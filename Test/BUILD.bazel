@@ -1,0 +1,94 @@
+package(default_visibility = ["//visibility:public"])
+
+load("@rules_lean//lean:defs.bzl", "lean_binary", "lean_test")
+
+# End-to-end validation of the FFI pipeline: exercises every HACL* binding
+# against published RFC known-answer vectors, and the TLS 1.3 key schedule
+# against RFC 8448. Passing this proves the http_archive -> cc_library -> shim
+# -> lean_library (@[extern]) chain links and runs correctly.
+lean_test(
+    name = "hacl_kat_test",
+    srcs = ["HaclKat.lean"],
+    deps = [
+        "//HaclStar:haclstar",
+        "//TLS13:tls13",
+    ],
+)
+
+# Wire-level TLS 1.3 ClientHello tolerance, GREASE, and HRR codec checks.
+lean_test(
+    name = "tls_handshake_test",
+    srcs = ["TlsHandshakeTest.lean"],
+    deps = ["//Tls:tls"],
+)
+
+# Full sans-I/O authenticated handshake and server-flight record ordering.
+lean_test(
+    name = "tls_server_interop_test",
+    srcs = ["TlsServerInteropTest.lean"],
+    data = ["Fixtures/Tls/server_cert.pem"],
+    deps = ["//Tls:tls"],
+)
+
+# Manual, one-shot loopback server for OpenSSL/Go interoperability gates.
+# This is a runnable harness, not part of the hermetic test suite.
+lean_binary(
+    name = "tls_external_server",
+    srcs = ["TlsExternalServer.lean"],
+    data = ["Fixtures/Tls/server_cert.pem"],
+    deps = ["//Tls:tls"],
+)
+
+# Pure-Lean strictness checks for the X.509 input boundary. The negative corpus
+# covers BER-only encodings, malformed OIDs, and ambiguous/noncanonical armor.
+lean_test(
+    name = "x509_der_test",
+    srcs = ["X509DerTest.lean"],
+    deps = ["//TLS13:tls13"],
+)
+
+lean_test(
+    name = "x509_hostname_test",
+    srcs = ["X509HostnameTest.lean"],
+    data = [
+        "Fixtures/Chain/expired-leaf.pem",
+        "Fixtures/Signature/rsa-pss.pem",
+        "Fixtures/X509/p256.pem",
+        "Fixtures/X509/rsa2048.pem",
+    ],
+    deps = ["//TLS13:tls13"],
+)
+
+lean_test(
+    name = "x509_certificate_test",
+    srcs = ["X509CertificateTest.lean"],
+    data = glob(["Fixtures/X509/*.pem"]),
+    deps = ["//TLS13:tls13"],
+)
+
+lean_test(
+    name = "x509_channel_binding_test",
+    srcs = ["X509ChannelBindingTest.lean"],
+    data = glob(["Fixtures/X509/*.pem"]),
+    deps = [
+        "//HaclStar:haclstar",
+        "//TLS13:tls13",
+    ],
+)
+
+lean_test(
+    name = "x509_chain_test",
+    srcs = ["X509ChainTest.lean"],
+    data = glob(["Fixtures/Chain/*.pem"]),
+    deps = ["//TLS13:tls13"],
+)
+
+lean_test(
+    name = "x509_signature_test",
+    srcs = ["X509SignatureTest.lean"],
+    data = glob([
+        "Fixtures/Signature/*.pem",
+        "Fixtures/X509/*.pem",
+    ]),
+    deps = ["//TLS13:tls13"],
+)

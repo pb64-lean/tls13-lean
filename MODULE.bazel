@@ -1,0 +1,67 @@
+module(
+    name = "tls13-lean",
+    version = "0.1.0",
+    compatibility_level = 1,
+)
+
+# Base Lean build rules. local_path_override is honored only when
+# tls13-lean is the root module; downstream consumers supply their own
+# overrides (or the registry resolves these).
+bazel_dep(name = "rules_lean", version = "0.1.0")
+local_path_override(
+    module_name = "rules_lean",
+    path = "../rules_lean",
+)
+
+# The lean4_upstream_std nix overlay (pinned lean + upstream Std) lives in the
+# grpc_lean_protobuf module; depend on it (dev-only) purely for those nix files.
+bazel_dep(name = "grpc_lean_protobuf", version = "0.1.0", dev_dependency = True)
+local_path_override(
+    module_name = "grpc_lean_protobuf",
+    path = "../grpc-lean/third_party/Lean-zh/protobuf",
+)
+
+# Transitive dep of grpc_lean_protobuf; its own local_path_override is ignored
+# when it is not the root module, so supply it here.
+local_path_override(
+    module_name = "grpc_lean_protobuf_binary",
+    path = "../grpc-lean/third_party/Lean-zh/binary",
+)
+
+# Lean toolchain for tls13-lean's OWN builds/tests only (dev_dependency,
+# so it is not forced on consumers). Reuses the pinned nixpkgs + lean overlay
+# from grpc_lean_protobuf, matching the grpc-lean setup.
+lean = use_extension("@rules_lean//lean:extensions.bzl", "lean", dev_dependency = True)
+lean.nix_toolchain(
+    name = "lean4",
+    attr = "lean4_upstream_std",
+    nix_file = "@grpc_lean_protobuf//:nixpkgs.nix",
+    nix_file_deps = ["@grpc_lean_protobuf//:nixpkgs.json"],
+)
+use_repo(lean, "lean4_toolchain")
+
+register_toolchains(
+    "@lean4_toolchain//:all",
+    dev_dependency = True,
+)
+
+# ---------------------------------------------------------------------------
+# HACL* — formally verified, constant-time C crypto primitives.
+#
+# We fetch the karamel-extracted C from the hacl-star `dist/gcc-compatible`
+# distribution (pinned by commit + integrity hash) and expose exactly the
+# portable translation units TLS 1.3 needs as a cc_library (see
+# third_party/hacl/hacl.BUILD). No system crypto dependency is introduced; the
+# downstream TLS state machine is written in Lean on top of these bindings.
+# ---------------------------------------------------------------------------
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "hacl",
+    # dist/ becomes the repo root, so sources are at gcc-compatible/... and
+    # karamel/... (matches the include layout in hacl.BUILD).
+    strip_prefix = "hacl-star-504c2987452f87fe44bce9b9f12e19d6e051761f/dist",
+    url = "https://github.com/hacl-star/hacl-star/archive/504c2987452f87fe44bce9b9f12e19d6e051761f.tar.gz",
+    sha256 = "e32f7add802f44e12c3f347824ddfd074abfe5cd5ccb291a942786a8c36af52c",
+    build_file = "//third_party/hacl:hacl.BUILD",
+)

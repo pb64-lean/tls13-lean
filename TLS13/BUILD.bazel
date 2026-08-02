@@ -1,0 +1,25 @@
+package(default_visibility = ["//visibility:public"])
+
+load("@rules_lean//lean:defs.bzl", "lean_library")
+
+# Pure-Lean TLS 1.3 protocol layer, built on the HaclStar crypto bindings.
+# Currently: the RFC 8446 §7.1 key schedule. The record layer, handshake
+# messages, and state machine land here as they are implemented.
+lean_library(
+    name = "tls13",
+    srcs = [
+        "KeySchedule.lean",
+        "X509.lean",
+        "X509/Certificate.lean",
+        "X509/ChannelBinding.lean",
+        "X509/Chain.lean",
+        "X509/DER.lean",
+        "X509/Hostname.lean",
+        "X509/OID.lean",
+        "X509/PEM.lean",
+        "X509/RSA.lean",
+        "X509/Signature.lean",
+        "X509/Time.lean",
+    ],
+    deps = ["//HaclStar:haclstar"],
+)

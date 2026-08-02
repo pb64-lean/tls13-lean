@@ -1,0 +1,42 @@
+package(default_visibility = ["//visibility:public"])
+
+load("@rules_lean//lean:defs.bzl", "lean_library")
+load("//:lean_runtime_headers.bzl", "lean_runtime_headers")
+
+lean_runtime_headers(
+    name = "lean_runtime_headers",
+)
+
+# The C FFI shim: marshals Lean `ByteArray` <-> HACL* `uint8_t*` buffers. It
+# needs both the HACL headers (from @hacl) and the Lean runtime header
+# `lean/lean.h` (from the toolchain's cc_library). As a CcInfo-providing dep of
+# the lean_library below, its objects — and @hacl's — are linked into any
+# lean_binary/lean_test that transitively depends on the bindings.
+cc_library(
+    name = "hacl_shim",
+    srcs = [
+        "shim/hacl_shim.c",
+        "shim/signature_shim.c",
+    ],
+    deps = [
+        "@hacl//:hacl",
+        ":lean_runtime_headers",
+    ],
+)
+
+# Lean bindings: `@[extern]` declarations whose symbols are defined by the shim.
+# Modules are package-qualified: HaclStar.Sha256, HaclStar.Hkdf, etc.
+lean_library(
+    name = "haclstar",
+    srcs = [
+        "Aead.lean",
+        "Curve25519.lean",
+        "Hex.lean",
+        "Hkdf.lean",
+        "Hmac.lean",
+        "P256.lean",
+        "Sha256.lean",
+        "Signature.lean",
+    ],
+    deps = [":hacl_shim"],
+)

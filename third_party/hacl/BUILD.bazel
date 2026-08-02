@@ -1,0 +1,5 @@
+# Marks third_party/hacl as a package so //third_party/hacl:hacl.BUILD resolves
+# as the build_file for the @hacl http_archive (see MODULE.bazel).
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["hacl.BUILD"])
