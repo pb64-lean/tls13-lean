@@ -1,95 +1,199 @@
 # tls13-lean
 
-A TLS 1.3 foundation for Lean 4: a **pure-Lean key schedule** over **formally
-verified, constant-time crypto primitives** bound from
-[HACL\*](https://github.com/hacl-star/hacl-star) via FFI. The first downstream
-client integration lives in sibling `pg-lean`, whose record, handshake, and
-sans-I/O client state machines build on this package.
+TLS 1.3 for Lean 4: pure-Lean protocol machinery — record layer, handshake
+codecs, sans-I/O **client and server** state machines, and X.509 path
+validation — over **formally verified, constant-time crypto primitives** bound
+from [HACL\*](https://github.com/hacl-star/hacl-star) via an explicit C FFI.
 
-This is the "option 3" design — own the protocol logic, borrow the primitives.
-HACL\* supplies the machine-checked C crypto; Lean supplies explicit protocol
-state and a path toward proofs of the key schedule and parsers. No system
-crypto library (OpenSSL/etc.) is introduced; HACL\* is fetched at a pinned
-commit and its portable C has no runtime dependency.
+This is the "own the protocol logic, borrow the primitives" design. HACL\*
+supplies the machine-checked C crypto; Lean supplies explicit protocol state.
+No system crypto library (OpenSSL etc.) is introduced; HACL\* is fetched at a
+pinned commit and its portable C has no runtime dependency.
+
+**Verification status, stated precisely:** the machine-checked component is
+the imported HACL\* C code. The Lean protocol code in this repository is
+implemented and tested — known-answer vectors for every primitive, wire-level
+handshake tests, X.509 corpus tests, and an in-repo client↔server handshake —
+but it carries no formal proofs today, and no refinement theorem against
+RFC 8446 is claimed. Protocol-level proofs are a direction, not a result.
 
 ## Layout
 
-Two Bazel packages below the root:
+Four Bazel packages:
 
-- **`HaclStar/`** — the crypto FFI. Bindings for exactly what TLS 1.3 needs:
-  SHA-256, HMAC-SHA256, HKDF-SHA256, X25519, P-256 ECDH, and
-  ChaCha20-Poly1305.
-- **`TLS13/`** — pure-Lean protocol layer. Currently the RFC 8446 §7.1 key
-  schedule. The first record layer, handshake codecs, and client machine are
-  currently in `../pg-lean/Pg/Tls/`.
+- **`HaclStar/`** — the crypto FFI: SHA-256/384/512, HMAC-SHA256,
+  HKDF-SHA256, X25519, P-256 ECDH, ChaCha20-Poly1305 AEAD, and Ed25519 +
+  ECDSA-P256 signatures (verify and sign). 16 `@[extern] opaque`
+  declarations over two small C shims.
+- **`TLS13/`** — the RFC 8446 §7.1 key schedule plus the X.509 stack:
+  strict-DER and PEM decoding, full certificate parsing, chain building and
+  validation, hostname verification, RSA (PKCS#1 v1.5 and PSS) signature
+  verification in pure Lean, and RFC 5929 `tls-server-end-point` channel
+  binding.
+- **`Tls/`** — the sans-I/O protocol core: ChaCha20-Poly1305 record layer
+  with KeyUpdate, handshake codecs for both roles (including
+  HelloRetryRequest, ALPN, SNI), and the client (`Tls.Client`) and server
+  (`Tls.Server`) state machines.
+- **`Test/`** — nine hermetic test binaries plus a manual loopback server
+  harness for external-client interop runs.
 
-Plus `Test/` (RFC known-answer vectors) and `third_party/hacl/` (the
-`http_archive` build overlay).
+## Protocol scope
+
+Implemented and negotiated today:
+
+- **Cipher suite**: `TLS_CHACHA20_POLY1305_SHA256` — deliberately the single
+  suite whose every primitive is portable scalar C in HACL\* (no per-CPU
+  assembly), so the build is identical on x86-64 and arm64.
+- **Key exchange**: X25519 preferred; P-256 available when configured.
+- **Server authentication**: Ed25519 (the server signs CertificateVerify
+  with a raw Ed25519 key). Clients accept CertificateVerify signatures with
+  `ecdsa_secp256r1_sha256`, `ed25519`, `rsa_pss_rsae_sha256`, and
+  `rsa_pss_pss_sha256`; PKCS#1 v1.5 is advertised for certificate-*chain*
+  selection only, as RFC 8446 requires.
+- **Extensions**: server_name, supported_groups, signature_algorithms, ALPN,
+  supported_versions, key_share; the server performs HelloRetryRequest with
+  the synthetic `message_hash` transcript and strict second-ClientHello
+  checks.
+
+Explicitly not yet supported (a candid list): PSK and session resumption
+(NewSessionTicket is parsed and discarded; the server never issues tickets),
+0-RTT, client certificates, AES-GCM suites, client-side HelloRetryRequest
+processing, and post-quantum hybrid groups. The narrow server-side
+ClientHello acceptance (ChaCha20-Poly1305 + X25519/P-256 + Ed25519) means
+mainstream clients such as Go `crypto/tls` or OpenSSL `s_client` do not
+negotiate with the server yet; broadening acceptance is roadmap work.
+
+## X.509
+
+`TLS13.X509` implements: strict DER (BER forms rejected), RFC 7468 PEM,
+full certificate parsing with byte-exact retention of the signed structures,
+path building with backtracking and bounded work
+(depth ≤ 10, ≤ 128 issuer attempts by default), expiry, CA / `keyCertSign` /
+`pathLenConstraint` enforcement, rejection of unhandled critical extensions,
+libpq-style hostname verification (SAN dNSName wildcards, IPv4/IPv6
+literals, CN fallback only without SAN; IDNA names must be given in A-label
+form), and channel-binding digests. Chain signature algorithms:
+ECDSA-P256-SHA256, Ed25519, RSA PKCS#1 v1.5 SHA-256, RSA-PSS SHA-256.
+
+Deliberately out of scope, matching libpq's default behavior: CRL and OCSP
+revocation. Also not interpreted: extendedKeyUsage, nameConstraints, policy
+constraints (they fail validation only if marked critical, since unhandled
+critical extensions are rejected).
+
+## Sans-I/O design
+
+The engines perform no I/O, read no clock, and generate no entropy:
+
+- `Tls.Client.Config` / `Tls.Server.Config` take caller-supplied randoms,
+  ephemeral key-exchange scalars, and session ids; callers are responsible
+  for sourcing them from a CSPRNG (downstream shells use Lean's
+  `IO.getRandomBytes`). The ECDSA signing binding likewise takes an explicit
+  per-message nonce — nonce hygiene is the caller's responsibility.
+- `feed` consumes wire bytes and returns produced wire bytes + plaintext;
+  failures come back as a `Failure` carrying the alert to seal and send
+  before discarding the connection.
+- Chain validation takes `now` as an argument; trust anchors are supplied
+  parsed.
+- Certificate-chain and hostname validation are separate, caller-invoked
+  policy steps — the handshake itself checks CertificateVerify against the
+  presented leaf.
+
+Downstream I/O shells in the sibling repositories:
+[`pg-lean`](https://github.com/pb64-lean/pg-lean) drives `Tls.Client` inside
+its PostgreSQL connection (plus libpq-style trust-store discovery), and
+[`grpc-lean`](https://github.com/pb64-lean/grpc-lean) wraps both engines in
+socket sessions for gRPC-over-TLS and a minimal HTTPS JSON endpoint.
 
 ## The FFI pipeline
-
-The binding pattern, bottom to top:
 
 ```
 @hacl (http_archive, pinned)          hacl-star dist/gcc-compatible/*.c
     │  cc_library  (third_party/hacl/hacl.BUILD)
     ▼
-HaclStar:hacl_shim (cc_library)       shim/hacl_shim.c  — ByteArray <-> uint8_t*
+HaclStar:hacl_shim (cc_library)       shim/*.c  — ByteArray <-> uint8_t*
     │  deps: @hacl + :lean_runtime_headers
     ▼
 HaclStar:haclstar (lean_library)      @[extern] opaque decls
     │
     ▼
-TLS13 / Test                          pure Lean
+TLS13 / Tls / Test                    pure Lean
 ```
 
-- The **shim** (`HaclStar/shim/hacl_shim.c`) is the only hand-written C: it
-  marshals Lean's boxed `ByteArray` to the flat `uint8_t*/uint32_t` buffers HACL
-  expects. It `#include`s `<lean/lean.h>`, obtained from a `lean_runtime_headers`
-  adapter that reads the active registered `rules_lean` toolchain. This works
-  both when this repository is the Bazel root and when it is a dependency.
-- HACL's `Hacl_HMAC.c` routes SHA-256 through an agile hash core, so its object
-  drags the full hash family (Blake2/SHA3/MD5/SHA1) in at link time. Those are
-  all portable C and are compiled; Vale assembly, EverCrypt autodetection,
-  bignum, and SIMD variants are excluded. The exact translation-unit set and
-  include roots were pinned empirically (see `third_party/hacl/hacl.BUILD`).
-- Bindings are `@[extern] opaque` pure functions —
-  SHA/HMAC/HKDF/X25519/P-256/AEAD are all deterministic. `ByteArray` in,
-  `ByteArray` (or `Option ByteArray` for fallible ECDH / AEAD-open) out.
+- HACL\* is pinned by `http_archive` to commit
+  `504c2987452f87fe44bce9b9f12e19d6e051761f` (sha256-verified), using the
+  karamel-extracted `dist/gcc-compatible` tree. Fifteen portable-C
+  translation units are compiled; Vale assembly, EverCrypt CPU
+  autodetection, bignum, and SIMD variants are deliberately excluded.
+- The shims (`HaclStar/shim/hacl_shim.c`, `shim/signature_shim.c`, ~340
+  lines total) are the only hand-written C: they marshal Lean `ByteArray`s
+  to flat buffers, enforce length preconditions before entering HACL\*, and
+  zero transient signature buffers. `<lean/lean.h>` comes from a
+  `lean_runtime_headers` adapter that reads the registered `rules_lean`
+  toolchain, so the shim compiles whether this repo is the Bazel root or a
+  dependency.
+- Bindings are `@[extern] opaque` pure functions: `ByteArray` in,
+  `ByteArray` (or `Option ByteArray` for fallible ECDH / AEAD-open /
+  signature verify) out.
 
-## Cipher suite scope
+## Trusted computing base
 
-The first target is `TLS_CHACHA20_POLY1305_SHA256` with `x25519` preferred and
-`secp256r1` available as a compatibility key-exchange group — a real,
-widely-supported suite whose every primitive is **portable scalar C** in HACL\*
-(no per-CPU assembly), so it builds identically on x86-64 and arm64.
-AES-GCM (whose fast constant-time path is x86-only Vale assembly) and the
-signature algorithms for certificate verification come later.
+An assurance-minded reader should count, beyond the Lean protocol code
+itself: the two C shims; the fifteen pinned HACL\* translation units (the
+agile HMAC core links the full hash family, so MD5/SHA-1/Blake2/SHA-3
+objects are present though unused); the Lean compiler and runtime, including
+the `Nat` big-integer backend used by the pure-Lean RSA verifier (public
+operands only — it is deliberately exact-and-clear rather than
+constant-time); and the Bazel/Nix toolchain pins. Secret-bearing state has
+no `Repr` instance, handshake secrets and scalars are dropped from state on
+completion, and Finished verification is constant-time — but there is no
+zeroization of Lean-side key material.
 
-## Verification status
+## Tests
 
-`bazel test //...` runs known-answer tests for every primitive against published
-vectors — SHA-256 (FIPS 180-2), HMAC (RFC 4231), HKDF (RFC 5869), X25519
-(RFC 7748), P-256 ECDH (RFC 5903), ChaCha20-Poly1305 (RFC 8439) — plus the
-key schedule against RFC 8448 (Early Secret `33ad0a1c…`, Derived Secret
-`6f2615a1…`), and an AEAD tamper-detection check.
+`bazel test //...` runs nine hermetic, offline suites:
+
+| Target | Coverage |
+| --- | --- |
+| `hacl_kat_test` | Known-answer vectors for every binding: SHA-2 (FIPS 180), HMAC (RFC 4231), HKDF (RFC 5869), X25519 (RFC 7748), P-256 ECDH (RFC 5903), ChaCha20-Poly1305 (RFC 8439) + tamper detection, Ed25519 (RFC 8032), ECDSA roundtrip, and the key schedule against RFC 8448 |
+| `tls_handshake_test` | Wire codecs against a GREASE-laden, fragmented, reordered ClientHello; record reassembly across TCP boundaries; missing-extension and duplicate-extension alerts; the full HelloRetryRequest flow |
+| `tls_server_interop_test` | Authenticated handshake between this repo's client and server engines (no sockets): negotiation, three-record server flight, application data both ways, 50-certificate fragmentation |
+| `x509_der_test`, `x509_certificate_test`, `x509_chain_test`, `x509_signature_test`, `x509_hostname_test`, `x509_channel_binding_test` | DER/PEM strictness corpus; OpenSSL-generated RSA/P-256/Ed25519 fixtures; chain validation success and eleven failure classes; RSA/ECDSA/PSS signature vectors and boundary rejections; hostname and channel-binding rules |
+
+Honest interop note: the hermetic "interop" test pairs this repo's own
+client and server. `bazel run //Test:tls_external_server -- 8443` starts a
+manual loopback harness intended for gates against independent clients
+(OpenSSL, Go); those runs are not yet scripted or part of CI, and the
+current server acceptance is too narrow for mainstream clients to complete
+a handshake (see Protocol scope).
+
+## Building
+
+Part of the [pb64-lean](https://github.com/pb64-lean) ecosystem: Bazel 8.5
+(`.bazelversion`), sibling checkouts for `../rules_lean` and (for the shared
+Nix-pinned Lean toolchain files only) `../grpc-lean`, and **Nix** to build
+the pinned Lean 4.31.0-pre toolchain:
+
+```sh
+for r in rules_lean grpc-lean tls13-lean; do
+  git clone "https://github.com/pb64-lean/$r"
+done
+cd tls13-lean
+bazel test //...
+```
+
+`lakefile.lean` is an IDE/LSP project model only; Bazel is the authoritative
+build because it compiles and links the HACL\* C shim.
 
 ## Roadmap
 
 1. ✅ Verified crypto primitives via HACL\* FFI
 2. ✅ Key schedule (HKDF-Expand-Label, Derive-Secret, Early/Handshake/Master)
-3. ✅ Client record layer in `pg-lean`: framing, nonces, AEAD, peer-initiated
-   KeyUpdate
-4. ✅ Client handshake codecs in `pg-lean`: first-flight X25519/P-256,
-   certificates, Finished, tickets, alerts
-5. ✅ Sans-I/O client machine in `pg-lean`: transcript/key schedule, Finished
-   verification, PostgreSQL SSLRequest transport integration
-6. X.509 path validation (the sharp-edged quarter: ASN.1 DER, trust stores)
-7. AES-GCM suites; signature algorithms for cert verification
-8. Promote the downstream protocol modules into a reusable client/server core
-
-## Toolchain
-
-Bazel + `rules_lean` (sibling `../rules_lean`), nix-pinned Lean via
-`grpc_lean_protobuf`'s overlay — same setup as the sibling `grpc-lean` /
-`pg-lean` projects.
+3. ✅ Record layer: framing, nonces, AEAD, KeyUpdate
+4. ✅ Handshake codecs for both roles, including HelloRetryRequest, ALPN, SNI
+5. ✅ Sans-I/O client and server state machines
+6. ✅ X.509: strict DER/PEM, chain validation, hostname, channel binding
+7. Broaden server ClientHello acceptance for mainstream-client interop;
+   scripted OpenSSL/Go interop gates
+8. AES-GCM suites; client-side HelloRetryRequest
+9. PSK, resumption, 0-RTT; client certificates
+10. Protocol-level proofs (key schedule, parsers, state-machine invariants)
