@@ -1,0 +1,16 @@
+name: assurance
+
+# Static assurance scan on GitHub-hosted runners (safe for pull_request).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: assurance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    uses: pb64-lean/.github/.github/workflows/assurance.yml@main

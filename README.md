@@ -1,5 +1,7 @@
 # tls13-lean
 
+[![CI](https://github.com/pb64-lean/tls13-lean/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/pb64-lean/tls13-lean/actions/workflows/ci.yml) [![Assurance](https://github.com/pb64-lean/tls13-lean/actions/workflows/assurance.yml/badge.svg?branch=main)](https://github.com/pb64-lean/tls13-lean/actions/workflows/assurance.yml)
+
 TLS 1.3 for Lean 4: pure-Lean protocol machinery — record layer, handshake
 codecs, sans-I/O **client and server** state machines, and X.509 path
 validation — over **formally verified, constant-time crypto primitives** bound

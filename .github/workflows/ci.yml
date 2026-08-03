@@ -1,0 +1,22 @@
+name: ci
+
+# Hermetic Bazel tests on the self-hosted NixOS runners.
+# NEVER add pull_request here: these jobs run on self-hosted runners.
+# grpc-lean is needed only for its third_party nix toolchain pin files.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "57 3 * * 1"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    uses: pb64-lean/.github/.github/workflows/bazel-ci.yml@main
+    with:
+      siblings: rules_lean grpc-lean
