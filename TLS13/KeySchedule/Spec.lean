@@ -406,6 +406,194 @@ theorem emptyContext_rfc8446 (H : Hkdf) (s : ByteArray) (keyLength ivLength : Na
     nextTrafficSecret H s = expandLabel H s .trafficUpd ByteArray.empty H.hashLen :=
   ⟨rfl, rfl, rfl, rfl⟩
 
+/-! ## Are two epochs' traffic secrets distinct?
+
+A record-layer nonce is only unique *within* an epoch: sequence numbers restart
+at zero whenever a new traffic secret is installed, so "this connection never
+repeats a nonce" needs, in addition, that the traffic secrets of distinct epochs
+are distinct. That is a property of HKDF, and HKDF is an opaque `@[extern]`
+HACL\* binding in this repository — nothing here can prove it.
+
+What this section does is make the assumption *small and reviewable*. Instead of
+assuming that some particular list of byte strings happens to have no repeats,
+assume the standard property that `HKDF-Expand-Label` is injective —
+`ExpandLabelInjective` below — and *derive* the distinctness of every epoch a
+connection can reach. Everything the RFC's diagram and §7.2's update chain
+produce then follows, for arbitrarily many key updates, from that one
+assumption. It is still an assumption about HACL\*'s HKDF; it is just a
+reviewable one. -/
+
+/-- **The assumption about the primitive**: `HKDF-Expand-Label` never maps two
+different argument tuples to the same output — different secrets, different
+labels, different contexts or different output lengths give different bytes.
+
+This is the shape of assumption a KDF is normally reviewed against, and it is
+strictly weaker than the pseudorandomness TLS's security analysis needs. It is
+*not* proved here: `H.expand` is an opaque HACL\* binding, so this stands beside
+the AEAD round trip of `Tls.Record.open_seal` as a named, visible hypothesis
+rather than a hidden one.
+
+Only two consequences are ever used: distinct labels give distinct outputs
+(which separates the handshake, application and §7.2 update epochs), and the
+map `secret ↦ HKDF-Expand-Label(secret, "traffic upd", "", Hash.length)` is
+injective (which separates the successive epochs of a key-update chain). -/
+structure ExpandLabelInjective (H : Hkdf) : Prop where
+  /-- Equal `HKDF-Expand-Label` outputs come from equal arguments. -/
+  eq_of_expandLabel : ∀ {s₁ s₂ c₁ c₂ : ByteArray} {l₁ l₂ : Label} {n₁ n₂ : Nat},
+    expandLabel H s₁ l₁ c₁ n₁ = expandLabel H s₂ l₂ c₂ n₂ →
+    s₁ = s₂ ∧ l₁ = l₂ ∧ c₁ = c₂ ∧ n₁ = n₂
+
+/-- `n` applications of the §7.2 traffic-secret update: the traffic secret in
+force after `n` KeyUpdates of an epoch that started from `secret`. -/
+@[expose] def trafficIter (H : Hkdf) (secret : ByteArray) : Nat → ByteArray
+  | 0 => secret
+  | n + 1 => nextTrafficSecret H (trafficIter H secret n)
+
+/-- **An epoch of a connection, named by the derivation that produced it.** A
+traffic epoch is a §7.1 `HKDF-Expand-Label` node — a parent secret, a label and
+a context — followed by some number of §7.2 `"traffic upd"` steps. Two epochs
+are the same exactly when all four components agree (`Epoch.eq_of_secret_eq`).
+
+`updates` is unbounded, so this names every epoch a connection can reach no
+matter how many KeyUpdates it performs. -/
+structure Epoch where
+  /-- The secret `HKDF-Expand-Label` was applied to. -/
+  parent : ByteArray
+  /-- The label the epoch's base secret was derived under. -/
+  label : Label
+  /-- The context of that derivation — a transcript hash, for a §7.1 node. -/
+  context : ByteArray
+  /-- The number of §7.2 KeyUpdates performed since. -/
+  updates : Nat
+
+/-- The §7.1 traffic secret an epoch starts from, before any KeyUpdate. -/
+@[expose] def Epoch.base (H : Hkdf) (e : Epoch) : ByteArray :=
+  expandLabel H e.parent e.label e.context H.hashLen
+
+/-- The traffic secret an epoch is protecting records under. -/
+@[expose] def Epoch.secret (H : Hkdf) (e : Epoch) : ByteArray :=
+  trafficIter H (e.base H) e.updates
+
+/-- An epoch descriptor names a real epoch only when its base secret is a §7.1
+derivation rather than itself a §7.2 update — otherwise `updates` would not
+count the KeyUpdates. Every label a TLS 1.3 traffic epoch is derived under
+(`"c hs traffic"`, `"s hs traffic"`, `"c ap traffic"`, `"s ap traffic"`,
+`"c e traffic"`) satisfies this. -/
+@[expose] def Epoch.Valid (e : Epoch) : Prop := e.label ≠ Label.trafficUpd
+
+/-- The successor epoch a KeyUpdate installs. -/
+@[expose] def Epoch.next (e : Epoch) : Epoch := { e with updates := e.updates + 1 }
+
+theorem Epoch.secret_next (H : Hkdf) (e : Epoch) :
+    e.next.secret H = nextTrafficSecret H (e.secret H) := rfl
+
+theorem Epoch.next_valid {e : Epoch} (h : e.Valid) : e.next.Valid := h
+
+private theorem trafficIter_inj {H : Hkdf} (hinj : ExpandLabelInjective H)
+    {p p' c c' : ByteArray} {l l' : Label} :
+    ∀ {m m' : Nat}, l ≠ Label.trafficUpd → l' ≠ Label.trafficUpd →
+      trafficIter H (expandLabel H p l c H.hashLen) m =
+        trafficIter H (expandLabel H p' l' c' H.hashLen) m' →
+      p = p' ∧ l = l' ∧ c = c' ∧ m = m' := by
+  intro m
+  induction m with
+  | zero =>
+      intro m' hl hl' h
+      cases m' with
+      | zero =>
+          obtain ⟨h1, h2, h3, -⟩ := hinj.eq_of_expandLabel h
+          exact ⟨h1, h2, h3, rfl⟩
+      | succ k =>
+          simp only [trafficIter, nextTrafficSecret] at h
+          obtain ⟨-, h2, -, -⟩ := hinj.eq_of_expandLabel h
+          exact absurd h2 hl
+  | succ k ih =>
+      intro m' hl hl' h
+      cases m' with
+      | zero =>
+          simp only [trafficIter, nextTrafficSecret] at h
+          obtain ⟨-, h2, -, -⟩ := hinj.eq_of_expandLabel h
+          exact absurd h2.symm hl'
+      | succ k' =>
+          simp only [trafficIter, nextTrafficSecret] at h
+          obtain ⟨h1, -, -, -⟩ := hinj.eq_of_expandLabel h
+          obtain ⟨a, b, c, d⟩ := ih hl hl' h1
+          exact ⟨a, b, c, by omega⟩
+
+/-- **Distinct epochs have distinct traffic secrets.** Given only that
+`HKDF-Expand-Label` is injective, an epoch's traffic secret determines the whole
+derivation that produced it: the parent secret, the label, the context, and how
+many §7.2 KeyUpdates have been applied. There is no bound on `updates`, so this
+covers a key-update chain of any length. -/
+theorem Epoch.eq_of_secret_eq {H : Hkdf} (hinj : ExpandLabelInjective H)
+    {e e' : Epoch} (hv : e.Valid) (hv' : e'.Valid) (h : e.secret H = e'.secret H) :
+    e = e' := by
+  obtain ⟨p, l, c, m⟩ := e
+  obtain ⟨p', l', c', m'⟩ := e'
+  obtain ⟨h1, h2, h3, h4⟩ := trafficIter_inj hinj hv hv' h
+  subst h1; subst h2; subst h3; subst h4
+  rfl
+
+/-! ### The order the epochs of a connection are used in
+
+A connection moves through its epochs in one direction: it may install a new
+§7.1 traffic secret at a later stage of the handshake, or roll the current one
+forward with a KeyUpdate, but it never goes back. `Epoch.Lt` is that order, and
+`Tls.Record.EpochsFrom` uses it to state that a run's epoch list is strictly
+increasing — from which, with `Epoch.eq_of_secret_eq`, the traffic secrets are
+pairwise distinct. -/
+
+/-- The stage of a connection at which an epoch derived under this label becomes
+current: early data, then the handshake, then the application data. Labels that
+never name a traffic epoch share the last stage; nothing below depends on their
+value. -/
+@[expose] def Label.stage : Label → Nat
+  | .ceTraffic => 0
+  | .cHsTraffic | .sHsTraffic => 1
+  | .cApTraffic | .sApTraffic => 2
+  | _ => 3
+
+/-- `e` is used strictly before `e'`: either `e'`'s base secret belongs to a
+later stage of the handshake, or the two are the same §7.1 node and `e'` has had
+strictly more KeyUpdates. -/
+@[expose] def Epoch.Lt (e e' : Epoch) : Prop :=
+  e.label.stage < e'.label.stage ∨
+    (e.parent = e'.parent ∧ e.label = e'.label ∧ e.context = e'.context ∧
+      e.updates < e'.updates)
+
+/-- `Epoch.Lt`, reflexively closed. -/
+@[expose] def Epoch.Le (e e' : Epoch) : Prop := e = e' ∨ e.Lt e'
+
+theorem Epoch.Le.refl (e : Epoch) : e.Le e := Or.inl rfl
+
+theorem Epoch.lt_next (e : Epoch) : e.Lt e.next :=
+  Or.inr ⟨rfl, rfl, rfl, Nat.lt_succ_self _⟩
+
+theorem Epoch.Lt.trans {a b c : Epoch} (h1 : a.Lt b) (h2 : b.Lt c) : a.Lt c := by
+  rcases h1 with h1 | ⟨p1, l1, c1, u1⟩ <;> rcases h2 with h2 | ⟨p2, l2, c2, u2⟩
+  · exact Or.inl (Nat.lt_trans h1 h2)
+  · exact Or.inl (l2 ▸ h1)
+  · exact Or.inl (l1 ▸ h2)
+  · exact Or.inr ⟨p1.trans p2, l1.trans l2, c1.trans c2, Nat.lt_trans u1 u2⟩
+
+theorem Epoch.lt_of_lt_of_le {a b c : Epoch} (h1 : a.Lt b) (h2 : b.Le c) : a.Lt c := by
+  rcases h2 with rfl | h2
+  · exact h1
+  · exact h1.trans h2
+
+theorem Epoch.Lt.ne {a b : Epoch} (h : a.Lt b) : a ≠ b := by
+  intro heq
+  subst heq
+  rcases h with h | ⟨-, -, -, h⟩ <;> omega
+
+/-- `e` is at or after the epoch `o`, where `none` means "no epoch has been
+installed yet" and so precedes every epoch. -/
+@[expose] def Epoch.LeOpt : Option Epoch → Epoch → Prop
+  | none, _ => True
+  | some e, e' => e.Le e'
+
+theorem Epoch.LeOpt.none_le (e : Epoch) : Epoch.LeOpt none e := trivial
+
 end Spec
 end KeySchedule
 end TLS13

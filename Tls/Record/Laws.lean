@@ -1541,5 +1541,164 @@ theorem Extends.run {before after : Option TrafficKeys} (h : Extends before afte
       obtain ⟨o, e, h'⟩ := h (some k) _ _ (WriteRun.done k)
       exact ⟨_, _, h'⟩
 
+/-! ## Discharging `secrets.Nodup` from the key schedule
+
+`WriteRun.nodup` takes the distinctness of the run's traffic secrets as a
+hypothesis. It need not: TLS does not pick those secrets arbitrarily, it derives
+each one with `HKDF-Expand-Label` at a specific label over a specific context
+(RFC 8446 §7.1) and rolls it forward with `"traffic upd"` (§7.2). If that
+primitive is injective — `TLS13.KeySchedule.Spec.ExpandLabelInjective`, the one
+named assumption — then an epoch's traffic secret determines the whole
+derivation, and a run whose epochs are *strictly increasing in the schedule's
+own order* automatically has distinct secrets.
+
+`EpochsFrom` is that "strictly increasing" property of a run's secret list, and
+`SpecExtends` is the `Extends` transformer refined to carry it. The engines
+prove `SpecExtends` step by step exactly as they prove `Extends`; the extra
+obligation appears only where an epoch is actually installed. -/
+
+open TLS13.KeySchedule
+
+/-- The epoch a write traffic state is in: `none` before any epoch is installed,
+and otherwise the key-schedule node whose traffic secret the state carries. -/
+def EpochOf (H : Spec.Hkdf) : Option Spec.Epoch → Option TrafficKeys → Prop
+  | none, none => True
+  | some e, some k => k.secret = e.secret H
+  | _, _ => False
+
+/-- The traffic-secret list of a run, described by the key schedule: it is the
+list of secrets of a strictly increasing sequence of epochs, each of them a §7.1
+derivation (`Spec.Epoch.Valid`) rather than a bare update, and none of them
+earlier than `o`. -/
+def EpochsFrom (H : Spec.Hkdf) (o : Option Spec.Epoch) (secrets : List ByteArray) :
+    Prop :=
+  ∃ epochs : List Spec.Epoch,
+    secrets = epochs.map (Spec.Epoch.secret H) ∧
+      List.Pairwise Spec.Epoch.Lt epochs ∧
+      ∀ e ∈ epochs, e.Valid ∧ Spec.Epoch.LeOpt o e
+
+/-- Forgetting a lower bound on a run's epochs. -/
+theorem EpochsFrom.mono {H : Spec.Hkdf} {o o' : Option Spec.Epoch}
+    {secrets : List ByteArray} (hle : ∀ e, Spec.Epoch.LeOpt o' e → Spec.Epoch.LeOpt o e)
+    (h : EpochsFrom H o' secrets) : EpochsFrom H o secrets := by
+  obtain ⟨epochs, hmap, hchain, hmem⟩ := h
+  exact ⟨epochs, hmap, hchain, fun e he => ⟨(hmem e he).1, hle e (hmem e he).2⟩⟩
+
+/-- **A run whose epochs strictly increase never repeats a traffic secret.**
+The distinctness `WriteRun.nodup` asks for is a *consequence* of the schedule
+once `HKDF-Expand-Label` is injective, because the secret of an epoch determines
+that epoch (`Spec.Epoch.eq_of_secret_eq`). -/
+theorem EpochsFrom.nodup {H : Spec.Hkdf} (hinj : Spec.ExpandLabelInjective H)
+    {o : Option Spec.Epoch} {secrets : List ByteArray} (h : EpochsFrom H o secrets) :
+    secrets.Nodup := by
+  obtain ⟨epochs, hmap, hchain, hmem⟩ := h
+  subst hmap
+  induction epochs with
+  | nil => exact List.nodup_nil
+  | cons e rest ih =>
+      obtain ⟨hhead, htail⟩ := List.pairwise_cons.mp hchain
+      refine List.nodup_cons.mpr ⟨?_, ih htail (fun x hx => hmem x (List.mem_cons_of_mem _ hx))⟩
+      intro hcontra
+      obtain ⟨x, hx, hxe⟩ := List.mem_map.mp hcontra
+      exact (hhead x hx).ne
+        (Spec.Epoch.eq_of_secret_eq hinj (hmem e List.mem_cons_self).1
+          (hmem x (List.mem_cons_of_mem _ hx)).1 hxe.symm)
+
+/-- `Extends`, refined by the key schedule: a step from a write state in epoch
+`o` to one in epoch `o'`, which extends any strictly-increasing-epoch run of the
+rest of the connection to a strictly-increasing-epoch run of the whole. -/
+def SpecExtends (H : Spec.Hkdf) (o o' : Option Spec.Epoch)
+    (before after : Option TrafficKeys) : Prop :=
+  ∀ dst secrets nonces, WriteRun after dst secrets nonces → EpochsFrom H o' secrets →
+    ∃ opened emitted, WriteRun before dst (opened ++ secrets) (emitted ++ nonces) ∧
+      EpochsFrom H o (opened ++ secrets)
+
+theorem SpecExtends.refl {H : Spec.Hkdf} (o : Option Spec.Epoch)
+    (a : Option TrafficKeys) : SpecExtends H o o a a :=
+  fun _ _ _ h hl => ⟨[], [], h, hl⟩
+
+theorem SpecExtends.trans {H : Spec.Hkdf} {o₁ o₂ o₃ : Option Spec.Epoch}
+    {a b c : Option TrafficKeys} (h1 : SpecExtends H o₁ o₂ a b)
+    (h2 : SpecExtends H o₂ o₃ b c) : SpecExtends H o₁ o₃ a c := by
+  intro dst secrets nonces h hl
+  obtain ⟨p2, e2, h2', hl2⟩ := h2 dst secrets nonces h hl
+  obtain ⟨p1, e1, h1', hl1⟩ := h1 dst _ _ h2' hl2
+  exact ⟨p1 ++ p2, e1 ++ e2, by rwa [List.append_assoc, List.append_assoc],
+    by rwa [List.append_assoc]⟩
+
+/-- Protecting one record leaves the epoch alone. -/
+theorem SpecExtends.of_seal {H : Spec.Hkdf} {o : Option Spec.Epoch}
+    {keys next : TrafficKeys} {contentType : ContentType}
+    {fragment wire : ByteArray} {paddingLength : Nat}
+    (h : «seal» keys contentType fragment paddingLength = .ok (next, wire)) :
+    SpecExtends H o o (some keys) (some next) :=
+  fun _ _ _ hrun hl =>
+    ⟨[], [(keys.secret, _)], WriteRun.protect (seal_nonce h) h hrun, hl⟩
+
+/-- Installing the first epoch: nothing was protected before it. -/
+theorem SpecExtends.install {H : Spec.Hkdf} {o' : Option Spec.Epoch}
+    {keys : TrafficKeys} : SpecExtends H none o' none (some keys) :=
+  fun _ _ _ hrun hl => ⟨[], [], WriteRun.install hrun, hl.mono (fun _ _ => trivial)⟩
+
+/-- **Replacing the write epoch, accounted for by the schedule.** The step
+abandons epoch `e` for a strictly later epoch `e'`; the abandoned epoch joins the
+run's epoch list ahead of everything the rest of the connection uses. -/
+theorem SpecExtends.rekey {H : Spec.Hkdf} {e e' : Spec.Epoch}
+    {keys next : TrafficKeys} (hsecret : keys.secret = e.secret H)
+    (hvalid : e.Valid) (hlt : e.Lt e') :
+    SpecExtends H (some e) (some e') (some keys) (some next) := by
+  intro dst secrets nonces hrun hl
+  obtain ⟨epochs, hmap, hchain, hmem⟩ := hl
+  refine ⟨[keys.secret], [], WriteRun.rekey hrun, e :: epochs, ?_, ?_, ?_⟩
+  · rw [hmap, hsecret]; rfl
+  · exact List.pairwise_cons.mpr
+      ⟨fun x hx => Spec.Epoch.lt_of_lt_of_le hlt (hmem x hx).2, hchain⟩
+  · intro x hx
+    cases hx with
+    | head => exact ⟨hvalid, Spec.Epoch.Le.refl e⟩
+    | tail _ hx =>
+        exact ⟨(hmem x hx).1,
+          Or.inr (Spec.Epoch.lt_of_lt_of_le hlt (hmem x hx).2)⟩
+
+/-- Read back the run a chain of refined steps certifies, together with the
+strictly increasing epoch list that makes its traffic secrets distinct. -/
+theorem SpecExtends.run {H : Spec.Hkdf} {o o' : Option Spec.Epoch}
+    {before after : Option TrafficKeys} (h : SpecExtends H o o' before after)
+    (hafter : EpochOf H o' after) (hvalid : ∀ e, o' = some e → e.Valid) :
+    ∃ secrets nonces, WriteRun before after secrets nonces ∧ EpochsFrom H o secrets := by
+  cases o' with
+  | none =>
+      cases after with
+      | none =>
+          obtain ⟨p, e, h', hl⟩ := h none [] [] WriteRun.idle ⟨[], rfl, List.Pairwise.nil,
+            fun _ hx => absurd hx (List.not_mem_nil)⟩
+          exact ⟨_, _, h', hl⟩
+      | some k => exact absurd hafter (fun x => x)
+  | some e' =>
+      cases after with
+      | none => exact absurd hafter (fun x => x)
+      | some k =>
+          obtain ⟨p, em, h', hl⟩ := h (some k) _ _ (WriteRun.done k)
+            ⟨[e'], by rw [(hafter : k.secret = e'.secret H)]; rfl,
+              List.pairwise_singleton _ _,
+              fun x hx => by
+                cases hx with
+                | head => exact ⟨hvalid e' rfl, Spec.Epoch.Le.refl e'⟩
+                | tail _ hx => exact absurd hx (List.not_mem_nil)⟩
+          exact ⟨_, _, h', hl⟩
+
+/-- **Nonce non-reuse with the epoch hypothesis discharged.** Given a refined run
+— one whose every epoch change is accounted for by the key schedule — and the
+injectivity of `HKDF-Expand-Label`, no (traffic secret, nonce) pair repeats. The
+`secrets.Nodup` hypothesis of `WriteRun.nodup` is *proved* here rather than
+assumed; what remains assumed is `hinj`, a property of the primitive. -/
+theorem SpecExtends.nonce_nodup {H : Spec.Hkdf} (hinj : Spec.ExpandLabelInjective H)
+    {o o' : Option Spec.Epoch} {before after : Option TrafficKeys}
+    (h : SpecExtends H o o' before after) (hafter : EpochOf H o' after)
+    (hvalid : ∀ e, o' = some e → e.Valid) :
+    ∃ secrets nonces, WriteRun before after secrets nonces ∧ nonces.Nodup := by
+  obtain ⟨secrets, nonces, hrun, hl⟩ := h.run hafter hvalid
+  exact ⟨secrets, nonces, hrun, hrun.nodup (hl.nodup hinj)⟩
+
 end Record
 end Tls
