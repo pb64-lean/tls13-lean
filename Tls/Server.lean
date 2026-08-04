@@ -258,18 +258,35 @@ private def uint24AtOne (bytes : ByteArray) : Nat :=
     (bytes.get! 3).toNat
 
 private def takeHandshake? (buffered : ByteArray) :
-    Except Error (Option (Handshake.Message × ByteArray)) := do
+    Except Error (Option (Handshake.Message × ByteArray)) :=
   if buffered.size < 4 then
-    pure none
+    .ok none
+  else if buffered.size < 4 + uint24AtOne buffered then
+    .ok none
   else
-    let total := 4 + uint24AtOne buffered
-    if buffered.size < total then
-      pure none
-    else
-      let encoded := buffered.extract 0 total
-      let rest := buffered.extract total buffered.size
-      let message ← liftHandshake (Handshake.decode encoded)
-      pure (some (message, rest))
+    match liftHandshake
+        (Handshake.decode (buffered.extract 0 (4 + uint24AtOne buffered))) with
+    | .error e => .error e
+    | .ok message =>
+        .ok (some (message,
+          buffered.extract (4 + uint24AtOne buffered) buffered.size))
+
+/-- A successful `takeHandshake?` consumes the four-byte message header plus
+the body, strictly shrinking the buffer. -/
+private theorem takeHandshake?_size {buffered rest : ByteArray}
+    {message : Handshake.Message}
+    (h : takeHandshake? buffered = .ok (some (message, rest))) :
+    rest.size < buffered.size := by
+  unfold takeHandshake? at h
+  split at h
+  · simp at h
+  · split at h
+    · simp at h
+    · split at h
+      · simp at h
+      · simp only [Except.ok.injEq, Option.some.injEq, Prod.mk.injEq] at h
+        rw [← h.2, ByteArray.size_extract]
+        omega
 
 private def constantTimeEq (left right : ByteArray) : Bool :=
   if left.size != right.size then
@@ -735,38 +752,118 @@ private def acceptKeyUpdate (state : State) (message : Handshake.Message) :
   | .updateNotRequested => pure (state, ByteArray.empty)
   | .updateRequested => sendKeyUpdateResponse state
 
-private partial def processHandshakeBuffer (state : State) :
-    Except Error (State × ByteArray) := do
-  let some (message, rest) ← takeHandshake? state.handshakeBuffered
-    | pure (state, ByteArray.empty)
-  let state := { state with handshakeBuffered := rest }
-  match state.phase with
-  | .waitingClientHello =>
-      unless message.msgType == Handshake.clientHelloType do
-        throw (.unexpectedHandshake state.phase message.msgType)
-      unless rest.isEmpty do
-        throw .interleavedHandshake
-      acceptClientHello { state with handshakeBuffered := ByteArray.empty } message
-  | .waitingSecondClientHello =>
-      unless message.msgType == Handshake.clientHelloType do
-        throw (.unexpectedHandshake state.phase message.msgType)
-      unless rest.isEmpty do
-        throw .interleavedHandshake
-      acceptClientHello { state with handshakeBuffered := ByteArray.empty } message
-  | .waitingClientFinished =>
-      unless message.msgType == Handshake.finishedType do
-        throw (.unexpectedHandshake state.phase message.msgType)
-      unless rest.isEmpty do
-        throw .interleavedHandshake
-      let state ← acceptClientFinished state message
-      pure (state, ByteArray.empty)
-  | .connected =>
-      if message.msgType == Handshake.keyUpdateType then
-        let (state, wireBytes) ← acceptKeyUpdate state message
-        let (state, more) ← processHandshakeBuffer state
-        pure (state, wireBytes ++ more)
-      else
-        throw (.unexpectedHandshake state.phase message.msgType)
+/-! Reduction lemmas used to prove that key updates leave the handshake
+buffer untouched, which bounds the `processHandshakeBuffer` recursion. -/
+
+private theorem except_bind_ok {ε α β : Type} (a : α) (f : α → Except ε β) :
+    (Except.ok a >>= f) = f a := rfl
+private theorem except_bind_error {ε α β : Type} (e : ε)
+    (f : α → Except ε β) :
+    ((Except.error e : Except ε α) >>= f) = Except.error e := rfl
+private theorem except_pure {ε α : Type} (a : α) :
+    (pure a : Except ε α) = Except.ok a := rfl
+
+private theorem sendKeyUpdateResponse_buffered {state next : State}
+    {wireBytes : ByteArray}
+    (h : sendKeyUpdateResponse state = .ok (next, wireBytes)) :
+    next.handshakeBuffered = state.handshakeBuffered := by
+  unfold sendKeyUpdateResponse at h
+  cases h1 : liftHandshake (Handshake.encodeKeyUpdate .updateNotRequested) with
+  | error e => rw [h1, except_bind_error] at h; cases h
+  | ok message =>
+      rw [h1, except_bind_ok] at h
+      cases h2 : requireWriteKeys state with
+      | error e => rw [h2, except_bind_error] at h; cases h
+      | ok writeKeys =>
+          rw [h2, except_bind_ok] at h
+          cases h3 : liftRecord
+              (Record.«seal» writeKeys .handshake message.encoded) with
+          | error e => rw [h3, except_bind_error] at h; cases h
+          | ok sealed =>
+              obtain ⟨advancedKeys, sealedBytes⟩ := sealed
+              rw [h3, except_bind_ok] at h
+              cases h4 : liftRecord advancedKeys.update with
+              | error e =>
+                  simp only [h4, except_bind_error] at h
+                  cases h
+              | ok updatedKeys =>
+                  simp only [h4, except_bind_ok, except_pure,
+                    Except.ok.injEq, Prod.mk.injEq] at h
+                  rw [← h.1]
+
+private theorem acceptKeyUpdate_buffered {state next : State}
+    {message : Handshake.Message} {wireBytes : ByteArray}
+    (h : acceptKeyUpdate state message = .ok (next, wireBytes)) :
+    next.handshakeBuffered = state.handshakeBuffered := by
+  unfold acceptKeyUpdate at h
+  cases h1 : liftHandshake (Handshake.parseKeyUpdate message) with
+  | error e => rw [h1, except_bind_error] at h; cases h
+  | ok update =>
+      rw [h1, except_bind_ok] at h
+      cases h2 : requireReadKeys state with
+      | error e => rw [h2, except_bind_error] at h; cases h
+      | ok readKeys =>
+          rw [h2, except_bind_ok] at h
+          cases h3 : liftRecord readKeys.update with
+          | error e => rw [h3, except_bind_error] at h; cases h
+          | ok updatedReadKeys =>
+              rw [h3, except_bind_ok] at h
+              cases hreq : update.request with
+              | updateNotRequested =>
+                  simp only [hreq, except_pure, Except.ok.injEq,
+                    Prod.mk.injEq] at h
+                  rw [← h.1]
+              | updateRequested =>
+                  simp only [hreq] at h
+                  rw [sendKeyUpdateResponse_buffered h]
+
+private def processHandshakeBuffer (state : State) :
+    Except Error (State × ByteArray) :=
+  match htake : takeHandshake? state.handshakeBuffered with
+  | .error e => .error e
+  | .ok none => .ok (state, ByteArray.empty)
+  | .ok (some (message, rest)) =>
+    have hrest : rest.size < state.handshakeBuffered.size :=
+      takeHandshake?_size htake
+    let state' := { state with handshakeBuffered := rest }
+    match state'.phase with
+    | .waitingClientHello => do
+        unless message.msgType == Handshake.clientHelloType do
+          throw (.unexpectedHandshake state'.phase message.msgType)
+        unless rest.isEmpty do
+          throw .interleavedHandshake
+        acceptClientHello { state' with handshakeBuffered := ByteArray.empty }
+          message
+    | .waitingSecondClientHello => do
+        unless message.msgType == Handshake.clientHelloType do
+          throw (.unexpectedHandshake state'.phase message.msgType)
+        unless rest.isEmpty do
+          throw .interleavedHandshake
+        acceptClientHello { state' with handshakeBuffered := ByteArray.empty }
+          message
+    | .waitingClientFinished => do
+        unless message.msgType == Handshake.finishedType do
+          throw (.unexpectedHandshake state'.phase message.msgType)
+        unless rest.isEmpty do
+          throw .interleavedHandshake
+        let stateF ← acceptClientFinished state' message
+        pure (stateF, ByteArray.empty)
+    | .connected =>
+        if message.msgType == Handshake.keyUpdateType then
+          match hacc : acceptKeyUpdate state' message with
+          | .error e => .error e
+          | .ok (stateK, wireBytes) =>
+            have hbuf : stateK.handshakeBuffered.size <
+                state.handshakeBuffered.size := by
+              rw [acceptKeyUpdate_buffered hacc]
+              exact hrest
+            match processHandshakeBuffer stateK with
+            | .error e => .error e
+            | .ok (stateF, more) => .ok (stateF, wireBytes ++ more)
+        else
+          .error (.unexpectedHandshake state'.phase message.msgType)
+  termination_by state.handshakeBuffered.size
+  decreasing_by exact hbuf
 
 private def processProtectedRecord (state : State) (record : Record.RawRecord) :
     Except Error (State × ByteArray × ByteArray) := do

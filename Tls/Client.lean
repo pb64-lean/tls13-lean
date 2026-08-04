@@ -285,18 +285,35 @@ private def uint24AtOne (bytes : ByteArray) : Nat :=
 /-- Return one complete framed handshake message without treating an
 incomplete prefix as a codec error. -/
 private def takeHandshake? (buffered : ByteArray) :
-    Except Error (Option (Handshake.Message × ByteArray)) := do
+    Except Error (Option (Handshake.Message × ByteArray)) :=
   if buffered.size < 4 then
-    pure none
+    .ok none
+  else if buffered.size < 4 + uint24AtOne buffered then
+    .ok none
   else
-    let total := 4 + uint24AtOne buffered
-    if buffered.size < total then
-      pure none
-    else
-      let encoded := buffered.extract 0 total
-      let rest := buffered.extract total buffered.size
-      let message ← liftHandshake (Handshake.decode encoded)
-      pure (some (message, rest))
+    match liftHandshake
+        (Handshake.decode (buffered.extract 0 (4 + uint24AtOne buffered))) with
+    | .error e => .error e
+    | .ok message =>
+        .ok (some (message,
+          buffered.extract (4 + uint24AtOne buffered) buffered.size))
+
+/-- A successful `takeHandshake?` consumes the four-byte message header plus
+the body, strictly shrinking the buffer. -/
+private theorem takeHandshake?_size {buffered rest : ByteArray}
+    {message : Handshake.Message}
+    (h : takeHandshake? buffered = .ok (some (message, rest))) :
+    rest.size < buffered.size := by
+  unfold takeHandshake? at h
+  split at h
+  · simp at h
+  · split at h
+    · simp at h
+    · split at h
+      · simp at h
+      · simp only [Except.ok.injEq, Option.some.injEq, Prod.mk.injEq] at h
+        rw [← h.2, ByteArray.size_extract]
+        omega
 
 private def constantTimeEq (left right : ByteArray) : Bool :=
   if left.size != right.size then
@@ -522,78 +539,165 @@ private def acceptKeyUpdate (state : State) (message : Handshake.Message) :
   | .updateNotRequested => pure (state, ByteArray.empty)
   | .updateRequested => sendKeyUpdateResponse state
 
-private partial def processHandshakeBuffer (state : State) :
-    Except Error (State × ByteArray) := do
-  let some (message, rest) ← takeHandshake? state.handshakeBuffered
-    | pure (state, ByteArray.empty)
-  let state := { state with handshakeBuffered := rest }
-  match state.phase with
-  | .waitingServerHello =>
-      throw (.unexpectedHandshake state.phase message.msgType)
-  | .waitingEncryptedExtensions =>
-      unless message.msgType == Handshake.encryptedExtensionsType do
-        throw (.unexpectedHandshake state.phase message.msgType)
-      let encryptedExtensions ← liftHandshake (Handshake.parseEncryptedExtensions message)
-      let alpnSelected ← liftHandshake (Handshake.selectedAlpnProtocol encryptedExtensions)
-      if let some protocol := alpnSelected then
-        unless state.offeredAlpnProtocols.contains protocol do
-          throw (.illegalParameter
-            s!"server selected ALPN protocol {protocol} that the client did not offer")
-      let state := appendTranscript
-        { state with phase := .waitingCertificate, alpnSelected } message
-      processHandshakeBuffer state
-  | .waitingCertificate =>
-      unless message.msgType == Handshake.certificateType do
-        throw (.unexpectedHandshake state.phase message.msgType)
-      let certificate ← liftHandshake (Handshake.parseCertificate message)
-      let parsedCertificates ← certificate.entries.mapM fun entry =>
-        decodeCertificate entry.der
-      let parsedLeaf := parsedCertificates[0]!
-      let state := appendTranscript {
-        state with
-        phase := .waitingCertificateVerify
-        leafCertificate? := some certificate.leafDer
-        peerCertificates := parsedCertificates
-        leafPublicKey? := some parsedLeaf.tbsCertificate.subjectPublicKeyInfo
-      } message
-      processHandshakeBuffer state
-  | .waitingCertificateVerify =>
-      unless message.msgType == Handshake.certificateVerifyType do
-        throw (.unexpectedHandshake state.phase message.msgType)
-      let certificateVerify ←
-        liftHandshake (Handshake.parseCertificateVerify message)
-      let some scheme := certificateVerifyScheme? certificateVerify.algorithm
-        | throw (.certificateVerifySchemeMismatch certificateVerify.algorithm)
-      let publicKey ← requireLeafPublicKey state
-      unless TLS13.X509.Signature.certificateVerifySchemeCompatible
-          scheme publicKey do
-        throw (.certificateVerifySchemeMismatch certificateVerify.algorithm)
-      let transcriptHash := HaclStar.sha256 state.transcript
-      unless TLS13.X509.Signature.verifyServerCertificateVerify
-          scheme publicKey transcriptHash certificateVerify.signature do
-        throw .certificateVerifyFailed
-      let state := appendTranscript {
-        state with
-        phase := .waitingServerFinished
-        leafPublicKey? := none
-      } message
-      processHandshakeBuffer state
-  | .waitingServerFinished =>
-      unless message.msgType == Handshake.finishedType do
-        throw (.unexpectedHandshake state.phase message.msgType)
-      unless rest.isEmpty do
-        throw .trailingHandshakeAfterFinished
-      completeServerHandshake state message
-  | .connected =>
-      if message.msgType == Handshake.newSessionTicketType then
-        let _ ← liftHandshake (Handshake.parseNewSessionTicket message)
-        processHandshakeBuffer state
-      else if message.msgType == Handshake.keyUpdateType then
-        let (state, wireBytes) ← acceptKeyUpdate state message
-        let (state, moreWireBytes) ← processHandshakeBuffer state
-        pure (state, wireBytes ++ moreWireBytes)
-      else
-        throw (.unexpectedHandshake state.phase message.msgType)
+/-! Reduction lemmas used to prove that key updates and transcript appends
+leave the handshake buffer untouched, which bounds the
+`processHandshakeBuffer` recursion. -/
+
+private theorem except_bind_ok {ε α β : Type} (a : α) (f : α → Except ε β) :
+    (Except.ok a >>= f) = f a := rfl
+private theorem except_bind_error {ε α β : Type} (e : ε)
+    (f : α → Except ε β) :
+    ((Except.error e : Except ε α) >>= f) = Except.error e := rfl
+private theorem except_pure {ε α : Type} (a : α) :
+    (pure a : Except ε α) = Except.ok a := rfl
+
+private theorem appendTranscript_buffered (state : State)
+    (message : Handshake.Message) :
+    (appendTranscript state message).handshakeBuffered =
+      state.handshakeBuffered := rfl
+
+private theorem sendKeyUpdateResponse_buffered {state next : State}
+    {wireBytes : ByteArray}
+    (h : sendKeyUpdateResponse state = .ok (next, wireBytes)) :
+    next.handshakeBuffered = state.handshakeBuffered := by
+  unfold sendKeyUpdateResponse at h
+  cases h1 : liftHandshake (Handshake.encodeKeyUpdate .updateNotRequested) with
+  | error e => rw [h1, except_bind_error] at h; cases h
+  | ok message =>
+      rw [h1, except_bind_ok] at h
+      cases h2 : requireWriteKeys state with
+      | error e => rw [h2, except_bind_error] at h; cases h
+      | ok writeKeys =>
+          rw [h2, except_bind_ok] at h
+          cases h3 : liftRecord
+              (Record.«seal» writeKeys .handshake message.encoded) with
+          | error e => rw [h3, except_bind_error] at h; cases h
+          | ok sealed =>
+              obtain ⟨advancedKeys, sealedBytes⟩ := sealed
+              rw [h3, except_bind_ok] at h
+              cases h4 : liftRecord advancedKeys.update with
+              | error e =>
+                  simp only [h4, except_bind_error] at h
+                  cases h
+              | ok updatedKeys =>
+                  simp only [h4, except_bind_ok, except_pure,
+                    Except.ok.injEq, Prod.mk.injEq] at h
+                  rw [← h.1]
+
+private theorem acceptKeyUpdate_buffered {state next : State}
+    {message : Handshake.Message} {wireBytes : ByteArray}
+    (h : acceptKeyUpdate state message = .ok (next, wireBytes)) :
+    next.handshakeBuffered = state.handshakeBuffered := by
+  unfold acceptKeyUpdate at h
+  cases h1 : liftHandshake (Handshake.parseKeyUpdate message) with
+  | error e => rw [h1, except_bind_error] at h; cases h
+  | ok update =>
+      rw [h1, except_bind_ok] at h
+      cases h2 : requireReadKeys state with
+      | error e => rw [h2, except_bind_error] at h; cases h
+      | ok readKeys =>
+          rw [h2, except_bind_ok] at h
+          cases h3 : liftRecord readKeys.update with
+          | error e => rw [h3, except_bind_error] at h; cases h
+          | ok updatedReadKeys =>
+              rw [h3, except_bind_ok] at h
+              cases hreq : update.request with
+              | updateNotRequested =>
+                  simp only [hreq, except_pure, Except.ok.injEq,
+                    Prod.mk.injEq] at h
+                  rw [← h.1]
+              | updateRequested =>
+                  simp only [hreq] at h
+                  rw [sendKeyUpdateResponse_buffered h]
+
+private def processHandshakeBuffer (state : State) :
+    Except Error (State × ByteArray) :=
+  match htake : takeHandshake? state.handshakeBuffered with
+  | .error e => .error e
+  | .ok none => .ok (state, ByteArray.empty)
+  | .ok (some (message, rest)) =>
+    have hrest : rest.size < state.handshakeBuffered.size :=
+      takeHandshake?_size htake
+    let state' := { state with handshakeBuffered := rest }
+    match state'.phase with
+    | .waitingServerHello =>
+        .error (.unexpectedHandshake state'.phase message.msgType)
+    | .waitingEncryptedExtensions => do
+        unless message.msgType == Handshake.encryptedExtensionsType do
+          throw (.unexpectedHandshake state'.phase message.msgType)
+        let encryptedExtensions ← liftHandshake (Handshake.parseEncryptedExtensions message)
+        let alpnSelected ← liftHandshake (Handshake.selectedAlpnProtocol encryptedExtensions)
+        if let some protocol := alpnSelected then
+          unless state'.offeredAlpnProtocols.contains protocol do
+            throw (.illegalParameter
+              s!"server selected ALPN protocol {protocol} that the client did not offer")
+        processHandshakeBuffer (appendTranscript
+          { state' with phase := .waitingCertificate, alpnSelected } message)
+    | .waitingCertificate => do
+        unless message.msgType == Handshake.certificateType do
+          throw (.unexpectedHandshake state'.phase message.msgType)
+        let certificate ← liftHandshake (Handshake.parseCertificate message)
+        let parsedCertificates ← certificate.entries.mapM fun entry =>
+          decodeCertificate entry.der
+        let parsedLeaf := parsedCertificates[0]!
+        processHandshakeBuffer (appendTranscript {
+          state' with
+          phase := .waitingCertificateVerify
+          leafCertificate? := some certificate.leafDer
+          peerCertificates := parsedCertificates
+          leafPublicKey? := some parsedLeaf.tbsCertificate.subjectPublicKeyInfo
+        } message)
+    | .waitingCertificateVerify => do
+        unless message.msgType == Handshake.certificateVerifyType do
+          throw (.unexpectedHandshake state'.phase message.msgType)
+        let certificateVerify ←
+          liftHandshake (Handshake.parseCertificateVerify message)
+        let some scheme := certificateVerifyScheme? certificateVerify.algorithm
+          | throw (.certificateVerifySchemeMismatch certificateVerify.algorithm)
+        let publicKey ← requireLeafPublicKey state'
+        unless TLS13.X509.Signature.certificateVerifySchemeCompatible
+            scheme publicKey do
+          throw (.certificateVerifySchemeMismatch certificateVerify.algorithm)
+        let transcriptHash := HaclStar.sha256 state'.transcript
+        unless TLS13.X509.Signature.verifyServerCertificateVerify
+            scheme publicKey transcriptHash certificateVerify.signature do
+          throw .certificateVerifyFailed
+        processHandshakeBuffer (appendTranscript {
+          state' with
+          phase := .waitingServerFinished
+          leafPublicKey? := none
+        } message)
+    | .waitingServerFinished => do
+        unless message.msgType == Handshake.finishedType do
+          throw (.unexpectedHandshake state'.phase message.msgType)
+        unless rest.isEmpty do
+          throw .trailingHandshakeAfterFinished
+        completeServerHandshake state' message
+    | .connected =>
+        if message.msgType == Handshake.newSessionTicketType then do
+          let _ ← liftHandshake (Handshake.parseNewSessionTicket message)
+          processHandshakeBuffer state'
+        else if message.msgType == Handshake.keyUpdateType then
+          match hacc : acceptKeyUpdate state' message with
+          | .error e => .error e
+          | .ok (stateK, wireBytes) =>
+            have hbuf : stateK.handshakeBuffered.size <
+                state.handshakeBuffered.size := by
+              rw [acceptKeyUpdate_buffered hacc]
+              exact hrest
+            match processHandshakeBuffer stateK with
+            | .error e => .error e
+            | .ok (stateF, moreWireBytes) =>
+                .ok (stateF, wireBytes ++ moreWireBytes)
+        else
+          .error (.unexpectedHandshake state'.phase message.msgType)
+  termination_by state.handshakeBuffered.size
+  decreasing_by
+    all_goals first
+      | exact hbuf
+      | exact hrest
+      | (simp only [appendTranscript_buffered]
+         exact hrest)
 
 private def validCompatibilityChangeCipherSpec (fragment : ByteArray) : Bool :=
   fragment.size == 1 && fragment.get! 0 == 1
