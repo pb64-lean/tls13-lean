@@ -47,13 +47,59 @@ leading from the connection's initial write state to its final one, in which no
 - It covers the **write** direction only. Nonce reuse is a sender property; the
   read-side nonces are the peer's.
 - Sequence numbers restart at zero on every KeyUpdate, so the trace is *scoped
-  by traffic-secret epoch* and the theorem's one hypothesis is that the epochs'
-  secrets are distinct (`secrets.Nodup`). TLS derives each with
-  HKDF-Expand-Label, an opaque HACL\* binding here, so that step is assumed —
-  the same boundary as the AEAD round trip in `open_seal`. Within one epoch
-  nothing is assumed: `seal` uses the nonce of the current sequence number and
-  returns the state with that number advanced without wrapping, and for a fixed
-  IV the nonce determines the sequence number.
+  by traffic-secret epoch*. Within one epoch nothing is assumed: `seal` uses the
+  nonce of the current sequence number and returns the state with that number
+  advanced without wrapping, and for a fixed IV the nonce determines the
+  sequence number. Distinctness *across* epochs is a hypothesis
+  (`secrets.Nodup`) in `run_nonce_nodup` — and a **theorem** in
+  `run_nonce_nodup_spec`, which is the stronger form described next.
+
+**Nonce non-reuse from one named assumption about HKDF.**
+`Tls.Client.Laws.run_nonce_nodup_spec` and `Tls.Server.Laws.run_nonce_nodup_spec`
+(and `start_run_nonce_nodup`, the form a caller sees: begin with `start`, drive
+with `run`) drop the `secrets.Nodup` hypothesis and conclude `nonces.Nodup`
+outright. What replaces it is one named, visible property of the primitive:
+
+```lean
+structure ExpandLabelInjective (H : Hkdf) : Prop where
+  eq_of_expandLabel : ∀ {s₁ s₂ c₁ c₂ : ByteArray} {l₁ l₂ : Label} {n₁ n₂ : Nat},
+    expandLabel H s₁ l₁ c₁ n₁ = expandLabel H s₂ l₂ c₂ n₂ →
+    s₁ = s₂ ∧ l₁ = l₂ ∧ c₁ = c₂ ∧ n₁ = n₂
+```
+
+— `HKDF-Expand-Label` never maps two different argument tuples to the same
+bytes. It is a hypothesis of the theorems, in the same style as `LawfulAead` and
+`Implements`, not something buried in a proof. Read the fine print here too:
+
+- **It is still an assumption about HACL\*'s HKDF, and it is not proved.**
+  `H.expand` is an opaque `@[extern]` binding; nothing in this repository can
+  say what it computes. This is not a security proof, and injectivity is not
+  pseudorandomness. What changed is the *size* of what must be trusted: from
+  "the particular byte strings this run produced happen to differ" to a
+  standard, reviewable property of a KDF — one an auditor can weigh against
+  HACL\*'s HKDF once, rather than per run.
+- What the repository proves is the other half: that the epochs a run installs
+  really are distinct *nodes* of the schedule. `Spec.Epoch` names an epoch by
+  the derivation that produced it (parent secret, label, context, number of §7.2
+  KeyUpdates since); `Spec.Epoch.eq_of_secret_eq` says injectivity makes an
+  epoch's traffic secret determine that node; and `Tls.Client.run_epochs` /
+  `Tls.Server.run_epochs` say every epoch an engine installs is a **strictly
+  later** node than the one it replaces — `c hs traffic` before `c ap traffic`
+  (RFC 8446 §7.1 stage order), and each KeyUpdate one `"traffic upd"` further
+  along. `Tls.Record.EpochsFrom.nodup` turns "strictly increasing" into
+  "pairwise distinct".
+- **The KeyUpdate chain is covered without a bound.** `Spec.Epoch.updates` is an
+  unbounded `Nat` and the induction in `eq_of_secret_eq` peels one
+  `"traffic upd"` at a time, so the guarantee holds for a connection that
+  rekeys any number of times. No fixed-point or acyclicity assumption is needed:
+  a §7.2 successor carries the label `"traffic upd"` and a §7.1 traffic secret
+  does not, so injectivity alone separates the chain from its own root.
+- The theorems are conditional on the connection *starting* before its first
+  epoch — a client waiting for the ServerHello, a server waiting for a
+  ClientHello, which is what `start` produces and what
+  `State.WellFormed.noWriteKeys` maintains. That is exactly what rules out a
+  hand-built `State` whose write keys are already the epoch a later transition
+  will install. The caller's single-threading obligation is unchanged.
 
 **Key-schedule refinement, stated exactly.** `TLS13/KeySchedule/Spec.lean` is a
 declarative transcription of RFC 8446 §7.1: the `HkdfLabel` wire structure,
@@ -161,7 +207,10 @@ Four Bazel packages:
   `seal`, wire bytes and all. It also defines `WriteRun`, the explicit trace
   of the `seal` calls a state machine performs — every step pinned to a real
   successful `seal` of the state the previous one returned — and proves
-  `WriteRun.nodup`, the nonce non-reuse theorem the engines' laws instantiate.
+  `WriteRun.nodup`, the nonce non-reuse theorem the engines' laws instantiate,
+  together with the refinement of that trace by the key schedule (`EpochsFrom`,
+  `SpecExtends`) that lets the engines discharge its epoch-distinctness
+  hypothesis rather than assume it.
   The handshake layer mirrors framing
   conservation: a decoded message's retained `encoded` bytes plus the
   remainder reproduce the input buffer exactly. `Tls.Handshake` also ends in
@@ -219,7 +268,10 @@ Four Bazel packages:
   keys the engine's own state carries and the advanced state is stored straight
   back — which composes into the nonce non-reuse theorem quoted above
   (`run_nonce_nodup`, and `feed_nonce_nodup` for a single feed, which for a
-  server covers the whole encrypted handshake flight). Alongside it,
+  server covers the whole encrypted handshake flight). The same walk is done a
+  second time carrying the *identity* of each epoch as a key-schedule node
+  (`run_epochs`), which is what makes `run_nonce_nodup_spec` unconditional on
+  epoch freshness. Alongside it,
   `State.WellFormed` is a structural invariant of an established connection —
   the client has both application epochs and has dropped the handshake secrets
   and transcript; the server has the client application epoch installed and has
@@ -238,7 +290,13 @@ Four Bazel packages:
   waiting for the ServerHello it holds *no* read epoch, so it cannot decrypt a
   protected record at all and therefore cannot deliver plaintext — only
   `acceptServerHello` installs the first read epoch, and it leaves
-  `waitingServerHello` in the same step. The transition laws
+  `waitingServerHello` in the same step. The server has the same clause
+  (`WellFormed.noReadKeys`, over `waitingClientHello` and
+  `waitingSecondClientHello`, so the HelloRetryRequest detour is covered), and
+  both engines also carry its write-side half (`WellFormed.noWriteKeys`): before
+  the connection's first epoch is installed there is none to replace, which is
+  what `run_nonce_nodup_spec` needs in order to know no epoch is ever
+  revisited. The transition laws
   cover the rest of the state-machine list: a connection becomes established
   only by verifying the peer `Finished` (`completeServerHandshake_verified`,
   `acceptClientFinished_verified`), application data is protected only by an
@@ -430,8 +488,8 @@ test binary is built, so a violation is a red target, not a stale README:
 | Target | What it certifies |
 | --- | --- |
 | `//HaclStar:haclstar_assurance` | The trusted C boundary: the 16 `@[extern] opaque` bindings are accounted for and no proof hole exists in the FFI package |
-| `//TLS13:tls13_assurance` | 22 principal theorems — the RFC 8446 §7.1 derivation tree as data (`Derived.tree_rfc8446`, `Label.text_rfc8446`), the `HkdfLabel` wire image byte for byte, and the refinement of `expandLabel`/`deriveSecret`/Early/Handshake/Master/`Derive-Secret`; plus DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies` |
-| `//Tls:tls_assurance` | 59 principal theorems — nonce non-reuse (`WriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, nonce and sequence injectivity), record conservation and seal/open inversion, ClientHello canonicity and body injectivity, the §7.3/§7.2/§4.4.4 record-layer and Finished derivations and the engines' §7.1 epoch installations, and the state-machine transition and invariant laws (including both directions of the connected-only application-data rule and the client's no-read-epoch-before-ServerHello clause) |
+| `//TLS13:tls13_assurance` | 23 principal theorems — the RFC 8446 §7.1 derivation tree as data (`Derived.tree_rfc8446`, `Label.text_rfc8446`), the `HkdfLabel` wire image byte for byte, the refinement of `expandLabel`/`deriveSecret`/Early/Handshake/Master/`Derive-Secret`, and epoch distinctness from `HKDF-Expand-Label` injectivity (`Spec.Epoch.eq_of_secret_eq`, unbounded in the number of key updates); plus DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies` |
+| `//Tls:tls_assurance` | 73 principal theorems — nonce non-reuse (`WriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, and the stronger `run_nonce_nodup_spec`/`start_run_nonce_nodup` that assume only `HKDF-Expand-Label` injectivity, plus `run_epochs`, `EpochsFrom.nodup`, nonce and sequence injectivity), record conservation and seal/open inversion, ClientHello canonicity and body injectivity, the §7.3/§7.2/§4.4.4 record-layer and Finished derivations and the engines' §7.1 epoch installations, and the state-machine transition and invariant laws (including both directions of the connected-only application-data rule and both engines' no-epoch-before-the-first-flight clauses) |
 
 Each target also scans every constant of the whole first-party closure
 (`HaclStar`, `TLS13`, `Tls` — 28 modules, ~5080 constants): nothing may reach
@@ -528,8 +586,10 @@ build because it compiles and links the HACL\* C shim.
     per-message parse inversion, GREASE-tolerant extension and `uint16`-vector
     roundtrips, HelloRetryRequest discrimination) and the state-machine layer (`Tls.Client.Laws`,
     `Tls.Server.Laws`: nonce non-reuse across a whole run of either engine,
-    scoped by traffic-secret epoch and assuming only that the epochs' secrets
-    differ; the `State.WellFormed` invariant established by `start` and
+    scoped by traffic-secret epoch — and, in `run_nonce_nodup_spec`, resting on
+    nothing beyond the injectivity of `HKDF-Expand-Label`, since the epochs a
+    run installs are proved to be strictly increasing nodes of the §7.1/§7.2
+    schedule; the `State.WellFormed` invariant established by `start` and
     preserved by every operation; and the transition laws — peer `Finished`
     verified before a connection is established, application data protected
     only when established, closed connections terminal, the HelloRetryRequest
