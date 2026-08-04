@@ -89,22 +89,30 @@ def remaining (r : Reader) : Nat :=
 def atEnd (r : Reader) : Bool :=
   r.offset == r.bytes.size
 
+-- The cursor primitives and `readTLV` itself are written as pure `if`/`match`
+-- chains (not `do` with `while`, whose `Loop.forIn` is a `partial def`) so the
+-- retention and re-decode laws at the end of this file can reason about them
+-- by case analysis.
+
 /-- Take exactly `count` bytes or report truncation. -/
-def take (r : Reader) (count : Nat) : Except String (ByteArray × Reader) := do
+def take (r : Reader) (count : Nat) : Except String (ByteArray × Reader) :=
   if r.offset > r.bytes.size || count > r.remaining then
-    throw s!"truncated DER input at offset {r.position}: need {count} bytes, have {r.remaining}"
-  let stop := r.offset + count
-  pure (r.bytes.extract r.offset stop, { r with offset := stop })
+    .error s!"truncated DER input at offset {r.position}: need {count} bytes, have {r.remaining}"
+  else
+    .ok (r.bytes.extract r.offset (r.offset + count), { r with offset := r.offset + count })
 
 /-- Read one byte or report truncation. -/
-def readByte (r : Reader) : Except String (UInt8 × Reader) := do
-  let (bytes, r) ← r.take 1
-  pure (bytes.get! 0, r)
+def readByte (r : Reader) : Except String (UInt8 × Reader) :=
+  match r.take 1 with
+  | .error e => .error e
+  | .ok (bytes, r) => .ok (bytes.get! 0, r)
 
 /-- Require the cursor to be exactly at the end of its bounded input. -/
-def requireEnd (r : Reader) (context : String := "DER value") : Except String Unit := do
-  unless r.atEnd do
-    throw s!"{context} has {r.remaining} trailing bytes at offset {r.position}"
+def requireEnd (r : Reader) (context : String := "DER value") : Except String Unit :=
+  if r.atEnd then
+    .ok ()
+  else
+    .error s!"{context} has {r.remaining} trailing bytes at offset {r.position}"
 
 /-- DER primitive/constructed form required for a known universal tag.
 `none` leaves a future or unknown universal tag uninterpreted. -/
@@ -116,19 +124,22 @@ private def expectedUniversalForm? (number : Nat) : Option Bool :=
   | 8 | 11 | 16 | 17 | 29 => some true
   | _ => none
 
-private def validateTag (tag : Tag) (offset : Nat) : Except String Unit := do
+private def validateTag (tag : Tag) (offset : Nat) : Except String Unit :=
   if tag.tagClass != .universal then
-    return
-  if tag.number == 0 then
-    throw s!"DER forbids the end-of-contents tag at offset {offset}"
-  if tag.number == 15 then
-    throw s!"reserved universal tag 15 at offset {offset}"
-  match expectedUniversalForm? tag.number with
-  | some expected =>
-    if tag.constructed != expected then
-      let want := if expected then "constructed" else "primitive"
-      throw s!"universal tag {tag.number} must be {want} in DER at offset {offset}"
-  | none => pure ()
+    .ok ()
+  else if tag.number == 0 then
+    .error s!"DER forbids the end-of-contents tag at offset {offset}"
+  else if tag.number == 15 then
+    .error s!"reserved universal tag 15 at offset {offset}"
+  else
+    match expectedUniversalForm? tag.number with
+    | some expected =>
+      if tag.constructed != expected then
+        let want := if expected then "constructed" else "primitive"
+        .error s!"universal tag {tag.number} must be {want} in DER at offset {offset}"
+      else
+        .ok ()
+    | none => .ok ()
 
 private def tagClassOfBits : Nat → TagClass
   | 0 => .universal
@@ -136,71 +147,103 @@ private def tagClassOfBits : Nat → TagClass
   | 2 => .contextSpecific
   | _ => .private_
 
-/-- Read one canonical DER TLV and return the advanced cursor. -/
-def readTLV (r : Reader) : Except String (TLV × Reader) := do
-  if r.offset > r.bytes.size then
-    throw s!"invalid DER cursor offset {r.position}"
-  let start := r.offset
-  let absoluteStart := r.position
-  let (first, afterFirst) ← r.readByte
-  let firstNat := first.toNat
-  let tagClass := tagClassOfBits (firstNat >>> 6)
-  let constructed := (firstNat &&& 0x20) != 0
-  let lowTag := firstNat &&& 0x1f
+/-- The `Nat` value of big-endian base-256 length octets. -/
+def lengthValue (octets : ByteArray) : Nat :=
+  octets.foldl (fun value octet => (value <<< 8) ||| octet.toNat) 0
 
-  let mut cursor := afterFirst
-  let mut tagNumber := lowTag
-  if lowTag == 0x1f then
-    let highStart := cursor.position
-    let mut firstGroup := true
-    let mut terminated := false
-    let mut groupCount := 0
-    tagNumber := 0
-    while !terminated do
-      if groupCount ≥ maxTagNumberOctets then
-        throw s!"high-tag-number identifier exceeds {maxTagNumberOctets} octets at offset {highStart}"
-      let (octet, next) ← cursor.readByte
+/-- Read the base-128 octet groups of a high-tag-number identifier, from a
+cursor, the absolute offset of the first group (used only in error reports),
+the accumulator, a first-group flag, and the remaining octet fuel implementing
+the `maxTagNumberOctets` resource bound. -/
+def readTagNumber : Reader → Nat → Nat → Bool → Nat → Except String (Nat × Reader)
+  | _, highStart, _, _, 0 =>
+    .error s!"high-tag-number identifier exceeds {maxTagNumberOctets} octets at offset {highStart}"
+  | r, highStart, acc, firstGroup, fuel + 1 =>
+    match r.readByte with
+    | .error e => .error e
+    | .ok (octet, next) =>
       if firstGroup && (octet.toNat &&& 0x7f) == 0 then
-        throw s!"non-minimal high-tag-number encoding at offset {highStart}"
-      tagNumber := (tagNumber <<< 7) ||| (octet.toNat &&& 0x7f)
-      cursor := next
-      groupCount := groupCount + 1
-      terminated := octet < 0x80
-      firstGroup := false
-    if tagNumber < 31 then
-      throw s!"high-tag-number form used for tag {tagNumber} at offset {absoluteStart}"
+        .error s!"non-minimal high-tag-number encoding at offset {highStart}"
+      else if octet < 0x80 then
+        .ok ((acc <<< 7) ||| (octet.toNat &&& 0x7f), next)
+      else
+        readTagNumber next highStart ((acc <<< 7) ||| (octet.toNat &&& 0x7f))
+          false fuel
 
-  let tag : Tag := { tagClass, constructed, number := tagNumber }
-  validateTag tag absoluteStart
+/-- Read a full identifier tag number given its already-consumed first octet.
+`identStart` is the absolute offset of the identifier, used only in error
+reports. -/
+def readNumber (first : UInt8) (r : Reader) (identStart : Nat) :
+    Except String (Nat × Reader) :=
+  if first.toNat &&& 0x1f == 0x1f then
+    match readTagNumber r r.position 0 true maxTagNumberOctets with
+    | .error e => .error e
+    | .ok (number, next) =>
+      if number < 31 then
+        .error s!"high-tag-number form used for tag {number} at offset {identStart}"
+      else
+        .ok (number, next)
+  else
+    .ok (first.toNat &&& 0x1f, r)
 
-  let lengthOffset := cursor.position
-  let (firstLength, afterLengthFirst) ← cursor.readByte
-  cursor := afterLengthFirst
-  let mut contentLength := firstLength.toNat
-  if firstLength == 0x80 then
-    throw s!"indefinite length is forbidden in DER at offset {lengthOffset}"
-  else if firstLength == 0xff then
-    throw s!"reserved DER length octet ff at offset {lengthOffset}"
-  else if firstLength ≥ 0x80 then
-    let lengthOctets := firstLength.toNat &&& 0x7f
-    let lengthStart := cursor.position
-    let (encodedLength, afterEncodedLength) ← cursor.take lengthOctets
-    if encodedLength.get! 0 == 0 then
-      throw s!"DER length has a leading zero at offset {lengthStart}"
-    contentLength := 0
-    for octet in encodedLength do
-      contentLength := (contentLength <<< 8) ||| octet.toNat
-    if contentLength < 128 then
-      throw s!"non-minimal long-form DER length {contentLength} at offset {lengthOffset}"
-    cursor := afterEncodedLength
+/-- Read one canonical DER length (short or minimal long form). -/
+def readLength (r : Reader) : Except String (Nat × Reader) :=
+  match r.readByte with
+  | .error e => .error e
+  | .ok (first, afterFirst) =>
+    if first == 0x80 then
+      .error s!"indefinite length is forbidden in DER at offset {r.position}"
+    else if first == 0xff then
+      .error s!"reserved DER length octet ff at offset {r.position}"
+    else if first ≥ 0x80 then
+      match afterFirst.take (first.toNat &&& 0x7f) with
+      | .error e => .error e
+      | .ok (encodedLength, afterLength) =>
+        if encodedLength.get! 0 == 0 then
+          .error s!"DER length has a leading zero at offset {afterFirst.position}"
+        else if lengthValue encodedLength < 128 then
+          .error s!"non-minimal long-form DER length {lengthValue encodedLength} at offset {r.position}"
+        else
+          .ok (lengthValue encodedLength, afterLength)
+    else
+      .ok (first.toNat, afterFirst)
 
-  if contentLength > cursor.remaining then
-    throw s!"truncated DER contents at offset {cursor.position}: declared {contentLength} bytes, have {cursor.remaining}"
-  let contentStart := cursor.offset
-  let (contents, afterContents) ← cursor.take contentLength
-  let encoded := r.bytes.extract start afterContents.offset
-  let headerSize := contentStart - start
-  pure ({ tag, contents, encoded, offset := absoluteStart, headerSize }, afterContents)
+/-- Read one canonical DER TLV and return the advanced cursor. -/
+def readTLV (r : Reader) : Except String (TLV × Reader) :=
+  if r.offset > r.bytes.size then
+    .error s!"invalid DER cursor offset {r.position}"
+  else
+    match r.readByte with
+    | .error e => .error e
+    | .ok (first, afterFirst) =>
+      match readNumber first afterFirst r.position with
+      | .error e => .error e
+      | .ok (number, afterTag) =>
+        match validateTag
+            { tagClass := tagClassOfBits (first.toNat >>> 6)
+              constructed := (first.toNat &&& 0x20) != 0
+              number } r.position with
+        | .error e => .error e
+        | .ok () =>
+          match readLength afterTag with
+          | .error e => .error e
+          | .ok (contentLength, afterLength) =>
+            if contentLength > afterLength.remaining then
+              .error s!"truncated DER contents at offset {afterLength.position}: declared {contentLength} bytes, have {afterLength.remaining}"
+            else
+              match afterLength.take contentLength with
+              | .error e => .error e
+              | .ok (contents, afterContents) =>
+                .ok
+                  ({ tag :=
+                      { tagClass := tagClassOfBits (first.toNat >>> 6)
+                        constructed := (first.toNat &&& 0x20) != 0
+                        number }
+                     contents
+                     encoded := r.bytes.extract r.offset afterContents.offset
+                     offset := r.position
+                     headerSize := afterLength.offset - r.offset },
+                    afterContents)
 
 end Reader
 
@@ -227,10 +270,13 @@ def asOID (tlv : TLV) : Except String OID := do
 end TLV
 
 /-- Decode exactly one DER value, rejecting trailing bytes. -/
-def decode (bytes : ByteArray) : Except String TLV := do
-  let (tlv, rest) ← (Reader.ofBytes bytes).readTLV
-  rest.requireEnd
-  pure tlv
+def decode (bytes : ByteArray) : Except String TLV :=
+  match (Reader.ofBytes bytes).readTLV with
+  | .error e => .error e
+  | .ok (tlv, rest) =>
+    match rest.requireEnd with
+    | .error e => .error e
+    | .ok () => .ok tlv
 
 /-- Decode every TLV in a bounded byte string. -/
 def decodeAll (bytes : ByteArray) : Except String (Array TLV) := do
@@ -245,7 +291,6 @@ def decodeAll (bytes : ByteArray) : Except String (Array TLV) := do
 /-- Decode exactly one DER OBJECT IDENTIFIER. -/
 def decodeOID (bytes : ByteArray) : Except String OID := do
   (← decode bytes).asOID
-
 end DER
 end X509
 end TLS13
