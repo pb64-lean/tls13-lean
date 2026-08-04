@@ -28,13 +28,13 @@ inductive ContentType where
 
 namespace ContentType
 
-def toUInt8 : ContentType → UInt8
+@[expose] def toUInt8 : ContentType → UInt8
   | .changeCipherSpec => 20
   | .alert => 21
   | .handshake => 22
   | .applicationData => 23
 
-def ofUInt8? : UInt8 → Option ContentType
+@[expose] def ofUInt8? : UInt8 → Option ContentType
   | 20 => some .changeCipherSpec
   | 21 => some .alert
   | 22 => some .handshake
@@ -44,13 +44,13 @@ def ofUInt8? : UInt8 → Option ContentType
 end ContentType
 
 /-- TLS 1.3 uses TLS 1.2's version number in every record-layer header. -/
-def legacyRecordVersion : UInt16 := 0x0303
+@[expose] def legacyRecordVersion : UInt16 := 0x0303
 
 /-- RFC 8446 §5.1 permits an initial ClientHello sender to use TLS 1.0's
 record version for compatibility with old middleboxes. Receivers ignore the
 legacy version on TLSPlaintext records; authenticated TLSCiphertext is still
 checked by `open` because its header is AEAD additional data. -/
-def legacyClientHelloRecordVersion : UInt16 := 0x0301
+@[expose] def legacyClientHelloRecordVersion : UInt16 := 0x0301
 
 @[expose] def headerLength : Nat := 5
 
@@ -141,32 +141,32 @@ structure TrafficKeys where
   deriving BEq, Inhabited
 
 /-- Append a big-endian 16-bit value. -/
-def putUInt16 (out : ByteArray) (value : UInt16) : ByteArray :=
+@[expose] def putUInt16 (out : ByteArray) (value : UInt16) : ByteArray :=
   (out.push (value >>> 8).toUInt8).push value.toUInt8
 
 /-- Read a big-endian 16-bit value at `offset`; the caller checks bounds. -/
-def getUInt16 (bytes : ByteArray) (offset : Nat) : UInt16 :=
+@[expose] def getUInt16 (bytes : ByteArray) (offset : Nat) : UInt16 :=
   (bytes.get! offset).toUInt16 <<< 8 ||| (bytes.get! (offset + 1)).toUInt16
 
 /-- Encode the five-byte record header. `fragmentLength` is truncated to
 16 bits; encoders validate it beforehand. -/
-def encodeHeader (contentType : ContentType) (version : UInt16)
+@[expose] def encodeHeader (contentType : ContentType) (version : UInt16)
     (fragmentLength : Nat) : ByteArray :=
   let out := ByteArray.empty.push contentType.toUInt8
   let out := putUInt16 out version
   putUInt16 out (UInt16.ofNat fragmentLength)
 
-def RawRecord.header (record : RawRecord) : ByteArray :=
+@[expose] def RawRecord.header (record : RawRecord) : ByteArray :=
   encodeHeader record.contentType record.legacyVersion record.fragment.size
 
 /-- Exact wire bytes of a raw record: the five-byte header followed by the
 fragment. `Tls.Record.Laws` proves that decoding is a left inverse of this
 encoding. -/
-def RawRecord.encode (record : RawRecord) : ByteArray :=
+@[expose] def RawRecord.encode (record : RawRecord) : ByteArray :=
   record.header ++ record.fragment
 
 /-- Concatenated wire encoding of framed records, in order. -/
-def encodeRawRecords (records : Array RawRecord) : ByteArray :=
+@[expose] def encodeRawRecords (records : Array RawRecord) : ByteArray :=
   records.foldl (fun out record => out ++ record.encode) ByteArray.empty
 
 /-- Encode an unprotected TLSPlaintext record. This is used for the initial
@@ -187,7 +187,7 @@ structure Decoder where
 /-- Validate a header's claimed fragment length as soon as the header is
 available, without waiting for the fragment itself. The extended TLSCiphertext
 limit applies only to outer `application_data` records. -/
-def checkFragmentLength (contentType : ContentType) (fragmentLength : Nat) :
+@[expose] def checkFragmentLength (contentType : ContentType) (fragmentLength : Nat) :
     Except Error Unit :=
   if contentType == .applicationData then
     if fragmentLength > maxCiphertextLength then
@@ -203,7 +203,7 @@ def checkFragmentLength (contentType : ContentType) (fragmentLength : Nat) :
 
 /-- Frame one record out of `buffered`. `some` carries the record and the
 unconsumed remainder; `none` means the buffer holds no complete record yet. -/
-def decodeStep (buffered : ByteArray) :
+@[expose] def decodeStep (buffered : ByteArray) :
     Except Error (Option (RawRecord × ByteArray)) :=
   if buffered.size < headerLength then
     .ok none
@@ -249,6 +249,9 @@ theorem decodeStep_size_lt {buffered rest : ByteArray} {record : RawRecord}
           simp only [headerLength] at *
           omega
 
+-- The named scrutinee hypothesis is consumed by `decreasing_by`, which the
+-- unused-variable linter does not see.
+set_option linter.unusedVariables false in
 def decodeBuffered (buffered : ByteArray) (records : Array RawRecord) :
     Except Error (ByteArray × Array RawRecord) :=
   match h : decodeStep buffered with
@@ -276,17 +279,25 @@ private def validateKeyAndIv (keys : TrafficKeys) : Except Error Unit := do
   unless keys.iv.size == aeadIvLength do
     throw (.invalidIvLength keys.iv.size)
 
+/-- Check the derived key and IV widths and assemble the initial traffic
+state, with the sequence number at zero. -/
+private def mkTrafficKeys (secret key iv : ByteArray) :
+    Except Error TrafficKeys :=
+  if key.size == aeadKeyLength then
+    if iv.size == aeadIvLength then
+      .ok { secret, key, iv, seq := 0 }
+    else
+      .error (.invalidIvLength iv.size)
+  else
+    .error (.invalidKeyLength key.size)
+
 /-- Derive the ChaCha20-Poly1305 key and static IV from a SHA-256 traffic
 secret (RFC 8446 §7.3). -/
 def deriveTrafficKeys (secret : ByteArray) : Except Error TrafficKeys := do
   validateSecret secret
-  let key := TLS13.KeySchedule.expandLabel secret "key" ByteArray.empty aeadKeyLength
-  let iv := TLS13.KeySchedule.expandLabel secret "iv" ByteArray.empty aeadIvLength
-  unless key.size == aeadKeyLength do
-    throw (.invalidKeyLength key.size)
-  unless iv.size == aeadIvLength do
-    throw (.invalidIvLength iv.size)
-  pure { secret, key, iv, seq := 0 }
+  mkTrafficKeys secret
+    (TLS13.KeySchedule.expandLabel secret "key" ByteArray.empty aeadKeyLength)
+    (TLS13.KeySchedule.expandLabel secret "iv" ByteArray.empty aeadIvLength)
 
 /-- RFC 8446 §7.2 application traffic-secret update. The context here is the
 empty byte string, not the hash of an empty transcript. -/
@@ -305,7 +316,7 @@ def TrafficKeys.update (keys : TrafficKeys) : Except Error TrafficKeys := do
 
 /-- The record sequence number left-zero-padded to the IV width, big endian
 (RFC 8446 §5.3). -/
-def sequenceBytes (seq : UInt64) : ByteArray :=
+@[expose] def sequenceBytes (seq : UInt64) : ByteArray :=
   ByteArray.mk #[
     0, 0, 0, 0,
     (seq >>> 56).toUInt8,
@@ -320,7 +331,7 @@ def sequenceBytes (seq : UInt64) : ByteArray :=
 
 /-- Pointwise XOR of the first `count` bytes of `a` and `b`; the callers
 check bounds. -/
-def xorBytes (count : Nat) (a b : ByteArray) : ByteArray :=
+@[expose] def xorBytes (count : Nat) (a b : ByteArray) : ByteArray :=
   match count with
   | 0 => ByteArray.empty
   | n + 1 => (xorBytes n a b).push (a.get! n ^^^ b.get! n)

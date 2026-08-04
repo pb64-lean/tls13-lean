@@ -9,6 +9,7 @@ lean_library(
     name = "tls",
     srcs = [
         "Record.lean",
+        "Record/Laws.lean",
         "Handshake.lean",
         "Client.lean",
         "Server.lean",
