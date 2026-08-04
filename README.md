@@ -325,19 +325,31 @@ own axiom, `<lemma>._native.bv_decide.ax_1_5`, whose statement is
 
 So the trust item is narrow and specific — the compiled LRAT checker and the
 compiler that built it, applied to seven fixed certificates — but it is real,
-and it **does** reach the headline theorems. `Tls.Record.WriteRun.nodup` and both
-engines' `run_nonce_nodup` depend on `nonceOf_inj`'s certificate; record
-conservation (`Decoder.feed_conservation`) and seal/open
-(`decodeStep_seal_open`) on `recompose_hi`'s and `hi_lo_recompose`'s;
-ClientHello canonicity (`parseClientHello_canonical`,
-`parseClientHello_body_injective`) and the retry check
-(`checkRetryClientHello_body_eq`) on `uint16_hi`'s. Everything else listed as a
-principal theorem below — the whole X.509/DER tier, `open_seal`, the handshake
-message roundtrips, and every state-machine transition law — closes over nothing
-but `propext`, `Classical.choice` and `Quot.sound`. The audit prints the exact
-axiom set of each theorem, so this is checked rather than asserted; eliminating
-the certificates by proving the seven identities from core's `BitVec` `getLsbD`
-lemmas is open follow-up work.
+and it **does** reach headline theorems. Precisely three families:
+
+- **nonce non-reuse** — `Record.WriteRun.nodup`, both engines'
+  `run_nonce_nodup` and `feed_nonce_nodup`, `Record.nonceOf_inj`,
+  `TrafficKeys.nonce_inj` (the `nonceOf_inj` certificate) and
+  `Record.sequenceBytes_inj` (its own);
+- **record framing** — `decodeStep_conservation`,
+  `decodeBuffered_conservation`, `Decoder.feed_conservation`,
+  `Decoder.feed_append`, `decodeStep_seal_open` (the `recompose_hi` and
+  `hi_lo_recompose` certificates);
+- **ClientHello canonicity** — `parseClientHello_canonical`(`_of_offersTls13`),
+  `parseClientHello_body_injective`, `parseExtensions_injective` and the retry
+  check `checkRetryClientHello_body_eq` (the `uint16_hi` certificate).
+
+Everything else the audit certifies closes over nothing but `propext`,
+`Classical.choice` and `Quot.sound`: the whole X.509/DER tier, `open_seal`,
+`seal_nonce`, `Decoder.feed_residual`, the handshake message roundtrips and the
+frame-canonicity laws, and every state-machine transition and invariant law.
+(Two of the seven certificates, `uint16_recompose`'s and `uint32_recompose`'s,
+are not reached by any headline theorem at all; they are allowed because they
+are declared inside the audited scope.) The audit prints the exact axiom set of
+each theorem, so all of this is checked rather than asserted. Eliminating the
+certificates by proving the seven identities from core's `BitVec` `getLsbD`
+lemmas — as `decodeOne_canonical`'s converse `uint24` recomposition is proved,
+arithmetically and certificate-free — is open follow-up work.
 
 ## Proof assurance
 
