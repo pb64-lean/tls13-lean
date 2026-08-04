@@ -79,6 +79,11 @@ Four Bazel packages:
   the cipher suites, offered versions, supported groups, key-share groups,
   signature schemes and the entire extension list — unknown and GREASE entries
   included — are returned in wire order with nothing dropped or reordered.
+  `Tls.Handshake.takeMessage?` — the reassembly step both state machines run on
+  the bytes the record layer hands up — is proved monotone and exact: every
+  proper prefix of a framed message yields nothing rather than an error, the
+  arrival of its last byte delivers the whole message with the following bytes
+  untouched, and delivery conserves the buffer.
 - **`Test/`** — nine hermetic test binaries, a one-shot loopback server
   harness, and a scripted (manual-tag) interoperability gate that drives the
   harness with real OpenSSL, curl, and Go `crypto/tls` clients.

@@ -222,6 +222,31 @@ def decode (bytes : ByteArray) : Except String Message :=
       else
         .error s!"handshake message has {rest.size} trailing bytes"
 
+/-- The big-endian `uint24` length field of a handshake frame header, read at
+offset 1 of a buffer that is at least four bytes long. -/
+def uint24AtOne (bytes : ByteArray) : Nat :=
+  (bytes.get! 1).toNat <<< 16 |||
+    (bytes.get! 2).toNat <<< 8 |||
+    (bytes.get! 3).toNat
+
+/-- Take one complete framed handshake message out of a transport buffer,
+returning `none` — not an error — while the buffer still holds only a prefix of
+a message. This is the reassembly step both state machines run on the bytes the
+record layer hands up; its laws are `takeMessage?_frame`,
+`takeMessage?_prefix_none` and `takeMessage?_conservation`. -/
+def takeMessage? (buffered : ByteArray) :
+    Except String (Option (Message × ByteArray)) :=
+  if buffered.size < 4 then
+    .ok none
+  else if buffered.size < 4 + uint24AtOne buffered then
+    .ok none
+  else
+    match decode (buffered.extract 0 (4 + uint24AtOne buffered)) with
+    | .error e => .error e
+    | .ok message =>
+        .ok (some (message,
+          buffered.extract (4 + uint24AtOne buffered) buffered.size))
+
 /-! Retention laws: a decoded message's `encoded` field holds exactly the
 input bytes, so appending it to a transcript never re-encodes. -/
 
@@ -3583,6 +3608,153 @@ theorem decodeOne_prefix_error {msgType : UInt8} {body : ByteArray} {msg : Messa
         rw [hbytes2, hpsize] at hle3
         rw [ho3, hoff2, hlen] at hle3
         omega
+
+/-! ### Buffered delivery
+
+`takeMessage?` is the reassembly step a state machine runs on the bytes the
+record layer has handed up so far. These laws say buffering is monotone and
+exact: while a framed message is incomplete the buffer yields nothing (never an
+error), and the instant its last byte arrives the whole message is delivered
+with the bytes after it returned untouched. -/
+
+private theorem size_encoded {msgType : UInt8} {body : ByteArray} {msg : Message}
+    (h : frame msgType body = .ok msg) : msg.encoded.size = 4 + body.size := by
+  obtain ⟨hlt, hmsg⟩ := frame_spec h
+  rw [hmsg]
+  show (ByteArray.empty.push msgType ++ length24Bytes body.size ++ body).size = _
+  rw [ByteArray.size_append, ByteArray.size_append,
+    show (ByteArray.empty.push msgType).size = 1 from rfl,
+    show (length24Bytes body.size).size = 3 from rfl]
+
+private theorem uint24AtOne_congr {a b : ByteArray}
+    (h : ∀ i, i < 4 → a.get! i = b.get! i) : uint24AtOne a = uint24AtOne b := by
+  unfold uint24AtOne
+  rw [h 1 (by omega), h 2 (by omega), h 3 (by omega)]
+
+private theorem uint24AtOne_encoded {msgType : UInt8} {body : ByteArray}
+    {msg : Message} (h : frame msgType body = .ok msg) :
+    uint24AtOne msg.encoded = body.size := by
+  obtain ⟨hlt, hmsg⟩ := frame_spec h
+  have hP1 : (ByteArray.empty.push msgType).size = 1 := rfl
+  have hPL : (ByteArray.empty.push msgType ++ length24Bytes body.size).size = 4 := by
+    rw [ByteArray.size_append, hP1]
+    rfl
+  have hb : ∀ i, 1 ≤ i → i < 4 →
+      msg.encoded.get! i = (length24Bytes body.size).get! (i - 1) := by
+    intro i h1 h4
+    rw [hmsg]
+    show (ByteArray.empty.push msgType ++ length24Bytes body.size ++ body).get! i = _
+    rw [get!_append_left (by rw [hPL]; omega),
+      get!_append_right (by rw [hP1]; omega)
+        (by rw [hP1, show (length24Bytes body.size).size = 3 from rfl]; omega),
+      hP1]
+  unfold uint24AtOne
+  rw [hb 1 (by omega) (by omega), hb 2 (by omega) (by omega),
+    hb 3 (by omega) (by omega)]
+  show (UInt8.ofNat (body.size >>> 16)).toNat <<< 16 |||
+    (UInt8.ofNat (body.size >>> 8)).toNat <<< 8 |||
+    (UInt8.ofNat body.size).toNat = body.size
+  exact uint24_recompose hlt
+
+/-- **Delivery**: once a framed message's last byte is in the buffer the whole
+message is taken out, and the bytes after it are returned untouched. -/
+theorem takeMessage?_frame {msgType : UInt8} {body : ByteArray} {msg : Message}
+    (h : frame msgType body = .ok msg) (rest : ByteArray) :
+    takeMessage? (msg.encoded ++ rest) = .ok (some (msg, rest)) := by
+  have hEsize : msg.encoded.size = 4 + body.size := size_encoded h
+  have hL : uint24AtOne (msg.encoded ++ rest) = body.size := by
+    rw [uint24AtOne_congr (b := msg.encoded)
+      (fun i hi => get!_append_left (by omega))]
+    exact uint24AtOne_encoded h
+  unfold takeMessage?
+  rw [if_neg (by rw [ByteArray.size_append]; omega), hL,
+    if_neg (by rw [ByteArray.size_append]; omega),
+    show (msg.encoded ++ rest).extract 0 (4 + body.size) = msg.encoded from by
+      rw [← hEsize]
+      exact ByteArray.extract_append_eq_left rfl,
+    decode_frame h,
+    show (msg.encoded ++ rest).extract (4 + body.size)
+        (msg.encoded ++ rest).size = rest from by
+      rw [← hEsize]
+      have h2 := ByteArray.extract_append_size_add (a := msg.encoded) (b := rest)
+        (i := 0) (j := rest.size)
+      rw [Nat.add_zero] at h2
+      rw [ByteArray.size_append, h2, ByteArray.extract_zero_size]]
+
+/-- **No early delivery**: a strict prefix of a framed message yields nothing —
+and never an error — so a state machine that waits for more bytes can never
+have skipped a message. -/
+theorem takeMessage?_prefix_none {msgType : UInt8} {body : ByteArray}
+    {msg : Message} (h : frame msgType body = .ok msg) {a c : ByteArray}
+    (hsplit : a ++ c = msg.encoded) (hc : 0 < c.size) :
+    takeMessage? a = .ok none := by
+  have hEsize : msg.encoded.size = 4 + body.size := size_encoded h
+  have hasize : a.size + c.size = msg.encoded.size := by
+    rw [← hsplit, ByteArray.size_append]
+  unfold takeMessage?
+  by_cases h4 : a.size < 4
+  · rw [if_pos h4]
+  · rw [if_neg h4]
+    have hL : uint24AtOne a = body.size := by
+      rw [uint24AtOne_congr (b := msg.encoded)
+        (fun i hi => by
+          rw [← hsplit]
+          exact (get!_append_left (by omega)).symm)]
+      exact uint24AtOne_encoded h
+    rw [hL, if_pos (by omega)]
+
+/-- **Buffering is monotone and exact**: however the record layer split a framed
+message, every proper prefix of it leaves the buffer empty-handed, and the
+arrival of its last byte delivers the whole message together with whatever
+followed it. -/
+theorem takeMessage?_frame_split {msgType : UInt8} {body : ByteArray}
+    {msg : Message} (h : frame msgType body = .ok msg) (a c rest : ByteArray)
+    (hsplit : a ++ c = msg.encoded) :
+    (0 < c.size → takeMessage? a = .ok none) ∧
+    takeMessage? (a ++ (c ++ rest)) = .ok (some (msg, rest)) :=
+  ⟨fun hc => takeMessage?_prefix_none h hsplit hc, by
+    rw [← ByteArray.append_assoc, hsplit]
+    exact takeMessage?_frame h rest⟩
+
+/-- **Conservation**: what `takeMessage?` delivers, followed by what it leaves
+behind, is exactly the buffer it was given — the handshake-layer mirror of
+`Tls.Record.Laws.decodeStep_conservation`. -/
+theorem takeMessage?_conservation {buffered rest : ByteArray} {msg : Message}
+    (h : takeMessage? buffered = .ok (some (msg, rest))) :
+    msg.encoded ++ rest = buffered := by
+  unfold takeMessage? at h
+  split at h
+  · cases h
+  · rename_i h4
+    split at h
+    · cases h
+    · rename_i hcomplete
+      split at h
+      · cases h
+      · rename_i message hdec
+        simp only [Except.ok.injEq, Option.some.injEq, Prod.mk.injEq] at h
+        obtain ⟨rfl, rfl⟩ := h
+        rw [decode_encoded hdec, ByteArray.extract_append_extract,
+          Nat.min_eq_left (Nat.zero_le _),
+          Nat.max_eq_right (by omega : 4 + uint24AtOne buffered ≤ buffered.size),
+          ByteArray.extract_zero_size]
+
+/-- A successful `takeMessage?` consumes the four-byte header plus the body, so
+the buffer strictly shrinks and a reassembly loop terminates. -/
+theorem takeMessage?_size {buffered rest : ByteArray} {msg : Message}
+    (h : takeMessage? buffered = .ok (some (msg, rest))) :
+    rest.size < buffered.size := by
+  unfold takeMessage? at h
+  split at h
+  · cases h
+  · split at h
+    · cases h
+    · split at h
+      · cases h
+      · simp only [Except.ok.injEq, Option.some.injEq, Prod.mk.injEq] at h
+        rw [← h.2, ByteArray.size_extract]
+        omega
+
 
 /-! ### `uint16` vectors (cipher suites, groups, versions, algorithms) -/
 

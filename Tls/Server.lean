@@ -252,48 +252,27 @@ private def requireWriteKeys (state : State) : Except Error Record.TrafficKeys :
 private def emptyTranscriptHash : ByteArray :=
   HaclStar.sha256 ByteArray.empty
 
-private def uint24AtOne (bytes : ByteArray) : Nat :=
-  (bytes.get! 1).toNat <<< 16 |||
-    (bytes.get! 2).toNat <<< 8 |||
-    (bytes.get! 3).toNat
-
-private def takeHandshake? (buffered : ByteArray) :
-    Except Error (Option (Handshake.Message × ByteArray)) :=
-  if buffered.size < 4 then
-    .ok none
-  else if buffered.size < 4 + uint24AtOne buffered then
-    .ok none
-  else
-    match liftHandshake
-        (Handshake.decode (buffered.extract 0 (4 + uint24AtOne buffered))) with
-    | .error e => .error e
-    | .ok message =>
-        .ok (some (message,
-          buffered.extract (4 + uint24AtOne buffered) buffered.size))
-
-/-- A successful `takeHandshake?` consumes the four-byte message header plus
-the body, strictly shrinking the buffer. -/
-private theorem takeHandshake?_size {buffered rest : ByteArray}
-    {message : Handshake.Message}
-    (h : takeHandshake? buffered = .ok (some (message, rest))) :
-    rest.size < buffered.size := by
-  unfold takeHandshake? at h
-  split at h
-  · simp at h
-  · split at h
-    · simp at h
-    · split at h
-      · simp at h
-      · simp only [Except.ok.injEq, Option.some.injEq, Prod.mk.injEq] at h
-        rw [← h.2, ByteArray.size_extract]
-        omega
-
 private theorem liftHandshake_ok {α : Type} {result : Except String α}
     {value : α} (h : liftHandshake result = .ok value) : result = .ok value := by
   unfold liftHandshake at h
   cases result with
   | error e => simp [Except.mapError] at h
   | ok b => simpa [Except.mapError] using h
+
+/-- Return one complete framed handshake message without treating an
+incomplete prefix as a codec error. The reassembly itself, and its laws, live
+in `Tls.Handshake`; this only adapts the error type. -/
+private def takeHandshake? (buffered : ByteArray) :
+    Except Error (Option (Handshake.Message × ByteArray)) :=
+  liftHandshake (Handshake.takeMessage? buffered)
+
+/-- A successful `takeHandshake?` consumes the four-byte message header plus
+the body, strictly shrinking the buffer. -/
+private theorem takeHandshake?_size {buffered rest : ByteArray}
+    {message : Handshake.Message}
+    (h : takeHandshake? buffered = .ok (some (message, rest))) :
+    rest.size < buffered.size :=
+  Handshake.takeMessage?_size (liftHandshake_ok h)
 
 /-- A successful `takeHandshake?` conserves bytes: the decoded message's
 retained exact encoding followed by the returned remainder is the input
@@ -302,21 +281,8 @@ buffer — the handshake-layer mirror of the record-framing conservation law
 private theorem takeHandshake?_conservation {buffered rest : ByteArray}
     {message : Handshake.Message}
     (h : takeHandshake? buffered = .ok (some (message, rest))) :
-    message.encoded ++ rest = buffered := by
-  unfold takeHandshake? at h
-  split at h
-  · simp at h
-  · split at h
-    · simp at h
-    · rename_i hcomplete
-      split at h
-      · simp at h
-      · rename_i decoded hdec
-        simp only [Except.ok.injEq, Option.some.injEq, Prod.mk.injEq] at h
-        rw [← h.1, ← h.2, Handshake.decode_encoded (liftHandshake_ok hdec),
-          ByteArray.extract_append_extract,
-          Nat.min_eq_left (Nat.zero_le _), Nat.max_eq_right (by omega)]
-        exact ByteArray.extract_zero_size
+    message.encoded ++ rest = buffered :=
+  Handshake.takeMessage?_conservation (liftHandshake_ok h)
 
 private def constantTimeEq (left right : ByteArray) : Bool :=
   if left.size != right.size then
