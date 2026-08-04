@@ -272,6 +272,18 @@ private theorem readVector16_ok {r r' : Reader} {b : ByteArray}
     rw [hb1] at hle2
     exact ⟨hb2.trans hb1, by omega, hle2⟩
 
+private theorem readVector8_ok {r r' : Reader} {b : ByteArray}
+    (h : r.readVector8 = .ok (b, r')) :
+    r'.bytes = r.bytes ∧ r.offset + 1 ≤ r'.offset ∧ r'.offset ≤ r.bytes.size := by
+  unfold Reader.readVector8 at h
+  split at h
+  · cases h
+  · rename_i len r₁ h8
+    obtain ⟨hb1, ho1, hle1⟩ := readUInt8_ok h8
+    obtain ⟨hb2, ho2, hle2⟩ := take_ok h
+    rw [hb1] at hle2
+    exact ⟨hb2.trans hb1, by omega, hle2⟩
+
 private theorem readUInt24_ok {r r' : Reader} {n : Nat}
     (h : r.readUInt24 = .ok (n, r')) :
     r'.bytes = r.bytes ∧ r'.offset = r.offset + 3 ∧ r'.offset ≤ r.bytes.size := by
@@ -1086,90 +1098,171 @@ def uint16ListBytes : List UInt16 → ByteArray
   | [] => ByteArray.empty
   | v :: rest => appendUInt16 ByteArray.empty v ++ uint16ListBytes rest
 
+/-- Keep the group identifiers this implementation knows, in wire order.
+Explicit recursion (not a `for` loop) so the ClientHello laws below can
+evaluate it. -/
+private def knownGroupsLoop : List UInt16 → Array NamedGroup → Array NamedGroup
+  | [], known => known
+  | id :: rest, known =>
+      match NamedGroup.ofUInt16? id with
+      | some group => knownGroupsLoop rest (known.push group)
+      | none => knownGroupsLoop rest known
+
 private def parseSupportedGroups (bytes : ByteArray) :
-    Except String (Array UInt16 × Array NamedGroup) := do
-  let ids ← parseUInt16List bytes
-  if ids.isEmpty then
-    throw "supported_groups list must not be empty"
-  let mut known : Array NamedGroup := #[]
-  for id in ids do
-    if let some group := NamedGroup.ofUInt16? id then
-      known := known.push group
-  pure (ids, known)
+    Except String (Array UInt16 × Array NamedGroup) :=
+  match parseUInt16List bytes with
+  | .error e => .error e
+  | .ok ids =>
+    if ids.isEmpty then
+      .error "supported_groups list must not be empty"
+    else
+      .ok (ids, knownGroupsLoop ids.toList #[])
+
+/-- One step of key_share entry parsing: read `group ‖ uint16 key_exchange`
+until the cursor is exhausted, rejecting empty keys and duplicate groups and
+ignoring groups this implementation does not offer.
+
+Written as explicit well-founded recursion over the unconsumed bytes rather
+than a `while` loop (whose `Loop.forIn` is a `partial def`, hence opaque to
+the kernel) so the key-share laws at the end of this file can evaluate it. -/
+private def parseKeyShareEntriesLoop (r : Reader) (seenGroupIds : Array UInt16)
+    (out : Array ClientKeyShare) :
+    Except String (Array UInt16 × Array ClientKeyShare) :=
+  if r.atEnd then
+    .ok (seenGroupIds, out)
+  else
+    match h16 : r.readUInt16 with
+    | .error e => .error e
+    | .ok (groupId, r₁) =>
+      match hv : r₁.readVector16 with
+      | .error e => .error e
+      | .ok (keyExchange, r₂) =>
+        if keyExchange.isEmpty then
+          .error s!"key_share entry for group {groupId} has an empty key_exchange"
+        else if seenGroupIds.contains groupId then
+          .error s!"duplicate key_share entry for group {groupId}"
+        else
+          have hlt : r₂.bytes.size - r₂.offset < r.bytes.size - r.offset := by
+            obtain ⟨hb1, ho1, hle1⟩ := readUInt16_ok h16
+            obtain ⟨hb2, ho2, hle2⟩ := readVector16_ok hv
+            rw [hb2, hb1]
+            rw [hb1] at hle2
+            omega
+          match NamedGroup.ofUInt16? groupId with
+          | some group =>
+              parseKeyShareEntriesLoop r₂ (seenGroupIds.push groupId)
+                (out.push { group, keyExchange })
+          | none =>
+              -- ignore groups we do not implement
+              parseKeyShareEntriesLoop r₂ (seenGroupIds.push groupId) out
+  termination_by r.bytes.size - r.offset
+  decreasing_by
+    · exact hlt
+    · exact hlt
 
 private def parseKeyShareEntries (bytes : ByteArray) :
-    Except String (Array UInt16 × Array ClientKeyShare) := do
-  let mut r : Reader := { bytes }
-  let mut out : Array ClientKeyShare := #[]
-  let mut seenGroupIds : Array UInt16 := #[]
-  while !r.atEnd do
-    let (groupId, r') ← r.readUInt16
-    let (keyExchange, r') ← r'.readVector16
-    if keyExchange.isEmpty then
-      throw s!"key_share entry for group {groupId} has an empty key_exchange"
-    if seenGroupIds.contains groupId then
-      throw s!"duplicate key_share entry for group {groupId}"
-    seenGroupIds := seenGroupIds.push groupId
-    match NamedGroup.ofUInt16? groupId with
-    | some group => out := out.push { group, keyExchange }
-    | none => pure ()  -- ignore groups we do not implement
-    r := r'
-  pure (seenGroupIds, out)
+    Except String (Array UInt16 × Array ClientKeyShare) :=
+  parseKeyShareEntriesLoop { bytes } #[] #[]
 
-private def isOrderedSubset (subset superset : Array UInt16) : Bool := Id.run do
-  let mut next := 0
-  for value in subset do
-    let mut found := false
-    while next < superset.size && !found do
-      if superset[next]! == value then
-        found := true
-      next := next + 1
-    unless found do
-      return false
-  return true
+/-- Whether `subset` occurs as a subsequence of `superset`. Explicit structural
+recursion (not the nested `while` scan it replaces) so the ClientHello laws
+below can evaluate it. -/
+@[expose] def isOrderedSubsetLoop : List UInt16 → List UInt16 → Bool
+  | [], _ => true
+  | _ :: _, [] => false
+  | v :: vs, s :: ss =>
+      if s == v then isOrderedSubsetLoop vs ss else isOrderedSubsetLoop (v :: vs) ss
 
-private def parseServerNameList (bytes : ByteArray) : Except String (Option String) := do
+/-- The key_share groups must occur in supported_groups order. Public because
+the ClientHello inversion law below takes it as a hypothesis. -/
+@[expose] def isOrderedSubset (subset superset : Array UInt16) : Bool :=
+  isOrderedSubsetLoop subset.toList superset.toList
+
+/-- One step of SNI server_name_list parsing: read `name_type ‖ uint16 name`
+until the cursor is exhausted. Unknown name types are structurally
+length-delimited and ignored. Explicit well-founded recursion, not a `while`
+loop, for the same reason as `parseExtensionsLoop`. -/
+private def parseServerNameListLoop (r : Reader) (seenNameTypes : Array UInt8)
+    (result : Option String) : Except String (Option String) :=
+  if r.atEnd then
+    .ok result
+  else
+    match h8 : r.readUInt8 with
+    | .error e => .error e
+    | .ok (nameType, r₁) =>
+      match hv : r₁.readVector16 with
+      | .error e => .error e
+      | .ok (name, r₂) =>
+        if name.isEmpty then
+          .error s!"SNI name of type {nameType} must not be empty"
+        else if seenNameTypes.contains nameType then
+          .error s!"duplicate SNI name type {nameType}"
+        else
+          have hlt : r₂.bytes.size - r₂.offset < r.bytes.size - r.offset := by
+            obtain ⟨hb1, ho1, hle1⟩ := readUInt8_ok h8
+            obtain ⟨hb2, ho2, hle2⟩ := readVector16_ok hv
+            rw [hb2, hb1]
+            rw [hb1] at hle2
+            omega
+          if nameType == 0 then
+            if name.foldl (fun found b => found || b == 0) false then
+              .error "SNI host_name must not contain NUL"
+            else
+              match String.fromUTF8? name with
+              | some hostName =>
+                  parseServerNameListLoop r₂ (seenNameTypes.push nameType)
+                    (some hostName)
+              | none => .error "SNI host_name is not valid UTF-8"
+          else
+            parseServerNameListLoop r₂ (seenNameTypes.push nameType) result
+  termination_by r.bytes.size - r.offset
+  decreasing_by
+    · exact hlt
+    · exact hlt
+
+private def parseServerNameList (bytes : ByteArray) :
+    Except String (Option String) :=
   if bytes.isEmpty then
-    throw "SNI server_name list must not be empty"
-  let mut r : Reader := { bytes }
-  let mut seenNameTypes : Array UInt8 := #[]
-  let mut result : Option String := none
-  while !r.atEnd do
-    let (nameType, r') ← r.readUInt8
-    let (name, r') ← r'.readVector16
-    if name.isEmpty then
-      throw s!"SNI name of type {nameType} must not be empty"
-    if seenNameTypes.contains nameType then
-      throw s!"duplicate SNI name type {nameType}"
-    seenNameTypes := seenNameTypes.push nameType
-    if nameType == 0 then
-      if name.foldl (fun found b => found || b == 0) false then
-        throw "SNI host_name must not contain NUL"
-      match String.fromUTF8? name with
-      | some hostName => result := some hostName
-      | none => throw "SNI host_name is not valid UTF-8"
-    -- Unknown name types are structurally length-delimited and ignored.
-    r := r'
-  pure result
+    .error "SNI server_name list must not be empty"
+  else
+    parseServerNameListLoop { bytes } #[] none
 
-private def parseAlpnProtocolList (bytes : ByteArray) : Except String (Array String) := do
+/-- One step of ALPN ProtocolNameList parsing: read one length-prefixed name
+until the cursor is exhausted. Explicit well-founded recursion, not a `while`
+loop, for the same reason as `parseExtensionsLoop`. -/
+private def parseAlpnProtocolListLoop (r : Reader) (out : Array String) :
+    Except String (Array String) :=
+  if r.atEnd then
+    .ok out
+  else
+    match hv : r.readVector8 with
+    | .error e => .error e
+    | .ok (name, r₁) =>
+      if name.isEmpty then
+        .error "ALPN protocol name must not be empty"
+      else
+        have hlt : r₁.bytes.size - r₁.offset < r.bytes.size - r.offset := by
+          obtain ⟨hb, ho, hle⟩ := readVector8_ok hv
+          rw [hb]
+          omega
+        match String.fromUTF8? name with
+        | some s => parseAlpnProtocolListLoop r₁ (out.push s)
+        | none =>
+            -- ProtocolName is an opaque byte string, not text. This server's
+            -- application-facing API uses String protocol IDs, so retain the
+            -- UTF-8 offers it can negotiate and ignore other well-formed IDs.
+            parseAlpnProtocolListLoop r₁ out
+  termination_by r.bytes.size - r.offset
+  decreasing_by
+    · exact hlt
+    · exact hlt
+
+private def parseAlpnProtocolList (bytes : ByteArray) :
+    Except String (Array String) :=
   if bytes.isEmpty then
-    throw "ALPN protocol list must not be empty"
-  let mut r : Reader := { bytes }
-  let mut out : Array String := #[]
-  while !r.atEnd do
-    let (name, r') ← r.readVector8
-    if name.isEmpty then
-      throw "ALPN protocol name must not be empty"
-    match String.fromUTF8? name with
-    | some s => out := out.push s
-    | none =>
-        -- ProtocolName is an opaque byte string, not text. This server's
-        -- application-facing API uses String protocol IDs, so retain the
-        -- UTF-8 offers it can negotiate and ignore other well-formed IDs.
-        pure ()
-    r := r'
-  pure out
+    .error "ALPN protocol list must not be empty"
+  else
+    parseAlpnProtocolListLoop { bytes } #[]
 
 /-- Parse a ClientHello for the server flow. Extracts the fields the server needs
 to select a key-exchange group, verify TLS 1.3 support, and negotiate ALPN/SNI. -/
