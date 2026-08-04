@@ -12,6 +12,7 @@ lean_library(
         "Record/Laws.lean",
         "Handshake.lean",
         "Client.lean",
+        "Client/Laws.lean",
         "Server.lean",
     ],
     deps = [

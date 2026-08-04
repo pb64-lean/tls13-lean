@@ -379,11 +379,12 @@ def start (config : Config) : Except Error Output := do
   }
   pure { state, wireBytes }
 
-private def acceptServerHello (state : State) (message : Handshake.Message) :
-    Except Error State := do
-  unless state.phase == .waitingServerHello do
-    throw (.unexpectedHandshake state.phase message.msgType)
-  let hello ← liftHandshake (Handshake.parseServerHello message)
+/-- The ServerHello checks that touch no key state: the session-id echo, and the
+requirement that the selected cipher suite and key-share group are ones this
+connection's ClientHello actually offered. Factored out of `acceptServerHello`
+so that function stays a short chain of binds the engine laws can walk. -/
+private def checkServerHello (state : State) (hello : Handshake.ServerHello) :
+    Except Error Unit := do
   unless hello.legacySessionIdEcho == state.legacySessionId do
     throw (.illegalParameter
       "ServerHello legacy_session_id_echo does not match ClientHello")
@@ -394,6 +395,13 @@ private def acceptServerHello (state : State) (message : Handshake.Message) :
     throw (.illegalParameter
       s!"server selected key-share group {hello.selectedGroup.toUInt16} \
         that the client did not offer")
+
+private def acceptServerHello (state : State) (message : Handshake.Message) :
+    Except Error State := do
+  unless state.phase == .waitingServerHello do
+    throw (.unexpectedHandshake state.phase message.msgType)
+  let hello ← liftHandshake (Handshake.parseServerHello message)
+  checkServerHello state hello
   let sharedSecret ← match hello.selectedGroup with
     | .x25519 =>
       let some sharedSecret :=
@@ -885,6 +893,48 @@ def closeNotify (state : State) : Except Error Output := do
     throw (.notConnected state.phase)
   let (state, wireBytes) ← emitCloseNotify state
   pure { state, wireBytes }
+
+/-! ## Runs
+
+A connection is driven by a sequence of caller operations. `run` folds them
+purely, which gives the state-machine laws in `Tls.Client.Laws` a single object
+to quantify over — in particular the nonce non-reuse theorem, which is about
+everything one run of the engine protects. -/
+
+/-- One caller-driven step of a client connection. -/
+inductive Op where
+  /-- Transport bytes arrived. -/
+  | feed (chunk : ByteArray)
+  /-- Application bytes to protect and send. -/
+  | send (plaintext : ByteArray)
+  /-- Send `close_notify`. -/
+  | close
+  /-- Seal a fatal alert; the caller discards the connection afterwards. -/
+  | fatalAlert (description : UInt8)
+  deriving Inhabited
+
+def step (state : State) (op : Op) : Except Error Output :=
+  match op with
+  | .feed chunk => feed state chunk
+  | .send plaintext => sealApplication state plaintext
+  | .close => closeNotify state
+  | .fatalAlert description => sealFatalAlert state description
+
+/-- Drive a sequence of operations from `state`, concatenating produced wire
+bytes and plaintext in order. -/
+def run (state : State) (ops : List Op) : Except Error Output :=
+  match ops with
+  | [] => .ok { state }
+  | op :: rest =>
+    match step state op with
+    | .error e => .error e
+    | .ok out =>
+      match run out.state rest with
+      | .error e => .error e
+      | .ok final =>
+        .ok { final with
+          wireBytes := out.wireBytes ++ final.wireBytes
+          plaintext := out.plaintext ++ final.plaintext }
 
 end Client
 end Tls
