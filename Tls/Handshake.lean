@@ -947,6 +947,30 @@ def parseNewSessionTicket (msg : Message) : Except String NewSessionTicket :=
   else
     .error s!"expected NewSessionTicket ({newSessionTicketType}), got {msg.msgType}"
 
+/-- Build a NewSessionTicket carrying no extensions. Mirrors
+`parseNewSessionTicket`: the same lifetime and non-empty-ticket checks, in the
+same order. -/
+def encodeNewSessionTicket (ticketLifetime ticketAgeAdd : UInt32)
+    (ticketNonce ticket : ByteArray) : Except String Message :=
+  if ticketLifetime > 604800 then
+    .error s!"NewSessionTicket lifetime exceeds seven days ({ticketLifetime})"
+  else if ticket.isEmpty then
+    .error "NewSessionTicket ticket must not be empty"
+  else
+    match encodeVector8 ticketNonce with
+    | .error e => .error e
+    | .ok nonceVector =>
+      match encodeVector16 ticket with
+      | .error e => .error e
+      | .ok ticketVector =>
+        match encodeVector16 ByteArray.empty with
+        | .error e => .error e
+        | .ok extensionsVector =>
+          frame newSessionTicketType
+            (appendUInt32 ByteArray.empty ticketLifetime ++
+              appendUInt32 ByteArray.empty ticketAgeAdd ++ nonceVector ++
+              ticketVector ++ extensionsVector)
+
 inductive KeyUpdateRequest where
   | updateNotRequested
   | updateRequested
@@ -1495,6 +1519,28 @@ private theorem readUInt24_eval {b : ByteArray} {off : Nat}
     extract_get! (by omega) (by omega)]
   rfl
 
+private theorem uint32_recompose (v : UInt32) :
+    ((v >>> 24).toUInt8.toUInt32 <<< 24 ||| (v >>> 16).toUInt8.toUInt32 <<< 16 |||
+      (v >>> 8).toUInt8.toUInt32 <<< 8 ||| v.toUInt8.toUInt32) = v := by
+  bv_decide
+
+private theorem readUInt32_eval {b : ByteArray} {off : Nat}
+    (h : off + 4 ≤ b.size) :
+    Reader.readUInt32 (Reader.mk b off) =
+      .ok ((b.get! off).toUInt32 <<< 24 ||| (b.get! (off + 1)).toUInt32 <<< 16 |||
+        (b.get! (off + 2)).toUInt32 <<< 8 ||| (b.get! (off + 3)).toUInt32,
+        Reader.mk b (off + 4)) := by
+  unfold Reader.readUInt32
+  rw [take_eval (by omega)]
+  show Except.ok (((b.extract off (off + 4)).get! 0).toUInt32 <<< 24 |||
+      ((b.extract off (off + 4)).get! 1).toUInt32 <<< 16 |||
+      ((b.extract off (off + 4)).get! 2).toUInt32 <<< 8 |||
+      ((b.extract off (off + 4)).get! 3).toUInt32,
+    Reader.mk b (off + 4)) = _
+  rw [extract_get! (by omega) (by omega), extract_get! (by omega) (by omega),
+    extract_get! (by omega) (by omega), extract_get! (by omega) (by omega)]
+  rfl
+
 /-! ### Framing roundtrip with residual -/
 
 /-- **Wire roundtrip with residual**: `decodeOne` accepts a framed message's
@@ -1806,6 +1852,39 @@ theorem encodeFinished_decode {verifyData : ByteArray} {msg : Message}
     (h : encodeFinished verifyData = .ok msg) : decode msg.encoded = .ok msg :=
   (encodeFinished_frame h).elim fun _ hf => decode_frame hf
 
+private theorem encodeNewSessionTicket_frame {ticketLifetime ticketAgeAdd : UInt32}
+    {ticketNonce ticket : ByteArray} {msg : Message}
+    (h : encodeNewSessionTicket ticketLifetime ticketAgeAdd ticketNonce ticket
+      = .ok msg) :
+    ∃ body, frame newSessionTicketType body = .ok msg := by
+  unfold encodeNewSessionTicket at h
+  split at h
+  · cases h
+  · split at h
+    · cases h
+    · split at h
+      · cases h
+      · split at h
+        · cases h
+        · split at h
+          · cases h
+          · exact ⟨_, h⟩
+
+/-- NewSessionTicket wire roundtrip with residual. -/
+theorem encodeNewSessionTicket_decodeOne {ticketLifetime ticketAgeAdd : UInt32}
+    {ticketNonce ticket : ByteArray} {msg : Message}
+    (h : encodeNewSessionTicket ticketLifetime ticketAgeAdd ticketNonce ticket
+      = .ok msg) (rest : ByteArray) :
+    decodeOne (msg.encoded ++ rest) = .ok (msg, rest) :=
+  (encodeNewSessionTicket_frame h).elim fun _ hf => decodeOne_frame hf rest
+
+/-- NewSessionTicket exact wire roundtrip. -/
+theorem encodeNewSessionTicket_decode {ticketLifetime ticketAgeAdd : UInt32}
+    {ticketNonce ticket : ByteArray} {msg : Message}
+    (h : encodeNewSessionTicket ticketLifetime ticketAgeAdd ticketNonce ticket
+      = .ok msg) : decode msg.encoded = .ok msg :=
+  (encodeNewSessionTicket_frame h).elim fun _ hf => decode_frame hf
+
 /-- KeyUpdate wire roundtrip with residual. -/
 theorem encodeKeyUpdate_decodeOne {request : KeyUpdateRequest} {msg : Message}
     (h : encodeKeyUpdate request = .ok msg) (rest : ByteArray) :
@@ -2074,6 +2153,36 @@ private theorem readUInt16_at {P S : ByteArray} {v : UInt16} :
     omega
   rw [readUInt16_eval hbound, h0, h1, uint16_recompose]
 
+private theorem readUInt32_at {P S : ByteArray} {v : UInt32} :
+    Reader.readUInt32
+        (Reader.mk (P ++ (appendUInt32 ByteArray.empty v ++ S)) P.size) =
+      .ok (v, Reader.mk (P ++ (appendUInt32 ByteArray.empty v ++ S))
+        (P.size + 4)) := by
+  have hA : (appendUInt32 ByteArray.empty v).size = 4 := rfl
+  have h0 : (P ++ (appendUInt32 ByteArray.empty v ++ S)).get! P.size =
+      (v >>> 24).toUInt8 := by
+    have h := get!_mid (P := P) (M := appendUInt32 ByteArray.empty v) (S := S)
+      (k := 0) (by rw [hA]; omega)
+    rw [Nat.add_zero] at h
+    rw [h]
+    rfl
+  have h1 : (P ++ (appendUInt32 ByteArray.empty v ++ S)).get! (P.size + 1) =
+      (v >>> 16).toUInt8 := by
+    rw [get!_mid (by rw [hA]; omega)]
+    rfl
+  have h2 : (P ++ (appendUInt32 ByteArray.empty v ++ S)).get! (P.size + 2) =
+      (v >>> 8).toUInt8 := by
+    rw [get!_mid (by rw [hA]; omega)]
+    rfl
+  have h3 : (P ++ (appendUInt32 ByteArray.empty v ++ S)).get! (P.size + 3) =
+      v.toUInt8 := by
+    rw [get!_mid (by rw [hA]; omega)]
+    rfl
+  have hbound : P.size + 4 ≤ (P ++ (appendUInt32 ByteArray.empty v ++ S)).size := by
+    rw [ByteArray.size_append, ByteArray.size_append, hA]
+    omega
+  rw [readUInt32_eval hbound, h0, h1, h2, h3, uint32_recompose]
+
 private theorem readUInt24_at {P S : ByteArray} {n : Nat} (h : n < 2 ^ 24) :
     Reader.readUInt24 (Reader.mk (P ++ (length24Bytes n ++ S)) P.size) =
       .ok (n, Reader.mk (P ++ (length24Bytes n ++ S)) (P.size + 3)) := by
@@ -2174,6 +2283,12 @@ private theorem readUInt16_at' {W P S : ByteArray} {off : Nat} {v : UInt16}
     Reader.readUInt16 (Reader.mk W off) = .ok (v, Reader.mk W (off + 2)) := by
   subst hW; subst hoff
   exact readUInt16_at
+
+private theorem readUInt32_at' {W P S : ByteArray} {off : Nat} {v : UInt32}
+    (hW : W = P ++ (appendUInt32 ByteArray.empty v ++ S)) (hoff : off = P.size) :
+    Reader.readUInt32 (Reader.mk W off) = .ok (v, Reader.mk W (off + 4)) := by
+  subst hW; subst hoff
+  exact readUInt32_at
 
 private theorem readUInt24_at' {W P S : ByteArray} {off n : Nat}
     (hW : W = P ++ (length24Bytes n ++ S)) (hoff : off = P.size) (h : n < 2 ^ 24) :
@@ -2912,6 +3027,145 @@ theorem encodeCertificate_parse {leaf : ByteArray} {rest : List ByteArray}
           simp only [hloop]
           rw [if_neg (by simp)]
           rfl
+
+/-! ### NewSessionTicket -/
+
+/-- **Parse inverts encode for NewSessionTicket**: every field comes back, and
+the ticket carries no extensions. -/
+theorem encodeNewSessionTicket_parse {ticketLifetime ticketAgeAdd : UInt32}
+    {ticketNonce ticket : ByteArray} {msg : Message}
+    (h : encodeNewSessionTicket ticketLifetime ticketAgeAdd ticketNonce ticket
+      = .ok msg) :
+    parseNewSessionTicket msg = .ok
+      { ticketLifetime := ticketLifetime, ticketAgeAdd := ticketAgeAdd,
+        ticketNonce := ticketNonce, ticket := ticket, extensions := #[],
+        encoded := msg.encoded } := by
+  unfold encodeNewSessionTicket at h
+  split at h
+  · cases h
+  · rename_i hlife
+    split at h
+    · cases h
+    · rename_i hticket
+      split at h
+      · cases h
+      · rename_i nonceVector hnonce
+        split at h
+        · cases h
+        · rename_i ticketVector hticketVec
+          split at h
+          · cases h
+          · rename_i extensionsVector hextVec
+            obtain ⟨hnonceSz, hnonceEq⟩ := encodeVector8_ok hnonce
+            obtain ⟨hticketSz, hticketEq⟩ := encodeVector16_ok hticketVec
+            obtain ⟨_, hextEq⟩ := encodeVector16_ok hextVec
+            obtain ⟨hlt, hmsg⟩ := frame_spec h
+            have hty : msg.msgType = newSessionTicketType := by rw [hmsg]
+            have hbody : msg.body =
+                appendUInt32 ByteArray.empty ticketLifetime ++
+                  appendUInt32 ByteArray.empty ticketAgeAdd ++
+                  (ByteArray.empty.push (UInt8.ofNat ticketNonce.size) ++
+                    ticketNonce) ++
+                  (appendUInt16 ByteArray.empty (UInt16.ofNat ticket.size) ++
+                    ticket) ++
+                  (appendUInt16 ByteArray.empty
+                    (UInt16.ofNat ByteArray.empty.size) ++ ByteArray.empty) := by
+              rw [hmsg]
+              show _ ++ _ ++ nonceVector ++ ticketVector ++ extensionsVector = _
+              rw [hnonceEq, hticketEq, hextEq]
+            -- The five field reads.
+            have h1 : Reader.readUInt32 (Reader.mk msg.body 0) =
+                .ok (ticketLifetime, Reader.mk msg.body (0 + 4)) :=
+              readUInt32_at' (W := msg.body) (off := 0) (P := ByteArray.empty)
+                (by rw [hbody]; simp only [ByteArray.append_assoc,
+                  ByteArray.empty_append]; rfl) rfl
+            have h2 : Reader.readUInt32 (Reader.mk msg.body (0 + 4)) =
+                .ok (ticketAgeAdd, Reader.mk msg.body (0 + 4 + 4)) :=
+              readUInt32_at' (W := msg.body) (off := 0 + 4)
+                (P := appendUInt32 ByteArray.empty ticketLifetime)
+                (by rw [hbody]; simp only [ByteArray.append_assoc]; rfl) rfl
+            have h3 : Reader.readVector8 (Reader.mk msg.body (0 + 4 + 4)) =
+                .ok (ticketNonce,
+                  Reader.mk msg.body (0 + 4 + 4 + 1 + ticketNonce.size)) :=
+              readVector8_at' (W := msg.body) (off := 0 + 4 + 4)
+                (P := appendUInt32 ByteArray.empty ticketLifetime ++
+                  appendUInt32 ByteArray.empty ticketAgeAdd)
+                (X := ticketNonce)
+                (by rw [hbody]; simp only [ByteArray.append_assoc]; rfl)
+                (by rw [ByteArray.size_append, show (appendUInt32 ByteArray.empty ticketLifetime).size = 4 from rfl,
+                  show (appendUInt32 ByteArray.empty ticketAgeAdd).size = 4 from rfl,
+                  ]) hnonceSz
+            have h4 : Reader.readVector16
+                (Reader.mk msg.body (0 + 4 + 4 + 1 + ticketNonce.size)) =
+                .ok (ticket, Reader.mk msg.body
+                  (0 + 4 + 4 + 1 + ticketNonce.size + 2 + ticket.size)) :=
+              readVector16_at' (W := msg.body)
+                (off := 0 + 4 + 4 + 1 + ticketNonce.size)
+                (P := appendUInt32 ByteArray.empty ticketLifetime ++
+                  appendUInt32 ByteArray.empty ticketAgeAdd ++
+                  (ByteArray.empty.push (UInt8.ofNat ticketNonce.size) ++
+                    ticketNonce))
+                (X := ticket)
+                (by rw [hbody]; simp only [ByteArray.append_assoc]; rfl)
+                (by rw [ByteArray.size_append, ByteArray.size_append,
+                  ByteArray.size_append, show (appendUInt32 ByteArray.empty ticketLifetime).size = 4 from rfl,
+                  show (appendUInt32 ByteArray.empty ticketAgeAdd).size = 4 from rfl,
+                  show (ByteArray.empty.push
+                    (UInt8.ofNat ticketNonce.size)).size = 1 from rfl]; omega)
+                hticketSz
+            have h5 : Reader.readVector16 (Reader.mk msg.body
+                (0 + 4 + 4 + 1 + ticketNonce.size + 2 + ticket.size)) =
+                .ok (ByteArray.empty, Reader.mk msg.body
+                  (0 + 4 + 4 + 1 + ticketNonce.size + 2 + ticket.size + 2 +
+                    ByteArray.empty.size)) :=
+              readVector16_at' (W := msg.body)
+                (off := 0 + 4 + 4 + 1 + ticketNonce.size + 2 + ticket.size)
+                (P := appendUInt32 ByteArray.empty ticketLifetime ++
+                  appendUInt32 ByteArray.empty ticketAgeAdd ++
+                  (ByteArray.empty.push (UInt8.ofNat ticketNonce.size) ++
+                    ticketNonce) ++
+                  (appendUInt16 ByteArray.empty (UInt16.ofNat ticket.size) ++
+                    ticket))
+                (X := ByteArray.empty) (S := ByteArray.empty)
+                (by rw [hbody]; simp only [ByteArray.append_assoc,
+                  ByteArray.append_empty])
+                (by rw [ByteArray.size_append, ByteArray.size_append,
+                  ByteArray.size_append, ByteArray.size_append,
+                  ByteArray.size_append, show (appendUInt32 ByteArray.empty ticketLifetime).size = 4 from rfl,
+                  show (appendUInt32 ByteArray.empty ticketAgeAdd).size = 4 from rfl,
+                  show (ByteArray.empty.push
+                    (UInt8.ofNat ticketNonce.size)).size = 1 from rfl,
+                  show (appendUInt16 ByteArray.empty
+                    (UInt16.ofNat ticket.size)).size = 2 from rfl]; omega)
+                (by simp)
+            have hend : 0 + 4 + 4 + 1 + ticketNonce.size + 2 + ticket.size + 2 +
+                ByteArray.empty.size = msg.body.size := by
+              rw [hbody, ByteArray.size_append, ByteArray.size_append,
+                ByteArray.size_append, ByteArray.size_append,
+                ByteArray.size_append, ByteArray.size_append,
+                ByteArray.size_append,
+                show (appendUInt32 ByteArray.empty ticketLifetime).size = 4
+                  from rfl,
+                show (appendUInt32 ByteArray.empty ticketAgeAdd).size = 4 from rfl,
+                show (ByteArray.empty.push (UInt8.ofNat ticketNonce.size)).size
+                  = 1 from rfl,
+                show (appendUInt16 ByteArray.empty
+                  (UInt16.ofNat ticket.size)).size = 2 from rfl,
+                show (appendUInt16 ByteArray.empty
+                  (UInt16.ofNat ByteArray.empty.size)).size = 2 from rfl,
+                show ByteArray.empty.size = 0 from rfl]
+              omega
+            unfold parseNewSessionTicket
+            rw [hty, if_pos (show (newSessionTicketType == newSessionTicketType)
+              = true from rfl)]
+            simp only [h1]
+            rw [if_neg hlife]
+            simp only [h2, h3, h4]
+            rw [if_neg hticket]
+            simp only [h5]
+            simp only [requireEnd_eval (context := "NewSessionTicket") hend]
+            simp only [parseExtensions_empty]
+            rfl
 
 end Handshake
 end Tls
