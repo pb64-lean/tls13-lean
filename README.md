@@ -91,7 +91,13 @@ laws then prove the implementation computes it. Read the fine print:
   ClientHello…server Finished, with their §7.3 key/IV/sequence state.
   `Tls.Server.completeClientHello_keySchedule` is the server's mirror, and also
   pins the client Finished it will demand to §4.4.4's `finished_key` of the
-  client handshake traffic secret.
+  client handshake traffic secret. `processHandshakeBuffer_keySchedule` carries
+  the client's link across the *whole* encrypted server flight
+  (EncryptedExtensions, Certificate, CertificateVerify, Finished) in one
+  statement, so the two client laws compose into ServerHello → established
+  connection. What is still not mechanised is the transport plumbing between
+  `feed` and that function — record framing, decryption and dispatch — which
+  moves bytes and touches no key state.
 - The **empirical** anchor is separate and complementary: `hacl_kat_test` checks
   the schedule against RFC 8448's published values (`33ad0a1c…`, `6f2615a1…`)
   and the `HkdfLabel` layout against a hand-written encoding. A proof cannot say
@@ -422,7 +428,7 @@ test binary is built, so a violation is a red target, not a stale README:
 | --- | --- |
 | `//HaclStar:haclstar_assurance` | The trusted C boundary: the 16 `@[extern] opaque` bindings are accounted for and no proof hole exists in the FFI package |
 | `//TLS13:tls13_assurance` | 22 principal theorems — the RFC 8446 §7.1 derivation tree as data (`Derived.tree_rfc8446`, `Label.text_rfc8446`), the `HkdfLabel` wire image byte for byte, and the refinement of `expandLabel`/`deriveSecret`/Early/Handshake/Master/`Derive-Secret`; plus DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies` |
-| `//Tls:tls_assurance` | 58 principal theorems — nonce non-reuse (`WriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, nonce and sequence injectivity), record conservation and seal/open inversion, ClientHello canonicity and body injectivity, the §7.3/§7.2/§4.4.4 record-layer and Finished derivations and the engines' §7.1 epoch installations, and the state-machine transition and invariant laws (including both directions of the connected-only application-data rule and the client's no-read-epoch-before-ServerHello clause) |
+| `//Tls:tls_assurance` | 59 principal theorems — nonce non-reuse (`WriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, nonce and sequence injectivity), record conservation and seal/open inversion, ClientHello canonicity and body injectivity, the §7.3/§7.2/§4.4.4 record-layer and Finished derivations and the engines' §7.1 epoch installations, and the state-machine transition and invariant laws (including both directions of the connected-only application-data rule and the client's no-read-epoch-before-ServerHello clause) |
 
 Each target also scans every constant of the whole first-party closure
 (`HaclStar`, `TLS13`, `Tls` — 28 modules, ~5080 constants): nothing may reach

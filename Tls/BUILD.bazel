@@ -91,6 +91,7 @@ lean_assurance_test(
         "Tls.Client.finishedVerifyData_spec",
         "Tls.Client.acceptServerHello_keySchedule",
         "Tls.Client.completeServerHandshake_keySchedule",
+        "Tls.Client.processHandshakeBuffer_keySchedule",
         "Tls.Client.acceptKeyUpdate_keySchedule",
         "Tls.Server.finishedVerifyData_spec",
         "Tls.Server.completeClientHello_keySchedule",

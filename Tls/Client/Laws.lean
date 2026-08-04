@@ -1856,6 +1856,122 @@ theorem completeServerHandshake_keySchedule {H : Spec.Hkdf} (hi : Implements H)
     cases h
     exact hgoal _ rfl rfl
 
+private theorem sendKeyUpdateResponse_handshakeSecret {state next : State}
+    {wire : ByteArray} (h : sendKeyUpdateResponse state = .ok (next, wire)) :
+    next.handshakeSecret? = state.handshakeSecret? := by
+  unfold sendKeyUpdateResponse at h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨keys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨sealed, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨advancedKeys, wireBytes⟩ := sealed
+  obtain ⟨updatedKeys, _, h⟩ := except_bind_ok_inv h
+  cases h
+  rfl
+
+private theorem acceptKeyUpdate_handshakeSecret {state next : State}
+    {message : Handshake.Message} {wire : ByteArray}
+    (h : acceptKeyUpdate state message = .ok (next, wire)) :
+    next.handshakeSecret? = state.handshakeSecret? := by
+  unfold acceptKeyUpdate at h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  split at h
+  · cases h; rfl
+  · rw [sendKeyUpdateResponse_handshakeSecret h]
+
+/-- **The client's whole encrypted server flight installs the RFC 8446 §7.1
+application epochs.** `processHandshakeBuffer` consumes EncryptedExtensions,
+Certificate, CertificateVerify and the server Finished in one call. Either it
+did not reach the Finished — and the handshake secret is untouched, so the
+epochs are unchanged — or it did, and there is a definite transcript (the
+ClientHello…server Finished sequence the engine accumulated) such that for any
+key-schedule inputs agreeing with the engine on the empty and
+ClientHello…server Finished transcript hashes and on the handshake secret the
+state carried, the installed write and read epochs are
+`client_application_traffic_secret_0` and
+`server_application_traffic_secret_0`.
+
+Composed with `acceptServerHello_keySchedule` — which supplies exactly that
+handshake secret, as the specification's — this links a real run of the client
+from ServerHello to established connection to the RFC's derivation tree. What
+is still not mechanised is the transport plumbing between `feed` and this
+function (record framing, decryption and dispatch), which moves bytes and
+touches no key state. -/
+theorem processHandshakeBuffer_keySchedule {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {wire : ByteArray}
+    (h : processHandshakeBuffer state = .ok (next, wire)) :
+    next.handshakeSecret? = state.handshakeSecret? ∨
+    ∃ transcript : ByteArray, ∀ inp : Spec.Inputs,
+      inp.hash .empty = HaclStar.sha256 ByteArray.empty →
+      inp.hash .serverFinished = HaclStar.sha256 transcript →
+      state.handshakeSecret? = some (Spec.secret H inp .handshake) →
+      (∃ wk, next.writeKeys? = some wk ∧
+        Record.TrafficKeys.DerivedFrom H wk (Spec.derived H inp .cApTraffic)) ∧
+      (∃ rk, next.readKeys? = some rk ∧
+        Record.TrafficKeys.DerivedFrom H rk (Spec.derived H inp .sApTraffic)) := by
+  unfold processHandshakeBuffer at h
+  split at h
+  · cases h
+  · cases h; exact Or.inl rfl
+  · rename_i message rest htake
+    have hsize : rest.size < state.handshakeBuffered.size := takeHandshake?_size htake
+    simp only [pure_bind] at h
+    split at h
+    · cases h
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+      obtain ⟨alpn, _, h⟩ := except_bind_ok_inv h
+      split at h
+      · obtain ⟨_, h⟩ := unless_ok h
+        have hw := processHandshakeBuffer_keySchedule hi h
+        exact hw
+      · have hw := processHandshakeBuffer_keySchedule hi h
+        exact hw
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+      have hw := processHandshakeBuffer_keySchedule hi h
+      exact hw
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+      split at h
+      · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        obtain ⟨_, h⟩ := unless_ok h
+        obtain ⟨_, h⟩ := unless_ok h
+        have hw := processHandshakeBuffer_keySchedule hi h
+        exact hw
+      · cases h
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨_, h⟩ := unless_ok h
+      exact Or.inr ⟨state.transcript ++ message.encoded, fun inp h1 h2 h3 =>
+        completeServerHandshake_keySchedule hi inp h1 h2 h3 h⟩
+    · split at h
+      · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        have hw := processHandshakeBuffer_keySchedule hi h
+        exact hw
+      · split at h
+        · split at h
+          · cases h
+          · rename_i stateK wireK hacc
+            split at h
+            · cases h
+            · rename_i stateF moreWire hnext
+              cases h
+              have hbuf : stateK.handshakeBuffered.size <
+                  state.handshakeBuffered.size := by
+                rw [acceptKeyUpdate_buffered hacc]; exact hsize
+              have hk := acceptKeyUpdate_handshakeSecret hacc
+              rcases processHandshakeBuffer_keySchedule hi hnext with hl | ⟨t, ht⟩
+              · exact Or.inl (by rw [hl, hk])
+              · exact Or.inr ⟨t, fun inp h1 h2 h3 => ht inp h1 h2 (by rw [hk]; exact h3)⟩
+        · cases h
+  termination_by state.handshakeBuffered.size
+  decreasing_by
+    all_goals first
+      | exact hsize
+      | exact hbuf
+
 /-- **A KeyUpdate installs the RFC 8446 §7.2 successor epoch.** The new read
 epoch's secret is `HKDF-Expand-Label(old, "traffic upd", "", Hash.length)` —
 empty context, not a transcript hash — and its key, IV and sequence number are

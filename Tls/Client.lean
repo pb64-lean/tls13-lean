@@ -617,7 +617,11 @@ private theorem acceptKeyUpdate_buffered {state next : State}
                   simp only [hreq] at h
                   rw [sendKeyUpdateResponse_buffered h]
 
-private def processHandshakeBuffer (state : State) :
+/-- Consume every complete handshake message the buffer holds, in phase order:
+EncryptedExtensions, Certificate, CertificateVerify, then the server Finished
+that establishes the connection. Public (but not `@[expose]`d) so
+`Tls.Client.Laws` can state its key-schedule law as a public theorem. -/
+def processHandshakeBuffer (state : State) :
     Except Error (State × ByteArray) :=
   match htake : takeHandshake? state.handshakeBuffered with
   | .error e => .error e
