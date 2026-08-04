@@ -794,6 +794,23 @@ theorem TrafficKeys.seq_update {keys keys' : TrafficKeys}
       rw [except_bind_ok] at h
       exact seq_deriveTrafficKeys h
 
+/-- A key update moves to the RFC 8446 §7.2 successor traffic secret: the new
+epoch's secret is `updateTrafficSecret` of the old one, so a KeyUpdate really
+does change the epoch, not merely the sequence number. -/
+theorem TrafficKeys.secret_update {keys keys' : TrafficKeys}
+    (h : keys.update = .ok keys') :
+    updateTrafficSecret keys.secret = .ok keys'.secret := by
+  unfold TrafficKeys.update at h
+  cases hs : updateTrafficSecret keys.secret with
+  | error e =>
+      rw [hs] at h
+      rw [except_bind_error] at h
+      cases h
+  | ok next =>
+      rw [hs] at h
+      rw [except_bind_ok] at h
+      rw [(deriveTrafficKeys_ok h).2]
+
 /-! ## Seal and open
 
 Laws about record protection. The AEAD itself is an opaque HACL* FFI

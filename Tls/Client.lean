@@ -309,7 +309,7 @@ private theorem takeHandshake?_conservation {buffered rest : ByteArray}
     message.encoded ++ rest = buffered :=
   Handshake.takeMessage?_conservation (liftHandshake_ok h)
 
-private def constantTimeEq (left right : ByteArray) : Bool :=
+def constantTimeEq (left right : ByteArray) : Bool :=
   if left.size != right.size then
     false
   else
@@ -319,7 +319,7 @@ private def constantTimeEq (left right : ByteArray) : Bool :=
         different := different ||| (left.get! i ^^^ right.get! i)
       return different == 0
 
-private def finishedVerifyData (trafficSecret transcriptHash : ByteArray) : ByteArray :=
+def finishedVerifyData (trafficSecret transcriptHash : ByteArray) : ByteArray :=
   let finishedKey := TLS13.KeySchedule.expandLabel trafficSecret "finished"
     ByteArray.empty TLS13.KeySchedule.hashLen
   HaclStar.hmacSha256 finishedKey transcriptHash
