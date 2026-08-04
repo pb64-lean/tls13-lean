@@ -162,7 +162,12 @@ Four Bazel packages:
   cover the rest of the state-machine list: a connection becomes established
   only by verifying the peer `Finished` (`completeServerHandshake_verified`,
   `acceptClientFinished_verified`), application data is protected only by an
-  established and open connection (`sealApplication_connected`), a closed
+  established and open connection (`sealApplication_connected`) and — the
+  inbound mirror — application-data plaintext is only ever *delivered* to the
+  caller alongside an established connection, for a single feed and for a whole
+  run (`feed_plaintext_connected`, `run_plaintext_connected`; both rest on
+  `connected` being absorbing, which is proved as `feed_connected` /
+  `run_connected`), a closed
   connection is terminal (`feedWithFailure_closed`; every other failure is an
   `Except` error carrying no successor state, so failure is terminal by
   construction), HelloRetryRequest installs the RFC 8446 synthetic
@@ -337,7 +342,7 @@ test binary is built, so a violation is a red target, not a stale README:
 | --- | --- |
 | `//HaclStar:haclstar_assurance` | The trusted C boundary: the 16 `@[extern] opaque` bindings are accounted for and no proof hole exists in the FFI package |
 | `//TLS13:tls13_assurance` | 10 principal theorems — DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies` |
-| `//Tls:tls_assurance` | 37 principal theorems — nonce non-reuse (`WriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, nonce and sequence injectivity), record conservation and seal/open inversion, ClientHello canonicity and body injectivity, and the state-machine transition and invariant laws |
+| `//Tls:tls_assurance` | 42 principal theorems — nonce non-reuse (`WriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, nonce and sequence injectivity), record conservation and seal/open inversion, ClientHello canonicity and body injectivity, and the state-machine transition and invariant laws (including both directions of the connected-only application-data rule) |
 
 Each target also scans every constant of the whole first-party closure
 (`HaclStar`, `TLS13`, `Tls` — 26 modules, ~4650 constants): nothing may reach

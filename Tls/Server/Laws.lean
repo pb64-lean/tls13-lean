@@ -1083,6 +1083,477 @@ theorem feedWithFailure_closed {state : State} {chunk : ByteArray}
   unfold feedWithFailure
   rw [if_pos (by rw [hclosed, hchunk]; rfl)]
 
+/-! ### Inbound application data
+
+The mirror of `sealApplication_connected`. Outbound, the engine refuses to
+protect application data unless the connection is established; inbound, this is
+the statement that the caller never *receives* application-data plaintext from
+any other state. Both directions are needed: an engine that leaked pre-handshake
+bytes to the caller would be just as broken as one that sent them.
+
+The chain is one lemma per level, each in the combined form "either we were
+already connected, or this level produced plaintext — then the successor state
+is connected". The disjunction is what lets a single induction over a whole feed
+work: `processRecords` accumulates plaintext across records, so a record that
+delivers nothing must still carry the connectedness established by an earlier
+one. -/
+
+private theorem emitCloseNotify_phase {state next : State} {wire : ByteArray}
+    (h : emitCloseNotify state = .ok (next, wire)) : next.phase = state.phase := by
+  unfold emitCloseNotify at h
+  split at h
+  · cases h; rfl
+  · obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
+    obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
+    obtain ⟨sealedKeys, wireBytes⟩ := sealed
+    cases h
+    rfl
+
+private theorem processAlert_phase {state next : State} {fragment : ByteArray}
+    {duringHandshake : Bool} {wire : ByteArray}
+    (h : processAlert state fragment duringHandshake = .ok (next, wire)) :
+    next.phase = state.phase := by
+  unfold processAlert at h
+  simp only [pure_bind] at h
+  split at h
+  case isFalse => cases h
+  split at h
+  case isFalse => cases h
+  split at h
+  · split at h
+    · cases h
+    · have hp := emitCloseNotify_phase h
+      exact hp
+  · cases h
+
+private theorem sendKeyUpdateResponse_phase {state next : State} {wire : ByteArray}
+    (h : sendKeyUpdateResponse state = .ok (next, wire)) :
+    next.phase = state.phase := by
+  unfold sendKeyUpdateResponse at h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
+  obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
+  obtain ⟨advancedKeys, wireBytes⟩ := sealed
+  obtain ⟨updatedKeys, hu, h⟩ := except_bind_ok_inv h
+  cases h
+  rfl
+
+private theorem acceptKeyUpdate_phase {state next : State}
+    {message : Handshake.Message} {wire : ByteArray}
+    (h : acceptKeyUpdate state message = .ok (next, wire)) :
+    next.phase = state.phase := by
+  unfold acceptKeyUpdate at h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  split at h
+  · cases h; rfl
+  · have hp := sendKeyUpdateResponse_phase h
+    exact hp
+
+/-- Post-handshake messages do not leave `connected`: the only handshake
+message the engine accepts there is a KeyUpdate, which changes epochs, not
+phases. -/
+private theorem processHandshakeBuffer_connected {state next : State}
+    {wire : ByteArray} (h : processHandshakeBuffer state = .ok (next, wire))
+    (hc : state.phase = .connected) : next.phase = .connected := by
+  unfold processHandshakeBuffer at h
+  split at h
+  · cases h
+  · cases h; exact hc
+  · rename_i message rest htake
+    have hsize : rest.size < state.handshakeBuffered.size := takeHandshake?_size htake
+    simp only [pure_bind] at h
+    split at h
+    · rename_i hph
+      have hph' : state.phase = Phase.waitingClientHello := hph
+      rw [hc] at hph'; cases hph'
+    · rename_i hph
+      have hph' : state.phase = Phase.waitingSecondClientHello := hph
+      rw [hc] at hph'; cases hph'
+    · rename_i hph
+      have hph' : state.phase = Phase.waitingClientFinished := hph
+      rw [hc] at hph'; cases hph'
+    · split at h
+      · split at h
+        · cases h
+        · rename_i stateK wireK hacc
+          split at h
+          · cases h
+          · rename_i stateF moreWire hnext
+            have hbuf : stateK.handshakeBuffered.size <
+                state.handshakeBuffered.size := by
+              rw [acceptKeyUpdate_buffered hacc]; exact hsize
+            have h2 := processHandshakeBuffer_connected hnext
+              (by rw [acceptKeyUpdate_phase hacc]; exact hc)
+            cases h
+            exact h2
+      · cases h
+  termination_by state.handshakeBuffered.size
+  decreasing_by
+    all_goals first
+      | exact hsize
+      | exact hbuf
+
+/-- The delivery point: a protected record hands plaintext up only from the
+`applicationData` branch, which refuses to run unless the phase is
+`connected`. -/
+private theorem processProtectedRecord_plaintext {state next : State}
+    {record : Record.RawRecord} {plain wire : ByteArray}
+    (h : processProtectedRecord state record = .ok (next, plain, wire))
+    (hp : state.phase = .connected ∨ plain.isEmpty = false) :
+    next.phase = .connected := by
+  unfold processProtectedRecord at h
+  simp only [pure_bind] at h
+  obtain ⟨readKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨opened, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨nextReadKeys, plaintext⟩ := opened
+  split at h
+  · obtain ⟨hph, h⟩ := unless_ok h
+    obtain ⟨_, h⟩ := if_throw_ok h
+    obtain ⟨_, h⟩ := unless_ok h
+    cases h
+    exact phase_eq_of_beq hph
+  · obtain ⟨_, h⟩ := if_throw_ok h
+    obtain ⟨pair, hpb, h⟩ := except_bind_ok_inv h
+    obtain ⟨stateH, wireH⟩ := pair
+    cases h
+    rcases hp with hc | hne
+    · exact processHandshakeBuffer_connected hpb hc
+    · exact absurd hne (by decide)
+  · obtain ⟨_, h⟩ := unless_ok h
+    obtain ⟨pair, hpa, h⟩ := except_bind_ok_inv h
+    obtain ⟨stateA, wireA⟩ := pair
+    cases h
+    rcases hp with hc | hne
+    · have hph := processAlert_phase hpa
+      exact hph.trans hc
+    · exact absurd hne (by decide)
+  · cases h
+
+private theorem processRecord_plaintext {state next : State}
+    {record : Record.RawRecord} {plain wire : ByteArray}
+    (h : processRecord state record = .ok (next, plain, wire))
+    (hp : state.phase = .connected ∨ plain.isEmpty = false) :
+    next.phase = .connected := by
+  unfold processRecord at h
+  simp only [pure_bind] at h
+  split at h
+  · -- waitingClientHello: no plaintext is ever produced, and the phase is not
+    -- `connected`, so both disjuncts are impossible.
+    rename_i hph
+    have hph' : state.phase = Phase.waitingClientHello := hph
+    split at h <;>
+      first
+        | (obtain ⟨pair, _, h⟩ := except_bind_ok_inv h
+           obtain ⟨stateP, wireP⟩ := pair
+           cases h
+           rcases hp with hc | hne
+           · rw [hc] at hph'; cases hph'
+           · exact absurd hne (by decide))
+        | (obtain ⟨_, h⟩ := unless_ok h
+           obtain ⟨pair, _, h⟩ := except_bind_ok_inv h
+           obtain ⟨stateA, wireA⟩ := pair
+           cases h
+           rcases hp with hc | hne
+           · rw [hc] at hph'; cases hph'
+           · exact absurd hne (by decide))
+        | cases h
+  · rename_i hph
+    have hph' : state.phase = Phase.waitingSecondClientHello := hph
+    split at h <;>
+      first
+        | (obtain ⟨pair, _, h⟩ := except_bind_ok_inv h
+           obtain ⟨stateP, wireP⟩ := pair
+           cases h
+           rcases hp with hc | hne
+           · rw [hc] at hph'; cases hph'
+           · exact absurd hne (by decide))
+        | (obtain ⟨_, h⟩ := unless_ok h
+           obtain ⟨_, h⟩ := unless_ok h
+           cases h
+           rcases hp with hc | hne
+           · rw [hc] at hph'; cases hph'
+           · exact absurd hne (by decide))
+        | (obtain ⟨_, h⟩ := unless_ok h
+           obtain ⟨pair, _, h⟩ := except_bind_ok_inv h
+           obtain ⟨stateA, wireA⟩ := pair
+           cases h
+           rcases hp with hc | hne
+           · rw [hc] at hph'; cases hph'
+           · exact absurd hne (by decide))
+        | cases h
+  · rename_i hph
+    have hph' : state.phase = Phase.waitingClientFinished := hph
+    split at h <;>
+      first
+        | (obtain ⟨_, h⟩ := unless_ok h
+           obtain ⟨_, h⟩ := unless_ok h
+           cases h
+           rcases hp with hc | hne
+           · rw [hc] at hph'; cases hph'
+           · exact absurd hne (by decide))
+        | exact processProtectedRecord_plaintext h hp
+        | cases h
+  · rename_i hph
+    have hph' : state.phase = Phase.connected := hph
+    split at h <;>
+      first
+        | exact processProtectedRecord_plaintext h (.inl hph')
+        | cases h
+
+private theorem append_isEmpty_false {a b : ByteArray}
+    (h : (a ++ b).isEmpty = false) : a.isEmpty = false ∨ b.isEmpty = false := by
+  simp only [ByteArray.isEmpty, beq_iff_eq, Bool.eq_false_iff, ne_eq,
+    ByteArray.size_append] at h ⊢
+  omega
+
+/-- `connected` is absorbing across a whole feed. -/
+private theorem processRecords_connected {records : List Record.RawRecord} :
+    ∀ {state : State} {plaintext wireBytes : ByteArray} {out : Output},
+      processRecords state records plaintext wireBytes = .ok out →
+        state.phase = .connected → out.state.phase = .connected := by
+  induction records with
+  | nil =>
+      intro state plaintext wireBytes out h hc
+      unfold processRecords at h
+      cases h
+      exact hc
+  | cons record rest ih =>
+      intro state plaintext wireBytes out h hc
+      unfold processRecords at h
+      split at h
+      · cases h
+      · rename_i stateN cleartext outbound hpr
+        exact ih h (processRecord_plaintext hpr (.inl hc))
+
+private theorem processRecords_plaintext {records : List Record.RawRecord} :
+    ∀ {state : State} {plaintext wireBytes : ByteArray} {out : Output},
+      processRecords state records plaintext wireBytes = .ok out →
+        (plaintext.isEmpty = false → state.phase = .connected) →
+        out.plaintext.isEmpty = false → out.state.phase = .connected := by
+  induction records with
+  | nil =>
+      intro state plaintext wireBytes out h hacc hne
+      unfold processRecords at h
+      cases h
+      exact hacc hne
+  | cons record rest ih =>
+      intro state plaintext wireBytes out h hacc hne
+      unfold processRecords at h
+      split at h
+      · cases h
+      · rename_i stateN cleartext outbound hpr
+        refine ih h (fun hcat => ?_) hne
+        rcases append_isEmpty_false hcat with hpl | hcl
+        · exact processRecord_plaintext hpr (.inl (hacc hpl))
+        · exact processRecord_plaintext hpr (.inr hcl)
+
+/-- **Application-data plaintext reaches the caller only from an established
+connection** — the inbound counterpart of `sealApplication_connected`. If a feed
+hands back any plaintext at all, the state it hands back with it is
+`connected`. -/
+theorem feedWithFailure_plaintext_connected {initial : State} {chunk : ByteArray}
+    {out : Output} (h : feedWithFailure initial chunk = .ok out)
+    (hne : out.plaintext.isEmpty = false) : out.state.phase = .connected := by
+  unfold feedWithFailure at h
+  split at h
+  · cases h
+  · split at h
+    · cases h
+    · exact processRecords_plaintext h (fun hemp => absurd hemp (by decide)) hne
+
+/-- `feed` never leaves an established connection. -/
+theorem feedWithFailure_connected {initial : State} {chunk : ByteArray}
+    {out : Output} (h : feedWithFailure initial chunk = .ok out)
+    (hc : initial.phase = .connected) : out.state.phase = .connected := by
+  unfold feedWithFailure at h
+  split at h
+  · cases h
+  · split at h
+    · cases h
+    · exact processRecords_connected h hc
+
+theorem feed_plaintext_connected {state : State} {chunk : ByteArray} {out : Output}
+    (h : feed state chunk = .ok out) (hne : out.plaintext.isEmpty = false) :
+    out.state.phase = .connected := by
+  unfold feed at h
+  cases hf : feedWithFailure state chunk with
+  | error failure => rw [hf] at h; cases h
+  | ok output =>
+      rw [hf] at h
+      cases h
+      exact feedWithFailure_plaintext_connected hf hne
+
+theorem feed_connected {state : State} {chunk : ByteArray} {out : Output}
+    (h : feed state chunk = .ok out) (hc : state.phase = .connected) :
+    out.state.phase = .connected := by
+  unfold feed at h
+  cases hf : feedWithFailure state chunk with
+  | error failure => rw [hf] at h; cases h
+  | ok output =>
+      rw [hf] at h
+      cases h
+      exact feedWithFailure_connected hf hc
+
+private theorem sealApplication_phase {state : State} {plaintext : ByteArray}
+    {out : Output} (h : sealApplication state plaintext = .ok out) :
+    out.state.phase = state.phase := by
+  unfold sealApplication at h
+  simp only [pure_bind] at h
+  split at h
+  · split at h
+    · cases h
+    · split at h
+      · cases h; rfl
+      · obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
+        obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
+        obtain ⟨nextKeys, records⟩ := sealed
+        cases h
+        rfl
+  · cases h
+
+private theorem closeNotify_phase {state : State} {out : Output}
+    (h : closeNotify state = .ok out) : out.state.phase = state.phase := by
+  unfold closeNotify at h
+  simp only [pure_bind] at h
+  split at h
+  case isFalse => cases h
+  obtain ⟨pair, hp, h⟩ := except_bind_ok_inv h
+  obtain ⟨next, wire⟩ := pair
+  cases h
+  exact emitCloseNotify_phase hp
+
+private theorem sealFatalAlert_phase {state : State} {description : UInt8}
+    {out : Output} (h : sealFatalAlert state description = .ok out) :
+    out.state.phase = state.phase := by
+  unfold sealFatalAlert at h
+  simp only [pure_bind] at h
+  split at h
+  · rename_i writeKeys hkeys
+    obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
+    obtain ⟨nextKeys, wire⟩ := sealed
+    cases h
+    rfl
+  · rename_i hkeys
+    obtain ⟨_, h⟩ := unless_ok h
+    obtain ⟨wire, _, h⟩ := except_bind_ok_inv h
+    cases h
+    rfl
+
+private theorem sealApplication_plaintext {state : State} {plaintext : ByteArray}
+    {out : Output} (h : sealApplication state plaintext = .ok out) :
+    out.plaintext = ByteArray.empty := by
+  unfold sealApplication at h
+  simp only [pure_bind] at h
+  split at h
+  · split at h
+    · cases h
+    · split at h
+      · cases h; rfl
+      · obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
+        obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
+        obtain ⟨nextKeys, records⟩ := sealed
+        cases h
+        rfl
+  · cases h
+
+private theorem closeNotify_plaintext {state : State} {out : Output}
+    (h : closeNotify state = .ok out) : out.plaintext = ByteArray.empty := by
+  unfold closeNotify at h
+  simp only [pure_bind] at h
+  split at h
+  case isFalse => cases h
+  obtain ⟨pair, hp, h⟩ := except_bind_ok_inv h
+  obtain ⟨next, wire⟩ := pair
+  cases h
+  rfl
+
+private theorem sealFatalAlert_plaintext {state : State} {description : UInt8}
+    {out : Output} (h : sealFatalAlert state description = .ok out) :
+    out.plaintext = ByteArray.empty := by
+  unfold sealFatalAlert at h
+  simp only [pure_bind] at h
+  split at h
+  · rename_i writeKeys hkeys
+    obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
+    obtain ⟨nextKeys, wire⟩ := sealed
+    cases h
+    rfl
+  · rename_i hkeys
+    obtain ⟨_, h⟩ := unless_ok h
+    obtain ⟨wire, _, h⟩ := except_bind_ok_inv h
+    cases h
+    rfl
+
+/-- Only `feed` produces plaintext; the send/close/alert operations return
+none, so the law lifts to a single step unchanged. -/
+theorem step_plaintext_connected {state : State} {op : Op} {out : Output}
+    (h : step state op = .ok out) (hne : out.plaintext.isEmpty = false) :
+    out.state.phase = .connected := by
+  unfold step at h
+  split at h
+  · exact feed_plaintext_connected h hne
+  · rw [sealApplication_plaintext h] at hne; cases hne
+  · rw [closeNotify_plaintext h] at hne; cases hne
+  · rw [sealFatalAlert_plaintext h] at hne; cases hne
+
+theorem step_connected {state : State} {op : Op} {out : Output}
+    (h : step state op = .ok out) (hc : state.phase = .connected) :
+    out.state.phase = .connected := by
+  unfold step at h
+  split at h
+  · exact feed_connected h hc
+  · rw [sealApplication_phase h]; exact hc
+  · rw [closeNotify_phase h]; exact hc
+  · rw [sealFatalAlert_phase h]; exact hc
+
+theorem run_connected {ops : List Op} : ∀ {state : State} {out : Output},
+    run state ops = .ok out → state.phase = .connected →
+      out.state.phase = .connected := by
+  induction ops with
+  | nil =>
+      intro state out h hc
+      unfold run at h; cases h; exact hc
+  | cons op rest ih =>
+      intro state out h hc
+      unfold run at h
+      split at h
+      · cases h
+      · rename_i out1 hstep
+        split at h
+        · cases h
+        · rename_i final hrun
+          have h2 := ih hrun (step_connected hstep hc)
+          cases h
+          exact h2
+
+/-- **Over a whole run, too**: any plaintext the caller receives comes back
+alongside an established connection. -/
+theorem run_plaintext_connected {ops : List Op} : ∀ {state : State} {out : Output},
+    run state ops = .ok out → out.plaintext.isEmpty = false →
+      out.state.phase = .connected := by
+  induction ops with
+  | nil =>
+      intro state out h hne
+      unfold run at h; cases h; cases hne
+  | cons op rest ih =>
+      intro state out h hne
+      unfold run at h
+      split at h
+      · cases h
+      · rename_i out1 hstep
+        split at h
+        · cases h
+        · rename_i final hrun
+          cases h
+          rcases append_isEmpty_false hne with h1 | h2
+          · have hc := step_plaintext_connected hstep h1
+            have h3 := run_connected hrun hc
+            exact h3
+          · have h3 := ih hrun h2
+            exact h3
+
 /-- **HelloRetryRequest applies the RFC 8446 §4.4.1 synthetic transcript**: the
 first ClientHello is replaced by `message_hash(CH1)` before the
 HelloRetryRequest is appended. -/
