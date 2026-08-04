@@ -39,6 +39,29 @@ lean_binary(
     deps = ["//Tls:tls"],
 )
 
+# External-client interoperability gate: drives the harness above with real
+# OpenSSL, curl, and (when available) Go crypto/tls clients, including forced
+# HelloRetryRequest paths. Tagged manual: it needs loopback TCP and host
+# tools, so it is excluded from the hermetic //... wildcard. Run it with
+#   bazel test //Test:external_interop_test --test_output=streamed
+# (optionally under `nix shell nixpkgs#go -c ...` for the Go cases).
+sh_test(
+    name = "external_interop_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = ["interop/external_interop_test.sh"],
+    data = [
+        "Fixtures/Tls/server_cert.pem",
+        "interop/goclient/main.go",
+        ":tls_external_server",
+    ],
+    tags = [
+        "local",
+        "manual",
+        "requires-network-tools",
+    ],
+)
+
 # Pure-Lean strictness checks for the X.509 input boundary. The negative corpus
 # covers BER-only encodings, malformed OIDs, and ambiguous/noncanonical armor.
 lean_test(

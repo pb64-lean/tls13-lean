@@ -48,6 +48,13 @@ private def hex (encoded : String) : ByteArray :=
   | some bytes => bytes
   | none => panic! "invalid embedded test hex"
 
+/-- Print one audit line and flush immediately: stdout is block-buffered when
+redirected to a file, and the interop gate script waits for the READY line
+before connecting. -/
+private def logLine (line : String) : IO Unit := do
+  IO.println line
+  (← IO.getStdout).flush
+
 private def sendBytes (client : TCP.Socket.Client) (bytes : ByteArray) : IO Unit := do
   unless bytes.isEmpty do
     (client.send bytes).block
@@ -71,9 +78,9 @@ private partial def completeHandshake (client : TCP.Socket.Client)
       match auditDecoder.feed chunk with
       | .ok decoded => pure decoded
       | .error error => throw (IO.userError s!"record audit decoder: {error}")
-    IO.println s!"RECV phase={repr state.phase} tcp_bytes={chunk.size} records={records.size}"
+    logLine s!"RECV phase={repr state.phase} tcp_bytes={chunk.size} records={records.size}"
     for record in records do
-      IO.println s!"RECORD type={repr record.contentType} fragment_bytes={record.fragment.size}"
+      logLine s!"RECORD type={repr record.contentType} fragment_bytes={record.fragment.size}"
     match Server.feedWithFailure state chunk with
     | .error failure =>
         sendFatalAlert client failure
@@ -124,14 +131,14 @@ def main (args : List String) : IO Unit := do
     port
   })
   listener.listen 1
-  IO.println s!"READY 127.0.0.1:{port}"
+  logLine s!"READY 127.0.0.1:{port}"
 
   let client ← listener.accept.block
   try
     let connected ← completeHandshake client readSize (Server.start config)
-    IO.println s!"NEGOTIATED suite={connected.cipherSuiteSelected} group={repr connected.groupSelected}"
+    logLine s!"NEGOTIATED suite={connected.cipherSuiteSelected} group={repr connected.groupSelected}"
     if connected.peerClosed then
-      IO.println "peer closed immediately after the handshake"
+      logLine "peer closed immediately after the handshake"
     else
       -- A tiny response lets curl exercise the same TLS endpoint without
       -- turning this interoperability harness into a full HTTP server.
