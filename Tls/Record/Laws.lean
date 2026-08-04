@@ -670,16 +670,28 @@ theorem TrafficKeys.get!_nonce {keys : TrafficKeys} {n : ByteArray} {i : Nat}
     n.get! i = keys.iv.get! i ^^^ (sequenceBytes keys.seq).get! i := by
   rw [(nonce_ok h).2, get!_xorBytes _ _ hi]
 
-/-- For a fixed IV, distinct sequence numbers give distinct nonces: XOR with
-a constant is a bijection and the sequence encoding is lossless. -/
-theorem TrafficKeys.nonce_inj {k1 k2 : TrafficKeys} {n : ByteArray}
-    (hiv : k1.iv = k2.iv) (h1 : k1.nonce = .ok n) (h2 : k2.nonce = .ok n) :
-    k1.seq = k2.seq := by
+/-- The per-record nonce of a traffic epoch, as a function of its static IV and
+the record sequence number (RFC 8446 §5.3). `TrafficKeys.nonce` computes exactly
+this; naming it separately lets the nonce laws below talk about the nonce of a
+sequence number the state machine has not reached yet. -/
+def nonceOf (iv : ByteArray) (seq : UInt64) : ByteArray :=
+  xorBytes aeadIvLength iv (sequenceBytes seq)
+
+theorem TrafficKeys.nonce_eq {keys : TrafficKeys} {n : ByteArray}
+    (h : keys.nonce = .ok n) : n = nonceOf keys.iv keys.seq := (nonce_ok h).2
+
+/-- For a fixed static IV, the nonce determines the record sequence number:
+XOR with a constant is a bijection and the sequence encoding is lossless. -/
+theorem nonceOf_inj {iv : ByteArray} {s t : UInt64}
+    (h : nonceOf iv s = nonceOf iv t) : s = t := by
   have e : ∀ i, i < aeadIvLength →
-      k1.iv.get! i ^^^ (sequenceBytes k1.seq).get! i =
-        k1.iv.get! i ^^^ (sequenceBytes k2.seq).get! i := by
+      iv.get! i ^^^ (sequenceBytes s).get! i =
+        iv.get! i ^^^ (sequenceBytes t).get! i := by
     intro i hi
-    rw [← TrafficKeys.get!_nonce h1 hi, hiv, ← TrafficKeys.get!_nonce h2 hi]
+    rw [← get!_xorBytes (count := aeadIvLength) iv (sequenceBytes s) hi,
+      ← get!_xorBytes (count := aeadIvLength) iv (sequenceBytes t) hi]
+    show (nonceOf iv s).get! i = (nonceOf iv t).get! i
+    rw [h]
   have h56 := e 4 (by decide)
   have h48 := e 5 (by decide)
   have h40 := e 6 (by decide)
@@ -705,6 +717,13 @@ theorem TrafficKeys.nonce_inj {k1 k2 : TrafficKeys} {n : ByteArray}
     show ∀ s : UInt64, (sequenceBytes s).get! 11 = s.toUInt8
       from fun _ => rfl] at h56 h48 h40 h32 h24 h16 h8 h0
   bv_decide
+
+/-- For a fixed IV, distinct sequence numbers give distinct nonces. -/
+theorem TrafficKeys.nonce_inj {k1 k2 : TrafficKeys} {n : ByteArray}
+    (hiv : k1.iv = k2.iv) (h1 : k1.nonce = .ok n) (h2 : k2.nonce = .ok n) :
+    k1.seq = k2.seq :=
+  nonceOf_inj (iv := k1.iv)
+    (by rw [← TrafficKeys.nonce_eq h1, hiv]; exact TrafficKeys.nonce_eq h2)
 
 /-! ## Traffic-key state -/
 
@@ -953,6 +972,58 @@ theorem seal_secret_eq {keys next : TrafficKeys} {contentType : ContentType}
     next.secret = keys.secret := by
   rw [seal_keys h]
 
+/-- **`seal` never revisits a sequence number**: it refuses to protect a record
+once the counter is exhausted, so the number increases by one *without
+wrapping*. This is what turns single-threaded key state into nonce
+non-reuse. -/
+theorem seal_seq_succ {keys next : TrafficKeys} {contentType : ContentType}
+    {fragment wire : ByteArray} {paddingLength : Nat}
+    (h : «seal» keys contentType fragment paddingLength = .ok (next, wire)) :
+    next.seq.toNat = keys.seq.toNat + 1 := by
+  have hkeys := seal_keys h
+  have hne : keys.seq ≠ (0xffffffffffffffff : UInt64) := by
+    unfold «seal» at h
+    split at h
+    · cases h
+    · split at h
+      · cases h
+      · split at h
+        · cases h
+        · split at h
+          · cases h
+          · rename_i nextKeys hadv
+            exact (advance_ok_iff.mp hadv).1
+  rw [hkeys]
+  show (keys.seq + 1).toNat = keys.seq.toNat + 1
+  have hlt : keys.seq.toNat < 2 ^ 64 := UInt64.toNat_lt keys.seq
+  have hmax : keys.seq.toNat ≠ 2 ^ 64 - 1 := fun hc =>
+    hne (UInt64.toNat_inj.mp (by rw [hc]; rfl))
+  rw [UInt64.toNat_add]
+  show (keys.seq.toNat + (1 : UInt64).toNat) % 2 ^ 64 = keys.seq.toNat + 1
+  rw [show (1 : UInt64).toNat = 1 from rfl, Nat.mod_eq_of_lt (by omega)]
+
+/-- A successful `seal` consumed exactly the epoch's nonce for the sequence
+number it was applied at. -/
+theorem seal_nonce {keys next : TrafficKeys} {contentType : ContentType}
+    {fragment wire : ByteArray} {paddingLength : Nat}
+    (h : «seal» keys contentType fragment paddingLength = .ok (next, wire)) :
+    keys.nonce = .ok (nonceOf keys.iv keys.seq) := by
+  unfold «seal» at h
+  split at h
+  · cases h
+  · split at h
+    · cases h
+    · split at h
+      · cases h
+      · split at h
+        · cases h
+        · split at h
+          · cases h
+          · split at h
+            · cases h
+            · rename_i nonce hnonce
+              rw [hnonce, TrafficKeys.nonce_eq hnonce]
+
 /-- **`open` inverts `seal`, modulo the opaque AEAD.** `haead` states that
 the HACL* binding round-trips on identical key, nonce, and additional data —
 it is an `@[extern] opaque` FFI import, so this is the precise boundary of
@@ -1081,6 +1152,219 @@ theorem decodeStep_seal_open
     rfl
   rw [hencode]
   exact decodeStep_encode_append ByteArray.empty hwf
+
+/-! ## Nonce non-reuse across a connection
+
+No theorem about `seal` *alone* can establish that a connection never reuses a
+nonce: a Lean `TrafficKeys` is an ordinary value, so a caller who keeps a copy
+can seal twice at the same sequence number. Non-reuse is a property of a *run*
+of the write path — of the sequence of `seal` calls a state machine actually
+performs, each applied to the state the previous one returned.
+
+`WriteRun` is that run, made explicit: it records every record protected, the
+nonce it consumed, and the traffic-secret epoch that consumed it. Sequence
+numbers restart at zero on every KeyUpdate (`TrafficKeys.seq_update`), so nonces
+*do* repeat across epochs; the trace is therefore tagged by epoch secret and the
+theorem is scoped accordingly. `WriteRun.nodup` is the result: the tagged trace
+of any run has no repeats, assuming only that the epochs' traffic secrets are
+distinct (`secrets.Nodup`) — which is a property of HKDF, an opaque HACL\*
+binding here, and so is a hypothesis exactly like the AEAD round trip in
+`open_seal`. -/
+
+/-- A write-side run of one connection direction.
+`WriteRun before after secrets nonces` holds when a state machine starting from
+write traffic state `before` (`none` when no epoch has been installed yet)
+reached `after` by protecting records, using the traffic-secret epochs `secrets`
+(oldest first) and consuming exactly `nonces`, in order, each paired with the
+secret of the epoch that consumed it.
+
+Every step is pinned to the executable record layer: `protect` carries an actual
+successful `seal` of the state the previous step returned, together with the
+`TrafficKeys.nonce` that `seal` used. Nothing here models the record layer — a
+`WriteRun` witness *is* a certificate about real `seal` calls. -/
+inductive WriteRun : Option TrafficKeys → Option TrafficKeys → List ByteArray →
+    List (ByteArray × ByteArray) → Prop where
+  /-- No traffic epoch was ever installed, so nothing was protected. -/
+  | idle : WriteRun none none [] []
+  /-- The run ends in epoch `keys` without protecting anything more. -/
+  | done (keys : TrafficKeys) : WriteRun (some keys) (some keys) [keys.secret] []
+  /-- One record protected under the current epoch: `seal` consumed exactly the
+  epoch's nonce at its current sequence number and returned the state the rest
+  of the run continues from. -/
+  | protect {keys next : TrafficKeys} {dst : Option TrafficKeys}
+      {contentType : ContentType} {fragment wire nonce : ByteArray}
+      {paddingLength : Nat} {secrets : List ByteArray}
+      {nonces : List (ByteArray × ByteArray)}
+      (hnonce : keys.nonce = .ok nonce)
+      (hseal : «seal» keys contentType fragment paddingLength = .ok (next, wire))
+      (hrest : WriteRun (some next) dst secrets nonces) :
+      WriteRun (some keys) dst secrets ((keys.secret, nonce) :: nonces)
+  /-- The current epoch is abandoned for a fresh one: `TrafficKeys.update` after
+  a KeyUpdate, or the key schedule's handshake → application transition. The new
+  epoch is unconstrained here; that distinct epochs really do have distinct
+  secrets is exactly the `secrets.Nodup` hypothesis of `WriteRun.nodup`. -/
+  | rekey {keys next : TrafficKeys} {dst : Option TrafficKeys}
+      {secrets : List ByteArray} {nonces : List (ByteArray × ByteArray)}
+      (hrest : WriteRun (some next) dst secrets nonces) :
+      WriteRun (some keys) dst (keys.secret :: secrets) nonces
+  /-- The first epoch is installed; nothing could have been protected before. -/
+  | install {keys : TrafficKeys} {dst : Option TrafficKeys}
+      {secrets : List ByteArray} {nonces : List (ByteArray × ByteArray)}
+      (hrest : WriteRun (some keys) dst secrets nonces) :
+      WriteRun none dst secrets nonces
+
+/-- The epoch a run starts in heads its epoch list. -/
+theorem WriteRun.secrets_head {keys : TrafficKeys} {dst : Option TrafficKeys}
+    {secrets : List ByteArray} {nonces : List (ByteArray × ByteArray)}
+    (h : WriteRun (some keys) dst secrets nonces) :
+    ∃ rest, secrets = keys.secret :: rest := by
+  generalize hsrc : (some keys : Option TrafficKeys) = src at h
+  induction h generalizing keys with
+  | idle => cases hsrc
+  | done k => cases hsrc; exact ⟨[], rfl⟩
+  | protect hnonce hseal hrest ih =>
+      cases hsrc
+      obtain ⟨rest, hrest'⟩ := ih rfl
+      exact ⟨rest, by rw [hrest', seal_secret_eq hseal]⟩
+  | rekey hrest ih => cases hsrc; exact ⟨_, rfl⟩
+  | install hrest ih => cases hsrc
+
+/-- Every nonce a run consumes is attributed to one of the run's epochs. -/
+theorem WriteRun.mem_secrets {src dst : Option TrafficKeys}
+    {secrets : List ByteArray} {nonces : List (ByteArray × ByteArray)}
+    (h : WriteRun src dst secrets nonces) : ∀ p ∈ nonces, p.1 ∈ secrets := by
+  induction h with
+  | idle => intro p hp; cases hp
+  | done k => intro p hp; cases hp
+  | protect hnonce hseal hrest ih =>
+      intro p hp
+      cases hp with
+      | head =>
+          obtain ⟨rest, hrest'⟩ := WriteRun.secrets_head hrest
+          rw [hrest', seal_secret_eq hseal]
+          exact List.mem_cons_self
+      | tail _ hp => exact ih p hp
+  | rekey hrest ih => intro p hp; exact List.mem_cons_of_mem _ (ih p hp)
+  | install hrest ih => exact ih
+
+/-- Everything a run still consumes under the epoch it is currently in uses that
+epoch's IV at a sequence number at or after the current one. Records protected
+under a *later* epoch carry that epoch's secret, and the epochs are distinct, so
+they cannot masquerade as this one. -/
+theorem WriteRun.mem_epoch {keys : TrafficKeys} {dst : Option TrafficKeys}
+    {secrets : List ByteArray} {nonces : List (ByteArray × ByteArray)}
+    (h : WriteRun (some keys) dst secrets nonces) (hfresh : secrets.Nodup) :
+    ∀ p ∈ nonces, p.1 = keys.secret →
+      ∃ s : UInt64, keys.seq.toNat ≤ s.toNat ∧ p.2 = nonceOf keys.iv s := by
+  generalize hsrc : (some keys : Option TrafficKeys) = src at h
+  induction h generalizing keys with
+  | idle => cases hsrc
+  | done k => intro p hp; cases hp
+  | protect hnonce hseal hrest ih =>
+      cases hsrc
+      intro p hp _
+      cases hp with
+      | head => exact ⟨_, Nat.le_refl _, TrafficKeys.nonce_eq hnonce⟩
+      | tail _ hp =>
+          obtain ⟨s, hle, heq⟩ :=
+            ih hfresh rfl p hp (by rw [seal_secret_eq hseal]; assumption)
+          refine ⟨s, ?_, ?_⟩
+          · rw [seal_seq_succ hseal] at hle; omega
+          · rw [heq, seal_iv_eq hseal]
+  | rekey hrest ih =>
+      cases hsrc
+      intro p hp hp1
+      exact absurd (hp1 ▸ WriteRun.mem_secrets hrest p hp)
+        (List.nodup_cons.mp hfresh).1
+  | install hrest ih => cases hsrc
+
+/-- **Nonce non-reuse.** Across a whole write-side run, no two records were
+protected under the same traffic secret with the same nonce.
+
+Within one epoch this is forced by the implementation: `seal` uses the nonce of
+the current sequence number and returns the state with that number advanced
+without wrapping (`seal_seq_succ`), and for a fixed static IV the nonce
+determines the sequence number (`nonceOf_inj`, from `sequenceBytes` injectivity).
+Across epochs it rests on the single hypothesis `hfresh`: the traffic secrets the
+connection used are distinct. TLS derives each of them with HKDF-Expand-Label,
+which is an opaque HACL\* binding here, so that step is assumed rather than
+proved — as with the AEAD round trip in `open_seal`. -/
+theorem WriteRun.nodup {src dst : Option TrafficKeys}
+    {secrets : List ByteArray} {nonces : List (ByteArray × ByteArray)}
+    (h : WriteRun src dst secrets nonces) (hfresh : secrets.Nodup) :
+    nonces.Nodup := by
+  induction h with
+  | idle => exact List.nodup_nil
+  | done k => exact List.nodup_nil
+  | protect hnonce hseal hrest ih =>
+      rename_i keys next _ _ _ _ nonce _ _ _
+      refine List.nodup_cons.mpr ⟨?_, ih hfresh⟩
+      intro hmem
+      obtain ⟨s, hle, heq⟩ :=
+        WriteRun.mem_epoch hrest hfresh _ hmem (seal_secret_eq hseal).symm
+      have hnonce' : nonce = nonceOf keys.iv keys.seq :=
+        TrafficKeys.nonce_eq hnonce
+      rw [seal_iv_eq hseal] at heq
+      have hseq : keys.seq = s := nonceOf_inj (by rw [← hnonce', ← heq])
+      rw [seal_seq_succ hseal, ← hseq] at hle
+      omega
+  | rekey hrest ih => exact ih (List.nodup_cons.mp hfresh).2
+  | install hrest ih => exact ih hfresh
+
+/-- The write-side effect of one state-machine step, phrased as a transformer
+over whatever the connection does next. Steps compose by `Extends.trans`, so a
+whole run's `WriteRun` is assembled from one lemma per engine operation without
+ever naming an intermediate trace. -/
+def Extends (before after : Option TrafficKeys) : Prop :=
+  ∀ dst secrets nonces, WriteRun after dst secrets nonces →
+    ∃ opened emitted, WriteRun before dst (opened ++ secrets) (emitted ++ nonces)
+
+/-- A step that leaves the write traffic state alone protects nothing. -/
+theorem Extends.refl (a : Option TrafficKeys) : Extends a a :=
+  fun _ _ _ h => ⟨[], [], h⟩
+
+theorem Extends.trans {a b c : Option TrafficKeys}
+    (h1 : Extends a b) (h2 : Extends b c) : Extends a c := by
+  intro dst secrets nonces h
+  obtain ⟨o2, e2, h2'⟩ := h2 dst secrets nonces h
+  obtain ⟨o1, e1, h1'⟩ := h1 dst _ _ h2'
+  exact ⟨o1 ++ o2, e1 ++ e2, by rwa [List.append_assoc, List.append_assoc]⟩
+
+theorem Extends.protect {keys next : TrafficKeys} {contentType : ContentType}
+    {fragment wire nonce : ByteArray} {paddingLength : Nat}
+    (hnonce : keys.nonce = .ok nonce)
+    (hseal : «seal» keys contentType fragment paddingLength = .ok (next, wire)) :
+    Extends (some keys) (some next) :=
+  fun _ _ _ h => ⟨[], [(keys.secret, nonce)], WriteRun.protect hnonce hseal h⟩
+
+/-- Protecting one record with the state machine's own write keys, storing the
+returned state back. -/
+theorem Extends.of_seal {keys next : TrafficKeys} {contentType : ContentType}
+    {fragment wire : ByteArray} {paddingLength : Nat}
+    (h : «seal» keys contentType fragment paddingLength = .ok (next, wire)) :
+    Extends (some keys) (some next) :=
+  Extends.protect (seal_nonce h) h
+
+/-- Replacing the write epoch outright (KeyUpdate, or handshake → application
+traffic keys). -/
+theorem Extends.rekey (keys next : TrafficKeys) :
+    Extends (some keys) (some next) :=
+  fun _ _ _ h => ⟨[keys.secret], [], WriteRun.rekey h⟩
+
+/-- Installing the first write epoch. -/
+theorem Extends.install (keys : TrafficKeys) : Extends none (some keys) :=
+  fun _ _ _ h => ⟨[], [], WriteRun.install h⟩
+
+/-- Read back the run a chain of steps certifies. -/
+theorem Extends.run {before after : Option TrafficKeys} (h : Extends before after) :
+    ∃ secrets nonces, WriteRun before after secrets nonces := by
+  cases after with
+  | none =>
+      obtain ⟨o, e, h'⟩ := h none [] [] WriteRun.idle
+      exact ⟨_, _, h'⟩
+  | some k =>
+      obtain ⟨o, e, h'⟩ := h (some k) _ _ (WriteRun.done k)
+      exact ⟨_, _, h'⟩
 
 end Record
 end Tls
