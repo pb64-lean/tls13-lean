@@ -77,7 +77,9 @@ def paddingExtension : UInt16 := 21
 -- application_layer_protocol_negotiation (RFC 7301).
 def alpnExtension : UInt16 := 16
 
-private def appendUInt16 (out : ByteArray) (n : UInt16) : ByteArray :=
+/-- Append a big-endian `uint16`. Public because the wire-codec laws below
+state extension and length encodings in terms of it. -/
+def appendUInt16 (out : ByteArray) (n : UInt16) : ByteArray :=
   (out.push (n >>> 8).toUInt8).push n.toUInt8
 
 private def appendUInt32 (out : ByteArray) (n : UInt32) : ByteArray :=
@@ -350,6 +352,19 @@ private def encodeExtension (extensionType : UInt16) (data : ByteArray) :
     Except String ByteArray := do
   pure (appendUInt16 ByteArray.empty extensionType ++ (← encodeVector16 data))
 
+/-- The wire image of one extension: `extension_type ‖ uint16 length ‖ data`.
+This is what `encodeExtension` emits, phrased as a total function so the
+extension laws below can talk about it. -/
+def extensionBytes (e : Extension) : ByteArray :=
+  appendUInt16 ByteArray.empty e.extensionType ++
+    (appendUInt16 ByteArray.empty (UInt16.ofNat e.data.size) ++ e.data)
+
+/-- The wire image of an extension list: its members' images concatenated in
+order, which is exactly the payload of an extensions block. -/
+def extensionsBytes : List Extension → ByteArray
+  | [] => ByteArray.empty
+  | e :: rest => extensionBytes e ++ extensionsBytes rest
+
 /-- One step of extension-list parsing: read `type ‖ uint16 length ‖ data`
 until the cursor is exhausted, rejecting duplicate extension types.
 
@@ -380,7 +395,10 @@ private def parseExtensionsLoop (r : Reader) (out : Array Extension) :
   termination_by r.bytes.size - r.offset
   decreasing_by exact hlt
 
-private def parseExtensions (bytes : ByteArray) : Except String (Array Extension) :=
+/-- Parse an extensions block: `type ‖ uint16 length ‖ data` repeated until
+the block is exhausted, rejecting duplicate types. Extension types are not
+interpreted here, so unknown (including GREASE) types are kept verbatim. -/
+def parseExtensions (bytes : ByteArray) : Except String (Array Extension) :=
   parseExtensionsLoop { bytes } #[]
 
 private def findExtension? (extensions : Array Extension) (extensionType : UInt16) :
@@ -1960,6 +1978,229 @@ theorem encodeCertificateVerify_parse {algorithm : UInt16}
       .ok () := requireEnd_eval (by omega)
   simp only [hr16, hv16, hend]
   rw [if_neg hemp]
+
+/-! ### Extension lists
+
+The extension parser is a loop, so its laws are proved once, for an arbitrary
+list of extensions sitting at an arbitrary offset inside a larger buffer, and
+then reused by every message that carries extensions. -/
+
+/-- Reading inside a sandwiched middle segment. -/
+private theorem get!_mid {P M S : ByteArray} {k : Nat} (h : k < M.size) :
+    (P ++ (M ++ S)).get! (P.size + k) = M.get! k := by
+  rw [get!_append_right (by omega) (by rw [ByteArray.size_append]; omega),
+    show P.size + k - P.size = k from by omega, get!_append_left h]
+
+/-- Slicing out a sandwiched middle segment. -/
+private theorem extract_mid (P M S : ByteArray) :
+    (P ++ (M ++ S)).extract P.size (P.size + M.size) = M := by
+  have h := ByteArray.extract_append_size_add (a := P) (b := M ++ S) (i := 0)
+    (j := M.size)
+  rw [Nat.add_zero] at h
+  rw [h]
+  exact ByteArray.extract_append_eq_left rfl
+
+private theorem size_extensionBytes (e : Extension) :
+    (extensionBytes e).size = 4 + e.data.size := by
+  unfold extensionBytes
+  rw [ByteArray.size_append, ByteArray.size_append,
+    show (appendUInt16 ByteArray.empty e.extensionType).size = 2 from rfl,
+    show (appendUInt16 ByteArray.empty (UInt16.ofNat e.data.size)).size = 2
+      from rfl]
+  omega
+
+/-- `encodeExtension` emits exactly `extensionBytes`. -/
+private theorem encodeExtension_eq {t : UInt16} {d out : ByteArray}
+    (h : encodeExtension t d = .ok out) :
+    d.size < 2 ^ 16 ∧ out = extensionBytes { extensionType := t, data := d } := by
+  unfold encodeExtension at h
+  obtain ⟨V, hV, h⟩ := bind_ok_ex h
+  obtain ⟨hszlt, hVeq⟩ := encodeVector16_ok hV
+  refine ⟨hszlt, ?_⟩
+  rw [← pure_eq_ok h, hVeq]
+  rfl
+
+/-- An exhausted cursor ends the loop with the extensions accumulated so far. -/
+private theorem parseExtensionsLoop_end {E : ByteArray} {off : Nat}
+    {out : Array Extension} (h : off = E.size) :
+    parseExtensionsLoop { bytes := E, offset := off } out = .ok out := by
+  unfold parseExtensionsLoop
+  rw [if_pos]
+  show (off == E.size) = true
+  rw [h]
+  exact beq_self_eq_true E.size
+
+/-- One correctly-encoded extension at the cursor advances the loop by exactly
+its wire size and appends it to the accumulator. -/
+private theorem parseExtensionsLoop_cons {P S : ByteArray} {e : Extension}
+    {out : Array Extension} (hsz : e.data.size < 2 ^ 16)
+    (hfresh : out.any (fun x => x.extensionType == e.extensionType) = false) :
+    parseExtensionsLoop
+        { bytes := P ++ (extensionBytes e ++ S), offset := P.size } out =
+      parseExtensionsLoop
+        { bytes := P ++ (extensionBytes e ++ S),
+          offset := (P ++ extensionBytes e).size } (out.push e) := by
+  have hM : (extensionBytes e).size = 4 + e.data.size := size_extensionBytes e
+  have hA : (appendUInt16 ByteArray.empty e.extensionType).size = 2 := rfl
+  have hL : (appendUInt16 ByteArray.empty (UInt16.ofNat e.data.size)).size = 2 :=
+    rfl
+  have hWsize : (P ++ (extensionBytes e ++ S)).size =
+      P.size + ((4 + e.data.size) + S.size) := by
+    rw [ByteArray.size_append, ByteArray.size_append, hM]
+  -- The four header bytes and the payload slice.
+  have hb0 : (P ++ (extensionBytes e ++ S)).get! (P.size + 0) =
+      (e.extensionType >>> 8).toUInt8 := by
+    rw [get!_mid (by omega)]
+    show (appendUInt16 ByteArray.empty e.extensionType ++
+      (appendUInt16 ByteArray.empty (UInt16.ofNat e.data.size) ++
+        e.data)).get! 0 = _
+    rw [get!_append_left (by omega)]
+    rfl
+  have hb1 : (P ++ (extensionBytes e ++ S)).get! (P.size + 1) =
+      e.extensionType.toUInt8 := by
+    rw [get!_mid (by omega)]
+    show (appendUInt16 ByteArray.empty e.extensionType ++
+      (appendUInt16 ByteArray.empty (UInt16.ofNat e.data.size) ++
+        e.data)).get! 1 = _
+    rw [get!_append_left (by omega)]
+    rfl
+  have hb2 : (P ++ (extensionBytes e ++ S)).get! (P.size + 2) =
+      (UInt16.ofNat e.data.size >>> 8).toUInt8 := by
+    rw [get!_mid (by omega)]
+    show (appendUInt16 ByteArray.empty e.extensionType ++
+      (appendUInt16 ByteArray.empty (UInt16.ofNat e.data.size) ++
+        e.data)).get! 2 = _
+    rw [get!_append_right (by omega) (by rw [ByteArray.size_append]; omega),
+      show 2 - (appendUInt16 ByteArray.empty e.extensionType).size = 0 from rfl,
+      get!_append_left (by omega)]
+    rfl
+  have hb3 : (P ++ (extensionBytes e ++ S)).get! (P.size + 3) =
+      (UInt16.ofNat e.data.size).toUInt8 := by
+    rw [get!_mid (by omega)]
+    show (appendUInt16 ByteArray.empty e.extensionType ++
+      (appendUInt16 ByteArray.empty (UInt16.ofNat e.data.size) ++
+        e.data)).get! 3 = _
+    rw [get!_append_right (by omega) (by rw [ByteArray.size_append]; omega),
+      show 3 - (appendUInt16 ByteArray.empty e.extensionType).size = 1 from rfl,
+      get!_append_left (by omega)]
+    rfl
+  have hdata : (P ++ (extensionBytes e ++ S)).extract (P.size + 2 + 2)
+      (P.size + 2 + 2 + e.data.size) = e.data := by
+    rw [show P ++ (extensionBytes e ++ S) =
+        (P ++ appendUInt16 ByteArray.empty e.extensionType ++
+          appendUInt16 ByteArray.empty (UInt16.ofNat e.data.size)) ++
+          (e.data ++ S) from by
+      unfold extensionBytes
+      rw [ByteArray.append_assoc, ByteArray.append_assoc, ByteArray.append_assoc,
+        ByteArray.append_assoc]]
+    rw [show P.size + 2 + 2 =
+        (P ++ appendUInt16 ByteArray.empty e.extensionType ++
+          appendUInt16 ByteArray.empty (UInt16.ofNat e.data.size)).size from by
+      rw [ByteArray.size_append, ByteArray.size_append, hA, hL]]
+    exact extract_mid _ _ _
+  -- Evaluate one iteration against the assembled buffer.
+  rw [show (P ++ extensionBytes e).size = P.size + 2 + 2 + e.data.size from by
+    rw [ByteArray.size_append, hM]; omega]
+  generalize hW : P ++ (extensionBytes e ++ S) = W at hWsize hb0 hb1 hb2 hb3 hdata ⊢
+  have hne : ¬(({ bytes := W, offset := P.size } : Reader).atEnd = true) := by
+    show ¬(P.size == W.size) = true
+    rw [beq_iff_eq]
+    omega
+  have hr16 : Reader.readUInt16 { bytes := W, offset := P.size } =
+      .ok (e.extensionType, { bytes := W, offset := P.size + 2 }) := by
+    rw [readUInt16_eval (by omega),
+      show W.get! P.size = (e.extensionType >>> 8).toUInt8 from by
+        rw [show P.size = P.size + 0 from by omega]; exact hb0,
+      hb1, uint16_recompose]
+  have hLen : ((W.get! (P.size + 2)).toUInt16 <<< 8 |||
+      (W.get! (P.size + 2 + 1)).toUInt16).toNat = e.data.size := by
+    rw [show P.size + 2 + 1 = P.size + 3 from by omega, hb2, hb3,
+      uint16_recompose, UInt16.toNat_ofNat']
+    exact Nat.mod_eq_of_lt hsz
+  have hv16 : Reader.readVector16 { bytes := W, offset := P.size + 2 } =
+      .ok (e.data, { bytes := W, offset := P.size + 2 + 2 + e.data.size }) := by
+    rw [readVector16_eval hLen (by omega), hdata]
+  have hdup :
+      ¬(out.any (fun ext => ext.extensionType == e.extensionType) = true) := by
+    rw [hfresh]
+    exact Bool.false_ne_true
+  rw [parseExtensionsLoop.eq_def]
+  rw [if_neg hne]
+  -- The loop matches on its reads with equation binders (needed for the
+  -- termination argument), so peel them with `split` rather than `rw`.
+  split
+  · rename_i err heq
+    rw [hr16] at heq
+    cases heq
+  · rename_i t r₁ heq
+    rw [hr16] at heq
+    simp only [Except.ok.injEq, Prod.mk.injEq] at heq
+    obtain ⟨rfl, rfl⟩ := heq
+    split
+    · rename_i err heq
+      rw [hv16] at heq
+      cases heq
+    · rename_i d r₂ heq
+      rw [hv16] at heq
+      simp only [Except.ok.injEq, Prod.mk.injEq] at heq
+      obtain ⟨rfl, rfl⟩ := heq
+      rw [if_neg hdup]
+
+/-- The extension loop consumes a whole encoded extension list, appending
+every member — of *any* extension type — to the accumulator in order. -/
+private theorem parseExtensionsLoop_extensionsBytes : ∀ (l : List Extension)
+    (P : ByteArray) (out : Array Extension),
+    (∀ e ∈ l, e.data.size < 2 ^ 16) →
+    (∀ e ∈ l, out.any (fun x => x.extensionType == e.extensionType) = false) →
+    l.Pairwise (fun a b => (a.extensionType == b.extensionType) = false) →
+    parseExtensionsLoop { bytes := P ++ extensionsBytes l, offset := P.size }
+        out = .ok (out.toList ++ l).toArray := by
+  intro l
+  induction l with
+  | nil =>
+    intro P out _ _ _
+    rw [show extensionsBytes ([] : List Extension) = ByteArray.empty from rfl,
+      ByteArray.append_empty, parseExtensionsLoop_end rfl, List.append_nil,
+      Array.toArray_toList]
+  | cons e rest ih =>
+    intro P out hsz hfresh hpw
+    rw [List.pairwise_cons] at hpw
+    rw [show extensionsBytes (e :: rest) = extensionBytes e ++ extensionsBytes rest
+      from rfl]
+    rw [parseExtensionsLoop_cons (hsz e (List.mem_cons_self ..))
+      (hfresh e (List.mem_cons_self ..))]
+    rw [show P ++ (extensionBytes e ++ extensionsBytes rest) =
+      (P ++ extensionBytes e) ++ extensionsBytes rest from
+        ByteArray.append_assoc.symm]
+    rw [ih (P ++ extensionBytes e) (out.push e)
+      (fun e' he' => hsz e' (List.mem_cons_of_mem e he'))
+      (fun e' he' => by
+        rw [Array.any_push, hfresh e' (List.mem_cons_of_mem e he'),
+          hpw.1 e' he']
+        rfl)
+      hpw.2]
+    rw [Array.toList_push, List.append_assoc]
+    rfl
+
+/-- **Extension-list roundtrip (GREASE tolerance)**: parsing the wire image of
+any extension list returns exactly that list, in order. The extension *types*
+are arbitrary — unknown, reserved, or GREASE values are carried through
+unchanged, never dropped or reordered — so re-encoding the parse result
+reproduces the original bytes (`extensionsBytes l`). -/
+theorem parseExtensions_extensionsBytes (l : List Extension)
+    (hsz : ∀ e ∈ l, e.data.size < 2 ^ 16)
+    (hdistinct :
+      l.Pairwise (fun a b => (a.extensionType == b.extensionType) = false)) :
+    parseExtensions (extensionsBytes l) = .ok l.toArray := by
+  unfold parseExtensions
+  rw [show ({ bytes := extensionsBytes l } : Reader) =
+    { bytes := ByteArray.empty ++ extensionsBytes l,
+      offset := ByteArray.empty.size } from by
+    rw [ByteArray.empty_append]
+    rfl]
+  rw [parseExtensionsLoop_extensionsBytes l ByteArray.empty #[] hsz
+    (fun _ _ => Array.any_empty) hdistinct]
+  rfl
 
 end Handshake
 end Tls
