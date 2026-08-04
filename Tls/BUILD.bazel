@@ -22,38 +22,26 @@ lean_library(
     ],
 )
 
-# `bv_decide` discharges the byte (de)composition identities in `Tls.Record.Laws`
-# and `Tls.Handshake` by running CaDiCaL and checking the resulting LRAT
-# certificate with a *natively compiled* checker. Lean records that step as one
-# generated axiom per call site — `<lemma>._native.bv_decide.ax_1_5`, private,
-# hence the `_private.<module>.0.` mangling — asserting that the certificate
-# verifies the reflected BitVec expression. That is a genuine trust-boundary
-# item (see the README's trusted computing base section), so it is allowed here
-# by exact name rather than by pattern: any *new* `bv_decide` call site fails
-# this audit until it is reviewed and listed.
-BV_DECIDE_LRAT_AXIOMS = [
-    "_private.Tls.Record.Laws.0.Tls.Record.hi_lo_recompose._native.bv_decide.ax_1_5",
-    "_private.Tls.Record.Laws.0.Tls.Record.recompose_hi._native.bv_decide.ax_1_5",
-    "_private.Tls.Record.Laws.0.Tls.Record.sequenceBytes_inj._native.bv_decide.ax_1_5",
-    "_private.Tls.Record.Laws.0.Tls.Record.nonceOf_inj._native.bv_decide.ax_1_5",
-    "_private.Tls.Handshake.0.Tls.Handshake.uint16_recompose._native.bv_decide.ax_1_5",
-    "_private.Tls.Handshake.0.Tls.Handshake.uint32_recompose._native.bv_decide.ax_1_5",
-    "_private.Tls.Handshake.0.Tls.Handshake.uint16_hi._native.bv_decide.ax_1_5",
-]
-
 # Compile-time audit of the protocol core: the headline theorems must exist, be
-# theorems, and close over nothing beyond the standard three axioms plus the
-# LRAT certificates above; no constant anywhere in the scanned closure may reach
-# `sorryAx`; and no `@[extern]` may appear outside the HaclStar FFI package.
-# `module_prefixes` covers the whole first-party closure (Tls, TLS13, HaclStar)
-# so that last check is a statement about the repository, not just this library.
+# theorems, and close over nothing beyond the three standard axioms; no constant
+# anywhere in the scanned closure may reach `sorryAx`; and no `@[extern]` may
+# appear outside the HaclStar FFI package. `module_prefixes` covers the whole
+# first-party closure (Tls, TLS13, HaclStar) so that last check is a statement
+# about the repository, not just this library.
+#
+# `allowed_axioms` is deliberately the bare standard three. The byte
+# (de)composition identities in `Tls.Record.Laws` and `Tls.Handshake` are proved
+# arithmetically rather than by `bv_decide`, so no generated LRAT-certificate
+# axiom (`<lemma>._native.bv_decide.ax_1_5`) exists to allow. Introducing one —
+# by reaching for `bv_decide` in a proof a headline theorem depends on — fails
+# this audit immediately, which is the point.
 lean_assurance_test(
     name = "tls_assurance",
     allowed_axioms = [
         "propext",
         "Classical.choice",
         "Quot.sound",
-    ] + BV_DECIDE_LRAT_AXIOMS,
+    ],
     allowed_extern_modules = ["HaclStar"],
     module_prefixes = [
         "HaclStar",
