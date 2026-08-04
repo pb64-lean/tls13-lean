@@ -1,5 +1,8 @@
 module
 
+import Std.Tactic.BVDecide
+public meta import Std.Tactic.BVDecide.Reflect
+
 public section
 
 namespace Tls
@@ -389,6 +392,28 @@ private def serverNameClientExtension (name : String) : Except String ByteArray 
   let hostName := ByteArray.empty.push 0 ++ (← encodeVector16 nameBytes)
   encodeExtension serverNameExtension (← encodeVector16 hostName)
 
+/-- Validate an optional first-flight P-256 share. Split out (like the two
+optional-extension helpers below) so the `encodeClientHello` do-chain stays
+linear, which lets `encodeClientHello_frame` peel it one bind at a time. -/
+private def checkP256PublicKey : Option ByteArray → Except String Unit
+  | none => pure ()
+  | some publicKey => do
+    unless publicKey.size == 65 && publicKey.get! 0 == 4 do
+      throw "P-256 public key must be a 65-byte SEC1 uncompressed point"
+
+/-- The SNI extension bytes, or empty when no name is offered. -/
+private def serverNameExtensionBytes : Option String → Except String ByteArray
+  | none => pure ByteArray.empty
+  | some name => serverNameClientExtension name
+
+/-- The ALPN extension bytes, or empty when no protocol is offered. -/
+private def alpnExtensionBytes (protocols : Array String) :
+    Except String ByteArray :=
+  if protocols.isEmpty then
+    pure ByteArray.empty
+  else
+    alpnClientExtension protocols
+
 /--
 Encode the minimal TLS 1.3 ClientHello used by pg-lean:
 TLS_CHACHA20_POLY1305_SHA256, first-flight X25519 and optional P-256 shares,
@@ -399,9 +424,7 @@ def encodeClientHello (cfg : ClientHelloConfig) : Except String Message := do
     throw s!"ClientHello random must be 32 bytes, got {cfg.random.size}"
   unless cfg.x25519PublicKey.size == 32 do
     throw s!"x25519 public key must be 32 bytes, got {cfg.x25519PublicKey.size}"
-  if let some publicKey := cfg.p256PublicKey then
-    unless publicKey.size == 65 && publicKey.get! 0 == 4 do
-      throw "P-256 public key must be a 65-byte SEC1 uncompressed point"
+  checkP256PublicKey cfg.p256PublicKey
   if cfg.legacySessionId.size > 32 then
     throw s!"legacy session id exceeds 32 bytes ({cfg.legacySessionId.size})"
 
@@ -410,10 +433,8 @@ def encodeClientHello (cfg : ClientHelloConfig) : Except String Message := do
   extensions := extensions ++ (← signatureAlgorithmsClientExtension)
   extensions := extensions ++
     (← keyShareClientExtension cfg.x25519PublicKey cfg.p256PublicKey)
-  if let some name := cfg.serverName then
-    extensions := extensions ++ (← serverNameClientExtension name)
-  if !cfg.alpnProtocols.isEmpty then
-    extensions := extensions ++ (← alpnClientExtension cfg.alpnProtocols)
+  extensions := extensions ++ (← serverNameExtensionBytes cfg.serverName)
+  extensions := extensions ++ (← alpnExtensionBytes cfg.alpnProtocols)
 
   let mut body := appendUInt16 ByteArray.empty legacyTls12Version
   body := body ++ cfg.random
@@ -630,17 +651,26 @@ structure CertificateVerify where
 
 /-- Parse CertificateVerify structurally. Scheme policy belongs to the TLS
 client: it rejects forbidden or unoffered schemes, checks the leaf SPKI, and
-verifies the signature over the raw transcript before advancing to Finished. -/
-def parseCertificateVerify (msg : Message) : Except String CertificateVerify := do
-  unless msg.msgType == certificateVerifyType do
-    throw s!"expected CertificateVerify ({certificateVerifyType}), got {msg.msgType}"
-  let r : Reader := { bytes := msg.body }
-  let (algorithm, r) ← r.readUInt16
-  let (signature, r) ← r.readVector16
-  r.requireEnd "CertificateVerify"
-  if signature.isEmpty then
-    throw "CertificateVerify signature must not be empty"
-  pure { algorithm, signature, encoded := msg.encoded }
+verifies the signature over the raw transcript before advancing to Finished.
+(Written as a pure `if`/`match` chain so `encodeCertificateVerify_parse` can
+evaluate it.) -/
+def parseCertificateVerify (msg : Message) : Except String CertificateVerify :=
+  if msg.msgType == certificateVerifyType then
+    match ({ bytes := msg.body } : Reader).readUInt16 with
+    | .error e => .error e
+    | .ok (algorithm, r) =>
+      match r.readVector16 with
+      | .error e => .error e
+      | .ok (signature, r) =>
+        match r.requireEnd "CertificateVerify" with
+        | .error e => .error e
+        | .ok () =>
+          if signature.isEmpty then
+            .error "CertificateVerify signature must not be empty"
+          else
+            .ok { algorithm, signature, encoded := msg.encoded }
+  else
+    .error s!"expected CertificateVerify ({certificateVerifyType}), got {msg.msgType}"
 
 structure Finished where
   verifyData : ByteArray
@@ -1059,6 +1089,673 @@ def encodeCertificateVerify (algorithm : UInt16) (signature : ByteArray) :
     throw "CertificateVerify signature must not be empty"
   frame certificateVerifyType
     (appendUInt16 ByteArray.empty algorithm ++ (← encodeVector16 signature))
+
+/-!
+## Wire-codec roundtrip laws
+
+Kernel-checked encode/parse inversion for the handshake framing layer:
+`frame` output is accepted byte-for-byte by `decodeOne` with an explicit
+residual (`decodeOne_frame`), and every message encoder therefore roundtrips
+through the wire decoder (`encode*_decode`). The loop-free message bodies
+also invert semantically (`encodeFinished_parse`, `encodeKeyUpdate_parse`,
+`encodeCertificateVerify_parse`). -/
+
+/-! ### `ByteArray.get!` bridges -/
+
+private theorem get!_eq_getElem {a : ByteArray} {i : Nat} (h : i < a.size) :
+    a.get! i = a[i] := by
+  rcases a with ⟨data⟩
+  show data[i]! = _
+  rw [getElem!_pos data i h]
+  rfl
+
+private theorem get!_append_left {a b : ByteArray} {i : Nat} (h : i < a.size) :
+    (a ++ b).get! i = a.get! i := by
+  rw [get!_eq_getElem (by simp [ByteArray.size_append]; omega),
+    get!_eq_getElem h, ByteArray.getElem_append_left h]
+
+private theorem get!_append_right {a b : ByteArray} {i : Nat}
+    (h1 : a.size ≤ i) (h2 : i < a.size + b.size) :
+    (a ++ b).get! i = b.get! (i - a.size) := by
+  rw [get!_eq_getElem (by simp [ByteArray.size_append]; omega),
+    get!_eq_getElem (by omega), ByteArray.getElem_append_right h1]
+
+private theorem extract_get! {a : ByteArray} {s e k : Nat} (hk : s + k < e)
+    (he : e ≤ a.size) : (a.extract s e).get! k = a.get! (s + k) := by
+  have hsize : (a.extract s e).size = e - s := by
+    rw [ByteArray.size_extract]
+    omega
+  rw [get!_eq_getElem (by omega), ByteArray.getElem_extract,
+    get!_eq_getElem (by omega)]
+
+/-! ### `Except` peeling helpers -/
+
+private theorem bind_ok_ex {α β : Type} {x : Except String α}
+    {f : α → Except String β} {b : β} (h : (x >>= f) = .ok b) :
+    ∃ a, x = .ok a ∧ f a = .ok b := by
+  cases x with
+  | error e => cases h
+  | ok a => exact ⟨a, rfl, h⟩
+
+private theorem ite_ok_cases {β : Type} {c : Prop} [Decidable c]
+    {t e : Except String β} {b : β} (h : (if c then t else e) = .ok b) :
+    (c ∧ t = .ok b) ∨ (¬c ∧ e = .ok b) := by
+  split at h
+  · exact .inl ⟨‹_›, h⟩
+  · exact .inr ⟨‹_›, h⟩
+
+private theorem pure_eq_ok {α : Type} {a b : α}
+    (h : (pure a : Except String α) = .ok b) : a = b := by
+  have h' : Except.ok a = Except.ok b := h
+  injection h'
+
+/-! ### The `type ‖ uint24 length ‖ body` frame -/
+
+/-- The big-endian `uint24` length bytes of a handshake frame header. -/
+def length24Bytes (n : Nat) : ByteArray :=
+  ((ByteArray.empty.push (UInt8.ofNat (n >>> 16))).push
+    (UInt8.ofNat (n >>> 8))).push (UInt8.ofNat n)
+
+private theorem encodeLength24_ok {n : Nat} {out : ByteArray}
+    (h : encodeLength24 n = .ok out) :
+    n < 2 ^ 24 ∧ out = length24Bytes n := by
+  unfold encodeLength24 at h
+  obtain ⟨hc, h⟩ | ⟨hc, h⟩ := ite_ok_cases h
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+  · exact ⟨by omega, (pure_eq_ok h).symm⟩
+
+/-- Everything a successful `frame` says: the body fit, and the message is
+its exact `type ‖ uint24 length ‖ body` encoding. -/
+theorem frame_spec {msgType : UInt8} {body : ByteArray} {msg : Message}
+    (h : frame msgType body = .ok msg) :
+    body.size < 2 ^ 24 ∧
+    msg = { msgType := msgType, body := body,
+            encoded := ByteArray.empty.push msgType ++
+              length24Bytes body.size ++ body } := by
+  unfold frame at h
+  obtain ⟨len, hlen, h⟩ := bind_ok_ex h
+  obtain ⟨hsize, hbytes⟩ := encodeLength24_ok hlen
+  refine ⟨hsize, ?_⟩
+  rw [← pure_eq_ok h, hbytes]
+
+private theorem uint24_recompose {n : Nat} (h : n < 2 ^ 24) :
+    (UInt8.ofNat (n >>> 16)).toNat <<< 16 |||
+      (UInt8.ofNat (n >>> 8)).toNat <<< 8 ||| (UInt8.ofNat n).toNat = n := by
+  rw [UInt8.toNat_ofNat', UInt8.toNat_ofNat', UInt8.toNat_ofNat']
+  apply Nat.eq_of_testBit_eq
+  intro i
+  simp only [Nat.testBit_or, Nat.testBit_shiftLeft, Nat.testBit_mod_two_pow,
+    Nat.testBit_shiftRight]
+  by_cases h8 : i < 8
+  · have e1 : ¬i ≥ 16 := by omega
+    have e2 : ¬i ≥ 8 := by omega
+    simp [e1, e2, h8]
+  · by_cases h16 : i < 16
+    · have e1 : ¬i ≥ 16 := by omega
+      have e2 : i ≥ 8 := by omega
+      have e3 : i - 8 < 8 := by omega
+      have e4 : 8 + (i - 8) = i := by omega
+      simp [e1, e2, e3, e4, h8]
+    · by_cases h24 : i < 24
+      · have e1 : i ≥ 16 := by omega
+        have e3 : i - 16 < 8 := by omega
+        have e4 : 16 + (i - 16) = i := by omega
+        have e5 : ¬i - 8 < 8 := by omega
+        simp [e1, e3, e4, e5, h8]
+      · have e1 : ¬i - 16 < 8 := by omega
+        have e5 : ¬i - 8 < 8 := by omega
+        have hn : n.testBit i = false :=
+          Nat.testBit_lt_two_pow
+            (Nat.lt_of_lt_of_le h (Nat.pow_le_pow_right (by omega) (by omega)))
+        simp [e1, e5, h8, hn]
+
+/-! ### Reader evaluation lemmas -/
+
+private theorem take_eval {b : ByteArray} {off n : Nat}
+    (h : off + n ≤ b.size) :
+    Reader.take { bytes := b, offset := off } n =
+      .ok (b.extract off (off + n), { bytes := b, offset := off + n }) := by
+  unfold Reader.take
+  rw [if_neg]
+  show ¬off + n > b.size
+  omega
+
+private theorem readUInt8_eval {b : ByteArray} {off : Nat} (h : off < b.size) :
+    Reader.readUInt8 { bytes := b, offset := off } =
+      .ok (b.get! off, { bytes := b, offset := off + 1 }) := by
+  unfold Reader.readUInt8
+  rw [take_eval (by omega)]
+  show Except.ok ((b.extract off (off + 1)).get! 0,
+    ({ bytes := b, offset := off + 1 } : Reader)) = _
+  rw [extract_get! (by omega) (by omega)]
+  rfl
+
+private theorem readUInt24_eval {b : ByteArray} {off : Nat}
+    (h : off + 3 ≤ b.size) :
+    Reader.readUInt24 { bytes := b, offset := off } =
+      .ok ((b.get! off).toNat <<< 16 ||| (b.get! (off + 1)).toNat <<< 8 |||
+        (b.get! (off + 2)).toNat, { bytes := b, offset := off + 3 }) := by
+  unfold Reader.readUInt24
+  rw [take_eval (by omega)]
+  show Except.ok (((b.extract off (off + 3)).get! 0).toNat <<< 16 |||
+      ((b.extract off (off + 3)).get! 1).toNat <<< 8 |||
+      ((b.extract off (off + 3)).get! 2).toNat,
+    ({ bytes := b, offset := off + 3 } : Reader)) = _
+  rw [extract_get! (by omega) (by omega), extract_get! (by omega) (by omega),
+    extract_get! (by omega) (by omega)]
+  rfl
+
+/-! ### Framing roundtrip with residual -/
+
+/-- **Wire roundtrip with residual**: `decodeOne` accepts a framed message's
+exact encoding, returns it unchanged, and consumes nothing beyond it. -/
+theorem decodeOne_frame {msgType : UInt8} {body : ByteArray} {msg : Message}
+    (h : frame msgType body = .ok msg) (rest : ByteArray) :
+    decodeOne (msg.encoded ++ rest) = .ok (msg, rest) := by
+  obtain ⟨hlt, hmsg⟩ := frame_spec h
+  subst hmsg
+  have hP1 : (ByteArray.empty.push msgType).size = 1 := rfl
+  have hL3 : (length24Bytes body.size).size = 3 := rfl
+  have hPL : (ByteArray.empty.push msgType ++ length24Bytes body.size).size
+      = 4 := by
+    rw [ByteArray.size_append, hP1, hL3]
+  show decodeOne (ByteArray.empty.push msgType ++ length24Bytes body.size ++
+    body ++ rest) = _
+  rw [ByteArray.append_assoc]
+  -- Facts about the assembled wire bytes, proved before generalizing.
+  have hXsize : (ByteArray.empty.push msgType ++ length24Bytes body.size ++
+      (body ++ rest)).size = 4 + (body.size + rest.size) := by
+    rw [ByteArray.size_append, hPL, ByteArray.size_append]
+  have hb0 : (ByteArray.empty.push msgType ++ length24Bytes body.size ++
+      (body ++ rest)).get! 0 = msgType := by
+    rw [get!_append_left (by omega), get!_append_left (by omega)]
+    rfl
+  have hb1 : (ByteArray.empty.push msgType ++ length24Bytes body.size ++
+      (body ++ rest)).get! 1 = UInt8.ofNat (body.size >>> 16) := by
+    rw [get!_append_left (by omega), get!_append_right (by omega) (by omega)]
+    rfl
+  have hb2 : (ByteArray.empty.push msgType ++ length24Bytes body.size ++
+      (body ++ rest)).get! 2 = UInt8.ofNat (body.size >>> 8) := by
+    rw [get!_append_left (by omega), get!_append_right (by omega) (by omega)]
+    rfl
+  have hb3 : (ByteArray.empty.push msgType ++ length24Bytes body.size ++
+      (body ++ rest)).get! 3 = UInt8.ofNat body.size := by
+    rw [get!_append_left (by omega), get!_append_right (by omega) (by omega)]
+    rfl
+  have hassoc : ByteArray.empty.push msgType ++ length24Bytes body.size ++
+      (body ++ rest) = (ByteArray.empty.push msgType ++
+        length24Bytes body.size ++ body) ++ rest :=
+    ByteArray.append_assoc.symm
+  have hbody : (ByteArray.empty.push msgType ++ length24Bytes body.size ++
+      (body ++ rest)).extract 4 (4 + body.size) = body := by
+    rw [ByteArray.extract_append,
+      show ((ByteArray.empty.push msgType ++ length24Bytes body.size).extract
+          4 (4 + body.size)) = ByteArray.empty from
+        ByteArray.extract_eq_empty_iff.mpr (by rw [hPL]; omega),
+      ByteArray.empty_append, hPL,
+      show (4 : Nat) - 4 = 0 from rfl,
+      show 4 + body.size - 4 = body.size from by omega,
+      ByteArray.extract_append_eq_left rfl]
+  have hencoded : (ByteArray.empty.push msgType ++ length24Bytes body.size ++
+      (body ++ rest)).extract 0 (4 + body.size) =
+      ByteArray.empty.push msgType ++ length24Bytes body.size ++ body := by
+    rw [hassoc]
+    exact ByteArray.extract_append_eq_left
+      (by rw [ByteArray.size_append, hPL])
+  have hrest : (ByteArray.empty.push msgType ++ length24Bytes body.size ++
+      (body ++ rest)).extract (4 + body.size)
+      (ByteArray.empty.push msgType ++ length24Bytes body.size ++
+        (body ++ rest)).size = rest := by
+    rw [hassoc]
+    exact ByteArray.extract_append_eq_right
+      (by rw [ByteArray.size_append, hPL]) ByteArray.size_append
+  generalize hE : ByteArray.empty.push msgType ++ length24Bytes body.size ++
+    (body ++ rest) = E at hXsize hb0 hb1 hb2 hb3 hbody hencoded hrest ⊢
+  have h8 := readUInt8_eval (b := E) (off := 0) (by omega)
+  rw [hb0] at h8
+  have h24 : ({ bytes := E, offset := 1 } : Reader).readUInt24 =
+      .ok ((E.get! 1).toNat <<< 16 ||| (E.get! 2).toNat <<< 8 |||
+        (E.get! 3).toNat, { bytes := E, offset := 4 }) :=
+    readUInt24_eval (by omega)
+  rw [hb1, hb2, hb3, uint24_recompose hlt] at h24
+  have htk : ({ bytes := E, offset := 4 } : Reader).take body.size =
+      .ok (E.extract 4 (4 + body.size),
+        { bytes := E, offset := 4 + body.size }) :=
+    take_eval (by omega)
+  rw [hbody] at htk
+  unfold decodeOne
+  simp only [h8, h24, htk]
+  rw [hencoded, hrest]
+
+/-- Exact wire roundtrip: `decode` inverts `frame`. -/
+theorem decode_frame {msgType : UInt8} {body : ByteArray} {msg : Message}
+    (h : frame msgType body = .ok msg) : decode msg.encoded = .ok msg := by
+  have hone := decodeOne_frame h ByteArray.empty
+  rw [ByteArray.append_empty] at hone
+  unfold decode
+  simp only [hone]
+  rw [if_pos (show ByteArray.empty.isEmpty = true from rfl)]
+
+/-! ### Every message encoder roundtrips through the wire decoder
+
+Each encoder ends in `frame`, so peeling its do-chain produces the frame
+equation and `decodeOne_frame`/`decode_frame` apply. -/
+
+private theorem encodeFinished_frame {verifyData : ByteArray} {msg : Message}
+    (h : encodeFinished verifyData = .ok msg) :
+    ∃ body, frame finishedType body = .ok msg := by
+  unfold encodeFinished at h
+  obtain ⟨hc, h⟩ | ⟨hc, h⟩ := ite_ok_cases h
+  · obtain ⟨_, _, h⟩ := bind_ok_ex h
+    exact ⟨_, h⟩
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+
+private theorem encodeKeyUpdate_frame {request : KeyUpdateRequest}
+    {msg : Message} (h : encodeKeyUpdate request = .ok msg) :
+    ∃ body, frame keyUpdateType body = .ok msg :=
+  ⟨_, h⟩
+
+private theorem encodeCertificateVerify_frame {algorithm : UInt16}
+    {signature : ByteArray} {msg : Message}
+    (h : encodeCertificateVerify algorithm signature = .ok msg) :
+    ∃ body, frame certificateVerifyType body = .ok msg := by
+  unfold encodeCertificateVerify at h
+  obtain ⟨hc, h⟩ | ⟨hc, h⟩ := ite_ok_cases h
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+  · obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    exact ⟨_, h⟩
+
+private theorem encodeEncryptedExtensions_frame {alpnSelected : Option String}
+    {msg : Message} (h : encodeEncryptedExtensions alpnSelected = .ok msg) :
+    ∃ body, frame encryptedExtensionsType body = .ok msg := by
+  unfold encodeEncryptedExtensions at h
+  cases halpn : alpnSelected with
+  | some protocol =>
+    rw [halpn] at h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    exact ⟨_, h⟩
+  | none =>
+    rw [halpn] at h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    exact ⟨_, h⟩
+
+private theorem encodeCertificate_frame {chain : Array ByteArray}
+    {msg : Message} (h : encodeCertificate chain = .ok msg) :
+    ∃ body, frame certificateType body = .ok msg := by
+  unfold encodeCertificate at h
+  obtain ⟨hc, h⟩ | ⟨hc, h⟩ := ite_ok_cases h
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+  · obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    exact ⟨_, h⟩
+
+private theorem encodeClientHello_frame {cfg : ClientHelloConfig}
+    {msg : Message} (h : encodeClientHello cfg = .ok msg) :
+    ∃ body, frame clientHelloType body = .ok msg := by
+  unfold encodeClientHello at h
+  obtain ⟨hc1, h⟩ | ⟨hc1, h⟩ := ite_ok_cases h
+  · obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨hc2, h⟩ | ⟨hc2, h⟩ := ite_ok_cases h
+    · obtain ⟨_, _, h⟩ := bind_ok_ex h
+      obtain ⟨_, _, h⟩ := bind_ok_ex h
+      obtain ⟨hc3, h⟩ | ⟨hc3, h⟩ := ite_ok_cases h
+      · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+        cases hu
+      · obtain ⟨_, _, h⟩ := bind_ok_ex h
+        obtain ⟨_, _, h⟩ := bind_ok_ex h
+        obtain ⟨_, _, h⟩ := bind_ok_ex h
+        obtain ⟨_, _, h⟩ := bind_ok_ex h
+        obtain ⟨_, _, h⟩ := bind_ok_ex h
+        obtain ⟨_, _, h⟩ := bind_ok_ex h
+        obtain ⟨_, _, h⟩ := bind_ok_ex h
+        obtain ⟨_, _, h⟩ := bind_ok_ex h
+        obtain ⟨_, _, h⟩ := bind_ok_ex h
+        obtain ⟨_, _, h⟩ := bind_ok_ex h
+        obtain ⟨_, _, h⟩ := bind_ok_ex h
+        exact ⟨_, h⟩
+    · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+      cases hu
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+
+private theorem encodeServerHello_frame {random legacySessionIdEcho : ByteArray}
+    {group : NamedGroup} {keyExchange : ByteArray} {cipherSuite : UInt16}
+    {msg : Message}
+    (h : encodeServerHello random legacySessionIdEcho group keyExchange
+      cipherSuite = .ok msg) :
+    ∃ body, frame serverHelloType body = .ok msg := by
+  unfold encodeServerHello at h
+  obtain ⟨hc, h⟩ | ⟨hc, h⟩ := ite_ok_cases h
+  · obtain ⟨hc2, h⟩ | ⟨hc2, h⟩ := ite_ok_cases h
+    · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+      cases hu
+    · obtain ⟨_, _, h⟩ := bind_ok_ex h
+      obtain ⟨_, _, h⟩ := bind_ok_ex h
+      obtain ⟨_, _, h⟩ := bind_ok_ex h
+      obtain ⟨_, _, h⟩ := bind_ok_ex h
+      obtain ⟨_, _, h⟩ := bind_ok_ex h
+      obtain ⟨_, _, h⟩ := bind_ok_ex h
+      exact ⟨_, h⟩
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+
+private theorem encodeHelloRetryRequest_frame {legacySessionIdEcho : ByteArray}
+    {group : NamedGroup} {cipherSuite : UInt16} {msg : Message}
+    (h : encodeHelloRetryRequest legacySessionIdEcho group cipherSuite
+      = .ok msg) :
+    ∃ body, frame serverHelloType body = .ok msg := by
+  unfold encodeHelloRetryRequest at h
+  obtain ⟨hc, h⟩ | ⟨hc, h⟩ := ite_ok_cases h
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+  · obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    exact ⟨_, h⟩
+
+/-- ClientHello wire roundtrip with residual. -/
+theorem encodeClientHello_decodeOne {cfg : ClientHelloConfig} {msg : Message}
+    (h : encodeClientHello cfg = .ok msg) (rest : ByteArray) :
+    decodeOne (msg.encoded ++ rest) = .ok (msg, rest) :=
+  (encodeClientHello_frame h).elim fun _ hf => decodeOne_frame hf rest
+
+/-- ClientHello exact wire roundtrip. -/
+theorem encodeClientHello_decode {cfg : ClientHelloConfig} {msg : Message}
+    (h : encodeClientHello cfg = .ok msg) : decode msg.encoded = .ok msg :=
+  (encodeClientHello_frame h).elim fun _ hf => decode_frame hf
+
+/-- ServerHello wire roundtrip with residual. -/
+theorem encodeServerHello_decodeOne {random legacySessionIdEcho : ByteArray}
+    {group : NamedGroup} {keyExchange : ByteArray} {cipherSuite : UInt16}
+    {msg : Message}
+    (h : encodeServerHello random legacySessionIdEcho group keyExchange
+      cipherSuite = .ok msg) (rest : ByteArray) :
+    decodeOne (msg.encoded ++ rest) = .ok (msg, rest) :=
+  (encodeServerHello_frame h).elim fun _ hf => decodeOne_frame hf rest
+
+/-- ServerHello exact wire roundtrip. -/
+theorem encodeServerHello_decode {random legacySessionIdEcho : ByteArray}
+    {group : NamedGroup} {keyExchange : ByteArray} {cipherSuite : UInt16}
+    {msg : Message}
+    (h : encodeServerHello random legacySessionIdEcho group keyExchange
+      cipherSuite = .ok msg) : decode msg.encoded = .ok msg :=
+  (encodeServerHello_frame h).elim fun _ hf => decode_frame hf
+
+/-- HelloRetryRequest wire roundtrip with residual. -/
+theorem encodeHelloRetryRequest_decodeOne {legacySessionIdEcho : ByteArray}
+    {group : NamedGroup} {cipherSuite : UInt16} {msg : Message}
+    (h : encodeHelloRetryRequest legacySessionIdEcho group cipherSuite
+      = .ok msg) (rest : ByteArray) :
+    decodeOne (msg.encoded ++ rest) = .ok (msg, rest) :=
+  (encodeHelloRetryRequest_frame h).elim fun _ hf => decodeOne_frame hf rest
+
+/-- HelloRetryRequest exact wire roundtrip. -/
+theorem encodeHelloRetryRequest_decode {legacySessionIdEcho : ByteArray}
+    {group : NamedGroup} {cipherSuite : UInt16} {msg : Message}
+    (h : encodeHelloRetryRequest legacySessionIdEcho group cipherSuite
+      = .ok msg) : decode msg.encoded = .ok msg :=
+  (encodeHelloRetryRequest_frame h).elim fun _ hf => decode_frame hf
+
+/-- EncryptedExtensions wire roundtrip with residual. -/
+theorem encodeEncryptedExtensions_decodeOne {alpnSelected : Option String}
+    {msg : Message} (h : encodeEncryptedExtensions alpnSelected = .ok msg)
+    (rest : ByteArray) : decodeOne (msg.encoded ++ rest) = .ok (msg, rest) :=
+  (encodeEncryptedExtensions_frame h).elim fun _ hf => decodeOne_frame hf rest
+
+/-- EncryptedExtensions exact wire roundtrip. -/
+theorem encodeEncryptedExtensions_decode {alpnSelected : Option String}
+    {msg : Message} (h : encodeEncryptedExtensions alpnSelected = .ok msg) :
+    decode msg.encoded = .ok msg :=
+  (encodeEncryptedExtensions_frame h).elim fun _ hf => decode_frame hf
+
+/-- Certificate wire roundtrip with residual. -/
+theorem encodeCertificate_decodeOne {chain : Array ByteArray} {msg : Message}
+    (h : encodeCertificate chain = .ok msg) (rest : ByteArray) :
+    decodeOne (msg.encoded ++ rest) = .ok (msg, rest) :=
+  (encodeCertificate_frame h).elim fun _ hf => decodeOne_frame hf rest
+
+/-- Certificate exact wire roundtrip. -/
+theorem encodeCertificate_decode {chain : Array ByteArray} {msg : Message}
+    (h : encodeCertificate chain = .ok msg) : decode msg.encoded = .ok msg :=
+  (encodeCertificate_frame h).elim fun _ hf => decode_frame hf
+
+/-- CertificateVerify wire roundtrip with residual. -/
+theorem encodeCertificateVerify_decodeOne {algorithm : UInt16}
+    {signature : ByteArray} {msg : Message}
+    (h : encodeCertificateVerify algorithm signature = .ok msg)
+    (rest : ByteArray) : decodeOne (msg.encoded ++ rest) = .ok (msg, rest) :=
+  (encodeCertificateVerify_frame h).elim fun _ hf => decodeOne_frame hf rest
+
+/-- CertificateVerify exact wire roundtrip. -/
+theorem encodeCertificateVerify_decode {algorithm : UInt16}
+    {signature : ByteArray} {msg : Message}
+    (h : encodeCertificateVerify algorithm signature = .ok msg) :
+    decode msg.encoded = .ok msg :=
+  (encodeCertificateVerify_frame h).elim fun _ hf => decode_frame hf
+
+/-- Finished wire roundtrip with residual. -/
+theorem encodeFinished_decodeOne {verifyData : ByteArray} {msg : Message}
+    (h : encodeFinished verifyData = .ok msg) (rest : ByteArray) :
+    decodeOne (msg.encoded ++ rest) = .ok (msg, rest) :=
+  (encodeFinished_frame h).elim fun _ hf => decodeOne_frame hf rest
+
+/-- Finished exact wire roundtrip. -/
+theorem encodeFinished_decode {verifyData : ByteArray} {msg : Message}
+    (h : encodeFinished verifyData = .ok msg) : decode msg.encoded = .ok msg :=
+  (encodeFinished_frame h).elim fun _ hf => decode_frame hf
+
+/-- KeyUpdate wire roundtrip with residual. -/
+theorem encodeKeyUpdate_decodeOne {request : KeyUpdateRequest} {msg : Message}
+    (h : encodeKeyUpdate request = .ok msg) (rest : ByteArray) :
+    decodeOne (msg.encoded ++ rest) = .ok (msg, rest) :=
+  (encodeKeyUpdate_frame h).elim fun _ hf => decodeOne_frame hf rest
+
+/-- KeyUpdate exact wire roundtrip. -/
+theorem encodeKeyUpdate_decode {request : KeyUpdateRequest} {msg : Message}
+    (h : encodeKeyUpdate request = .ok msg) : decode msg.encoded = .ok msg :=
+  (encodeKeyUpdate_frame h).elim fun _ hf => decode_frame hf
+
+/-! ### Body-level parse inversion for the loop-free messages -/
+
+/-- Parse inverts encode for Finished. -/
+theorem encodeFinished_parse {verifyData : ByteArray} {msg : Message}
+    (h : encodeFinished verifyData = .ok msg) :
+    parseFinished msg = .ok { verifyData := verifyData,
+                              encoded := msg.encoded } := by
+  unfold encodeFinished at h
+  obtain ⟨hsz, h⟩ | ⟨hsz, h⟩ := ite_ok_cases h
+  · obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨hlt, hmsg⟩ := frame_spec h
+    have hty : msg.msgType = finishedType := by rw [hmsg]
+    have hbd : msg.body = verifyData := by rw [hmsg]
+    unfold parseFinished
+    rw [hty, hbd,
+      if_pos (show (finishedType == finishedType) = true from rfl),
+      if_pos hsz]
+    rfl
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+
+/-- Parse inverts encode for KeyUpdate. -/
+theorem encodeKeyUpdate_parse {request : KeyUpdateRequest} {msg : Message}
+    (h : encodeKeyUpdate request = .ok msg) :
+    parseKeyUpdate msg = .ok { request := request,
+                               encoded := msg.encoded } := by
+  obtain ⟨hlt, hmsg⟩ := frame_spec h
+  have hty : msg.msgType = keyUpdateType := by rw [hmsg]
+  have hbd : msg.body = ByteArray.empty.push request.toUInt8 := by rw [hmsg]
+  unfold parseKeyUpdate
+  rw [hty, hbd,
+    if_pos (show (keyUpdateType == keyUpdateType) = true from rfl),
+    if_pos (show ((ByteArray.empty.push request.toUInt8).size == 1) = true
+      from rfl)]
+  cases request <;> rfl
+
+private theorem uint16_recompose (v : UInt16) :
+    ((v >>> 8).toUInt8.toUInt16 <<< 8 ||| v.toUInt8.toUInt16) = v := by
+  bv_decide
+
+private theorem encodeLength16_ok {n : Nat} {out : ByteArray}
+    (h : encodeLength16 n = .ok out) :
+    n < 2 ^ 16 ∧ out = appendUInt16 ByteArray.empty (UInt16.ofNat n) := by
+  unfold encodeLength16 at h
+  obtain ⟨hc, h⟩ | ⟨hc, h⟩ := ite_ok_cases h
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+  · exact ⟨by omega, (pure_eq_ok h).symm⟩
+
+private theorem encodeVector16_ok {b out : ByteArray}
+    (h : encodeVector16 b = .ok out) :
+    b.size < 2 ^ 16 ∧
+    out = appendUInt16 ByteArray.empty (UInt16.ofNat b.size) ++ b := by
+  unfold encodeVector16 at h
+  obtain ⟨len, hlen, h⟩ := bind_ok_ex h
+  obtain ⟨hsize, hbytes⟩ := encodeLength16_ok hlen
+  refine ⟨hsize, ?_⟩
+  rw [← pure_eq_ok h, hbytes]
+
+private theorem readUInt16_eval {b : ByteArray} {off : Nat}
+    (h : off + 2 ≤ b.size) :
+    Reader.readUInt16 { bytes := b, offset := off } =
+      .ok ((b.get! off).toUInt16 <<< 8 ||| (b.get! (off + 1)).toUInt16,
+        { bytes := b, offset := off + 2 }) := by
+  unfold Reader.readUInt16
+  rw [take_eval (by omega)]
+  show Except.ok (((b.extract off (off + 2)).get! 0).toUInt16 <<< 8 |||
+      ((b.extract off (off + 2)).get! 1).toUInt16,
+    ({ bytes := b, offset := off + 2 } : Reader)) = _
+  rw [extract_get! (by omega) (by omega), extract_get! (by omega) (by omega)]
+  rfl
+
+private theorem readVector16_eval {b : ByteArray} {off L : Nat}
+    (hL : ((b.get! off).toUInt16 <<< 8 |||
+      (b.get! (off + 1)).toUInt16).toNat = L)
+    (h : off + 2 + L ≤ b.size) :
+    Reader.readVector16 { bytes := b, offset := off } =
+      .ok (b.extract (off + 2) (off + 2 + L),
+        { bytes := b, offset := off + 2 + L }) := by
+  unfold Reader.readVector16
+  rw [readUInt16_eval (by omega)]
+  show ({ bytes := b, offset := off + 2 } : Reader).take
+    ((b.get! off).toUInt16 <<< 8 ||| (b.get! (off + 1)).toUInt16).toNat = _
+  rw [hL, take_eval (by omega)]
+
+private theorem requireEnd_eval {b : ByteArray} {off : Nat} {context : String}
+    (h : off = b.size) :
+    Reader.requireEnd { bytes := b, offset := off } context = .ok () := by
+  unfold Reader.requireEnd
+  rw [if_pos]
+  · rfl
+  · show (off == b.size) = true
+    rw [h]
+    exact beq_self_eq_true b.size
+
+/-- Parse inverts encode for CertificateVerify. -/
+theorem encodeCertificateVerify_parse {algorithm : UInt16}
+    {signature : ByteArray} {msg : Message}
+    (h : encodeCertificateVerify algorithm signature = .ok msg) :
+    parseCertificateVerify msg =
+      .ok { algorithm := algorithm, signature := signature,
+            encoded := msg.encoded } := by
+  unfold encodeCertificateVerify at h
+  obtain ⟨hemp, h⟩ | ⟨hemp, h⟩ := ite_ok_cases h
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+  obtain ⟨_, _, h⟩ := bind_ok_ex h
+  obtain ⟨V, hV, h⟩ := bind_ok_ex h
+  obtain ⟨hszlt, hVeq⟩ := encodeVector16_ok hV
+  obtain ⟨hlt, hmsg⟩ := frame_spec h
+  subst hVeq
+  have hty : msg.msgType = certificateVerifyType := by rw [hmsg]
+  have hbd : msg.body = appendUInt16 ByteArray.empty algorithm ++
+      (appendUInt16 ByteArray.empty (UInt16.ofNat signature.size) ++
+        signature) := by rw [hmsg]
+  -- Facts about the assembled body bytes.
+  have hA2 : (appendUInt16 ByteArray.empty algorithm).size = 2 := rfl
+  have hL2 : (appendUInt16 ByteArray.empty
+    (UInt16.ofNat signature.size)).size = 2 := rfl
+  have hLS : (appendUInt16 ByteArray.empty (UInt16.ofNat signature.size) ++
+      signature).size = 2 + signature.size := by
+    rw [ByteArray.size_append, hL2]
+  have hBsize : (appendUInt16 ByteArray.empty algorithm ++
+      (appendUInt16 ByteArray.empty (UInt16.ofNat signature.size) ++
+        signature)).size = 2 + (2 + signature.size) := by
+    rw [ByteArray.size_append, hA2, ByteArray.size_append, hL2]
+  have hb0 : (appendUInt16 ByteArray.empty algorithm ++
+      (appendUInt16 ByteArray.empty (UInt16.ofNat signature.size) ++
+        signature)).get! 0 = (algorithm >>> 8).toUInt8 := by
+    rw [get!_append_left (by omega)]
+    rfl
+  have hb1 : (appendUInt16 ByteArray.empty algorithm ++
+      (appendUInt16 ByteArray.empty (UInt16.ofNat signature.size) ++
+        signature)).get! 1 = algorithm.toUInt8 := by
+    rw [get!_append_left (by omega)]
+    rfl
+  have hb2 : (appendUInt16 ByteArray.empty algorithm ++
+      (appendUInt16 ByteArray.empty (UInt16.ofNat signature.size) ++
+        signature)).get! 2 = (UInt16.ofNat signature.size >>> 8).toUInt8 := by
+    rw [get!_append_right (by omega) (by omega),
+      show (2 : Nat) - (appendUInt16 ByteArray.empty algorithm).size = 0
+        from rfl,
+      get!_append_left (by omega)]
+    rfl
+  have hb3 : (appendUInt16 ByteArray.empty algorithm ++
+      (appendUInt16 ByteArray.empty (UInt16.ofNat signature.size) ++
+        signature)).get! 3 = (UInt16.ofNat signature.size).toUInt8 := by
+    rw [get!_append_right (by omega) (by omega),
+      show (3 : Nat) - (appendUInt16 ByteArray.empty algorithm).size = 1
+        from rfl,
+      get!_append_left (by omega)]
+    rfl
+  have hslice : (appendUInt16 ByteArray.empty algorithm ++
+      (appendUInt16 ByteArray.empty (UInt16.ofNat signature.size) ++
+        signature)).extract (2 + 2) (2 + 2 + signature.size) = signature := by
+    rw [show appendUInt16 ByteArray.empty algorithm ++
+        (appendUInt16 ByteArray.empty (UInt16.ofNat signature.size) ++
+          signature) =
+        (appendUInt16 ByteArray.empty algorithm ++
+          appendUInt16 ByteArray.empty (UInt16.ofNat signature.size)) ++
+          signature from ByteArray.append_assoc.symm]
+    exact ByteArray.extract_append_eq_right
+      (by rw [ByteArray.size_append, hA2, hL2])
+      (by rw [ByteArray.size_append, hA2, hL2])
+  -- Evaluate the parser.
+  unfold parseCertificateVerify
+  rw [hty,
+    if_pos (show (certificateVerifyType == certificateVerifyType) = true
+      from rfl), hbd]
+  generalize hB : appendUInt16 ByteArray.empty algorithm ++
+    (appendUInt16 ByteArray.empty (UInt16.ofNat signature.size) ++
+      signature) = B at hBsize hb0 hb1 hb2 hb3 hslice ⊢
+  have hr16 : Reader.readUInt16 { bytes := B } =
+      .ok (algorithm, { bytes := B, offset := 2 }) := by
+    rw [readUInt16_eval (off := 0) (by omega), hb0,
+      show B.get! (0 + 1) = algorithm.toUInt8 from hb1, uint16_recompose]
+  have hL : ((B.get! 2).toUInt16 <<< 8 |||
+      (B.get! (2 + 1)).toUInt16).toNat = signature.size := by
+    rw [hb2, show B.get! (2 + 1) = (UInt16.ofNat signature.size).toUInt8
+      from hb3, uint16_recompose, UInt16.toNat_ofNat']
+    exact Nat.mod_eq_of_lt hszlt
+  have hv16 : Reader.readVector16 { bytes := B, offset := 2 } =
+      .ok (signature, { bytes := B, offset := 2 + 2 + signature.size }) := by
+    rw [readVector16_eval hL (by omega), hslice]
+  have hend : Reader.requireEnd
+      { bytes := B, offset := 2 + 2 + signature.size } "CertificateVerify" =
+      .ok () := requireEnd_eval (by omega)
+  simp only [hr16, hv16, hend]
+  rw [if_neg hemp]
 
 end Handshake
 end Tls
