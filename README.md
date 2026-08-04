@@ -70,11 +70,11 @@ Four Bazel packages:
   kernel-checked wire-codec laws: every message encoder roundtrips through
   the wire decoder with an explicit residual, the framing outcome depends
   only on the reassembled byte stream and never accepts a partial frame,
-  the EncryptedExtensions/Certificate/CertificateVerify/Finished/
-  NewSessionTicket/KeyUpdate bodies invert semantically, extension lists and
-  `uint16` vectors roundtrip for arbitrary (including unknown and GREASE)
-  types and values, and HelloRetryRequest is discriminated from ServerHello
-  by the RFC 8446 sentinel random.
+  the ServerHello/HelloRetryRequest/EncryptedExtensions/Certificate/
+  CertificateVerify/Finished/NewSessionTicket/KeyUpdate bodies invert
+  semantically, extension lists and `uint16` vectors roundtrip for arbitrary
+  (including unknown and GREASE) types and values, and HelloRetryRequest is
+  discriminated from ServerHello by the RFC 8446 sentinel random.
 - **`Test/`** — nine hermetic test binaries, a one-shot loopback server
   harness, and a scripted (manual-tag) interoperability gate that drives the
   harness with real OpenSSL, curl, and Go `crypto/tls` clients.

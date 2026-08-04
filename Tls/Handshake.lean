@@ -553,8 +553,10 @@ structure ServerHello where
   deriving Inhabited, BEq
 
 /-- The per-group key-share size check shared by the ServerHello parser and
-its laws. -/
-private def checkKeyShareSize : NamedGroup → ByteArray → Except String Unit
+its laws: an x25519 share is 32 bytes, a P-256 share is a 65-byte SEC1
+uncompressed point. Public (and exposed) because the ServerHello inversion law
+below takes it as a hypothesis. -/
+@[expose] def checkKeyShareSize : NamedGroup → ByteArray → Except String Unit
   | .x25519, keyExchange =>
       if keyExchange.size == 32 then
         .ok ()
@@ -587,7 +589,10 @@ private def parseServerKeyShare (data : ByteArray) :
           | .ok () => .ok (selectedGroup, keyExchange)
 
 /-- Parse a ServerHello. (Written as a pure `if`/`match` chain so the
-ServerHello laws below can evaluate it.) -/
+ServerHello laws below can evaluate it.) `encodeServerHello_parse` proves this
+inverts `encodeServerHello` field by field, and
+`encodeHelloRetryRequest_parseServerHello` that it refuses a
+HelloRetryRequest. -/
 def parseServerHello (msg : Message) : Except String ServerHello :=
   if msg.msgType == serverHelloType then
     match ({ bytes := msg.body } : Reader).readUInt16 with
@@ -671,7 +676,9 @@ private def parseHrrKeyShare (data : ByteArray) : Except String NamedGroup :=
       | some selectedGroup => .ok selectedGroup
 
 /-- Parse a HelloRetryRequest. (Written as a pure `if`/`match` chain so the
-HelloRetryRequest laws below can evaluate it.) -/
+HelloRetryRequest laws below can evaluate it.) `encodeHelloRetryRequest_parse`
+proves this inverts `encodeHelloRetryRequest` field by field, and
+`encodeServerHello_parseHelloRetryRequest` that it refuses a ServerHello. -/
 def parseHelloRetryRequest (msg : Message) : Except String HelloRetryRequest :=
   if msg.msgType == serverHelloType then
     match ({ bytes := msg.body } : Reader).readUInt16 with
@@ -3394,6 +3401,444 @@ theorem parseUInt16List_uint16ListBytes (l : List UInt16) :
   rw [parseUInt16ListLoop_uint16ListBytes l ByteArray.empty #[]]
   rfl
 
+/-! ### ServerHello and HelloRetryRequest body inversion
+
+The framing laws recover the `Message`; these laws take its body apart. Every
+field an encoder wrote comes back unchanged, and the two extensions a server
+sends — `supported_versions` selecting TLS 1.3, then `key_share` — are
+recovered in order with their exact wire data. -/
+
+/-- Named-group codes roundtrip: a group encodes to a code that parses back to
+the same group. -/
+theorem NamedGroup.ofUInt16?_toUInt16 (g : NamedGroup) :
+    NamedGroup.ofUInt16? g.toUInt16 = some g := by
+  cases g <;> rfl
+
+/-- A buffer that is exactly one `uint16` reads back as that value. -/
+private theorem readUInt16_solo (v : UInt16) :
+    Reader.readUInt16 (Reader.mk (appendUInt16 ByteArray.empty v) 0) =
+      .ok (v, Reader.mk (appendUInt16 ByteArray.empty v) (0 + 2)) :=
+  readUInt16_at' (W := appendUInt16 ByteArray.empty v) (P := ByteArray.empty)
+    (S := ByteArray.empty)
+    (by rw [ByteArray.append_empty, ByteArray.empty_append]) rfl
+
+/-- The HelloRetryRequest key_share body (a bare group code) parses back to
+that group. -/
+private theorem parseHrrKeyShare_eq (g : NamedGroup) :
+    parseHrrKeyShare (appendUInt16 ByteArray.empty g.toUInt16) = .ok g := by
+  unfold parseHrrKeyShare
+  simp only [readUInt16_solo,
+    requireEnd_eval (b := appendUInt16 ByteArray.empty g.toUInt16)
+      (off := 0 + 2) (context := "HelloRetryRequest key_share") rfl,
+    NamedGroup.ofUInt16?_toUInt16]
+
+/-- The ServerHello key_share body (`group ‖ uint16 key`) parses back to the
+group and key it was built from, provided the key has the size the parser
+requires for that group. -/
+private theorem parseServerKeyShare_eq {g : NamedGroup} {k : ByteArray}
+    (hsz : k.size < 2 ^ 16) (hcheck : checkKeyShareSize g k = .ok ()) :
+    parseServerKeyShare (appendUInt16 ByteArray.empty g.toUInt16 ++
+        (appendUInt16 ByteArray.empty (UInt16.ofNat k.size) ++ k)) = .ok (g, k) := by
+  unfold parseServerKeyShare
+  simp only [readUInt16_at' (W := appendUInt16 ByteArray.empty g.toUInt16 ++
+        (appendUInt16 ByteArray.empty (UInt16.ofNat k.size) ++ k))
+      (off := 0) (v := g.toUInt16) (P := ByteArray.empty)
+      (S := appendUInt16 ByteArray.empty (UInt16.ofNat k.size) ++ k)
+      (by rw [ByteArray.empty_append]) rfl,
+    NamedGroup.ofUInt16?_toUInt16,
+    readVector16_at' (W := appendUInt16 ByteArray.empty g.toUInt16 ++
+        (appendUInt16 ByteArray.empty (UInt16.ofNat k.size) ++ k))
+      (off := 0 + 2) (P := appendUInt16 ByteArray.empty g.toUInt16)
+      (X := k) (S := ByteArray.empty) (by rw [ByteArray.append_empty]) rfl hsz,
+    requireEnd_eval (b := appendUInt16 ByteArray.empty g.toUInt16 ++
+        (appendUInt16 ByteArray.empty (UInt16.ofNat k.size) ++ k))
+      (off := 0 + 2 + 2 + k.size) (context := "ServerHello key_share")
+      (by rw [ByteArray.size_append, ByteArray.size_append,
+        show (appendUInt16 ByteArray.empty g.toUInt16).size = 2 from rfl,
+        show (appendUInt16 ByteArray.empty (UInt16.ofNat k.size)).size = 2
+          from rfl]; omega),
+    hcheck]
+
+
+/-- **Parse inverts encode for HelloRetryRequest**: the echoed session id,
+cipher suite and selected group come back, together with the two extensions
+the encoder wrote, in order. -/
+theorem encodeHelloRetryRequest_parse {legacySessionIdEcho : ByteArray}
+    {group : NamedGroup} {cipherSuite : UInt16} {msg : Message}
+    (h : encodeHelloRetryRequest legacySessionIdEcho group cipherSuite = .ok msg) :
+    parseHelloRetryRequest msg = .ok
+      { legacySessionIdEcho := legacySessionIdEcho, cipherSuite := cipherSuite,
+        selectedGroup := group,
+        extensions :=
+          #[{ extensionType := supportedVersionsExtension,
+              data := appendUInt16 ByteArray.empty tls13Version },
+            { extensionType := keyShareExtension,
+              data := appendUInt16 ByteArray.empty group.toUInt16 }],
+        encoded := msg.encoded } := by
+  unfold encodeHelloRetryRequest at h
+  obtain ⟨hc, h⟩ | ⟨hc, h⟩ := ite_ok_cases h
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+  obtain ⟨_, _, h⟩ := bind_ok_ex h
+  obtain ⟨SV, hSV, h⟩ := bind_ok_ex h
+  obtain ⟨KS, hKS, h⟩ := bind_ok_ex h
+  obtain ⟨SIDV, hSIDV, h⟩ := bind_ok_ex h
+  obtain ⟨EXTV, hEXTV, h⟩ := bind_ok_ex h
+  obtain ⟨hSVsz, hSVeq⟩ := encodeExtension_eq hSV
+  obtain ⟨hKSsz, hKSeq⟩ := encodeExtension_eq hKS
+  obtain ⟨hSIDsz, hSIDeq⟩ := encodeVector8_ok hSIDV
+  obtain ⟨hEXTsz, hEXTeq⟩ := encodeVector16_ok hEXTV
+  obtain ⟨hlt, hmsg⟩ := frame_spec h
+  have hty : msg.msgType = serverHelloType := by rw [hmsg]
+  have hexts : extensionsBytes
+      [{ extensionType := supportedVersionsExtension,
+         data := appendUInt16 ByteArray.empty tls13Version },
+       { extensionType := keyShareExtension,
+         data := appendUInt16 ByteArray.empty group.toUInt16 }] = SV ++ KS := by
+    show extensionBytes _ ++ (extensionBytes _ ++ extensionsBytes []) = _
+    rw [← hSVeq, ← hKSeq,
+      show extensionsBytes ([] : List Extension) = ByteArray.empty from rfl,
+      ByteArray.append_empty]
+  have hbody : msg.body =
+      appendUInt16 ByteArray.empty legacyTls12Version ++ helloRetryRequestRandom ++
+          (ByteArray.empty.push (UInt8.ofNat legacySessionIdEcho.size) ++
+            legacySessionIdEcho) ++
+          appendUInt16 ByteArray.empty cipherSuite ++ ByteArray.empty.push 0 ++
+        (appendUInt16 ByteArray.empty (UInt16.ofNat (SV ++ KS).size) ++
+          (SV ++ KS)) := by
+    rw [hmsg]
+    show _ ++ _ ++ SIDV ++ _ ++ _ ++ EXTV = _
+    rw [hSIDeq, hEXTeq]
+  have s2 : (appendUInt16 ByteArray.empty legacyTls12Version).size = 2 := rfl
+  have sR : helloRetryRequestRandom.size = 32 := rfl
+  have s1 : (ByteArray.empty.push (UInt8.ofNat legacySessionIdEcho.size)).size = 1 :=
+    rfl
+  have sc : (appendUInt16 ByteArray.empty cipherSuite).size = 2 := rfl
+  have sz : (ByteArray.empty.push (0 : UInt8)).size = 1 := rfl
+  have se : ∀ n : Nat, (appendUInt16 ByteArray.empty (UInt16.ofNat n)).size = 2 :=
+    fun _ => rfl
+  have r1 : Reader.readUInt16 (Reader.mk msg.body 0) =
+      .ok (legacyTls12Version, Reader.mk msg.body (0 + 2)) :=
+    readUInt16_at' (W := msg.body) (off := 0) (P := ByteArray.empty)
+      (by rw [hbody]; simp only [ByteArray.append_assoc, ByteArray.empty_append]; rfl)
+      rfl
+  have r2 : Reader.take (Reader.mk msg.body (0 + 2)) 32 =
+      .ok (helloRetryRequestRandom, Reader.mk msg.body (0 + 2 + 32)) :=
+    take_at' (W := msg.body) (off := 0 + 2) (n := 32)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version)
+      (X := helloRetryRequestRandom)
+      (by rw [hbody]; simp only [ByteArray.append_assoc]; rfl) rfl sR
+  have r3 : Reader.readVector8 (Reader.mk msg.body (0 + 2 + 32)) =
+      .ok (legacySessionIdEcho,
+        Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionIdEcho.size)) :=
+    readVector8_at' (W := msg.body) (off := 0 + 2 + 32)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version ++
+        helloRetryRequestRandom)
+      (X := legacySessionIdEcho)
+      (by rw [hbody]; simp only [ByteArray.append_assoc]; rfl)
+      (by rw [ByteArray.size_append, s2, sR]) hSIDsz
+  have r4 : Reader.readUInt16
+      (Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionIdEcho.size)) =
+      .ok (cipherSuite,
+        Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionIdEcho.size + 2)) :=
+    readUInt16_at' (W := msg.body)
+      (off := 0 + 2 + 32 + 1 + legacySessionIdEcho.size)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version ++
+        helloRetryRequestRandom ++
+        (ByteArray.empty.push (UInt8.ofNat legacySessionIdEcho.size) ++
+          legacySessionIdEcho))
+      (by rw [hbody]; simp only [ByteArray.append_assoc]; rfl)
+      (by rw [ByteArray.size_append, ByteArray.size_append,
+        ByteArray.size_append, s2, sR, s1]; omega)
+  have r5 : Reader.readUInt8
+      (Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionIdEcho.size + 2)) =
+      .ok (0,
+        Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionIdEcho.size + 2 + 1)) :=
+    readUInt8_at' (W := msg.body)
+      (off := 0 + 2 + 32 + 1 + legacySessionIdEcho.size + 2)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version ++
+        helloRetryRequestRandom ++
+        (ByteArray.empty.push (UInt8.ofNat legacySessionIdEcho.size) ++
+          legacySessionIdEcho) ++ appendUInt16 ByteArray.empty cipherSuite)
+      (by rw [hbody]; simp only [ByteArray.append_assoc]; rfl)
+      (by rw [ByteArray.size_append, ByteArray.size_append,
+        ByteArray.size_append, ByteArray.size_append, s2, sR, s1, sc]; omega)
+  have r6 : Reader.readVector16
+      (Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionIdEcho.size + 2 + 1)) =
+      .ok (SV ++ KS, Reader.mk msg.body
+        (0 + 2 + 32 + 1 + legacySessionIdEcho.size + 2 + 1 + 2 +
+          (SV ++ KS).size)) :=
+    readVector16_at' (W := msg.body)
+      (off := 0 + 2 + 32 + 1 + legacySessionIdEcho.size + 2 + 1)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version ++
+        helloRetryRequestRandom ++
+        (ByteArray.empty.push (UInt8.ofNat legacySessionIdEcho.size) ++
+          legacySessionIdEcho) ++ appendUInt16 ByteArray.empty cipherSuite ++
+        ByteArray.empty.push 0)
+      (X := SV ++ KS) (S := ByteArray.empty)
+      (by rw [hbody]; simp only [ByteArray.append_assoc, ByteArray.append_empty])
+      (by rw [ByteArray.size_append, ByteArray.size_append,
+        ByteArray.size_append, ByteArray.size_append, ByteArray.size_append,
+        s2, sR, s1, sc, sz]; omega) hEXTsz
+  have hend : 0 + 2 + 32 + 1 + legacySessionIdEcho.size + 2 + 1 + 2 +
+      (SV ++ KS).size = msg.body.size := by
+    rw [hbody]
+    simp only [ByteArray.size_append, s2, sR, s1, sc, sz, se]
+    omega
+  have hesz : ∀ e ∈ [Extension.mk supportedVersionsExtension
+        (appendUInt16 ByteArray.empty tls13Version),
+      Extension.mk keyShareExtension (appendUInt16 ByteArray.empty group.toUInt16)],
+      e.data.size < 2 ^ 16 := by
+    intro e he
+    cases he with
+    | head => exact (show (2 : Nat) < 2 ^ 16 by decide)
+    | tail _ he => cases he with
+      | head => exact (show (2 : Nat) < 2 ^ 16 by decide)
+      | tail _ he => cases he
+  have hedist : List.Pairwise
+      (fun a b => (a.extensionType == b.extensionType) = false)
+      [Extension.mk supportedVersionsExtension
+          (appendUInt16 ByteArray.empty tls13Version),
+        Extension.mk keyShareExtension
+          (appendUInt16 ByteArray.empty group.toUInt16)] := by
+    refine List.Pairwise.cons ?_ (List.pairwise_singleton ..)
+    intro b hb
+    cases hb with
+    | head => rfl
+    | tail _ hb => cases hb
+  unfold parseHelloRetryRequest
+  rw [hty, if_pos (show (serverHelloType == serverHelloType) = true from rfl)]
+  simp only [r1]
+  rw [if_pos (beq_self_eq_true legacyTls12Version)]
+  simp only [r2]
+  rw [if_pos (beq_self helloRetryRequestRandom)]
+  simp only [r3]
+  rw [if_neg hc]
+  simp only [r4, r5]
+  rw [if_pos (show ((0 : UInt8) == 0) = true from rfl)]
+  simp only [r6, requireEnd_eval (context := "HelloRetryRequest") hend]
+  rw [← hexts]
+  simp only [parseExtensions_extensionsBytes _ hesz hedist,
+    show requireExtension
+      [Extension.mk supportedVersionsExtension
+          (appendUInt16 ByteArray.empty tls13Version),
+        Extension.mk keyShareExtension
+          (appendUInt16 ByteArray.empty group.toUInt16)].toArray
+      supportedVersionsExtension "supported_versions" =
+      .ok (Extension.mk supportedVersionsExtension
+        (appendUInt16 ByteArray.empty tls13Version)) from rfl]
+  rw [if_pos (beq_self (appendUInt16 ByteArray.empty tls13Version))]
+  simp only [show requireExtension
+      [Extension.mk supportedVersionsExtension
+          (appendUInt16 ByteArray.empty tls13Version),
+        Extension.mk keyShareExtension
+          (appendUInt16 ByteArray.empty group.toUInt16)].toArray
+      keyShareExtension "key_share" =
+      .ok (Extension.mk keyShareExtension
+        (appendUInt16 ByteArray.empty group.toUInt16)) from rfl,
+    parseHrrKeyShare_eq]
+
+
+/-- **Parse inverts encode for ServerHello**: the random, echoed session id,
+cipher suite, selected group and key share all come back, together with the two
+extensions the encoder wrote, in order. The random must not be the
+HelloRetryRequest sentinel (`encodeHelloRetryRequest_parseServerHello` covers
+that case) and the key share must have the size the parser requires for the
+selected group. -/
+theorem encodeServerHello_parse {random legacySessionIdEcho : ByteArray}
+    {group : NamedGroup} {keyExchange : ByteArray} {cipherSuite : UInt16}
+    {msg : Message}
+    (h : encodeServerHello random legacySessionIdEcho group keyExchange
+      cipherSuite = .ok msg)
+    (hrand : (random == helloRetryRequestRandom) = false)
+    (hkey : checkKeyShareSize group keyExchange = .ok ()) :
+    parseServerHello msg = .ok
+      { random := random, legacySessionIdEcho := legacySessionIdEcho,
+        cipherSuite := cipherSuite, selectedGroup := group,
+        keyExchange := keyExchange,
+        extensions :=
+          #[{ extensionType := supportedVersionsExtension,
+              data := appendUInt16 ByteArray.empty tls13Version },
+            { extensionType := keyShareExtension,
+              data := appendUInt16 ByteArray.empty group.toUInt16 ++
+                (appendUInt16 ByteArray.empty (UInt16.ofNat keyExchange.size) ++
+                  keyExchange) }],
+        encoded := msg.encoded } := by
+  unfold encodeServerHello at h
+  obtain ⟨hc32, h⟩ | ⟨hc32, h⟩ := ite_ok_cases h
+  case inr => obtain ⟨_, hu, _⟩ := bind_ok_ex h
+              cases hu
+  obtain ⟨hc, h⟩ | ⟨hc, h⟩ := ite_ok_cases h
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+  obtain ⟨_, _, h⟩ := bind_ok_ex h
+  obtain ⟨SV, hSV, h⟩ := bind_ok_ex h
+  obtain ⟨KX, hKX, h⟩ := bind_ok_ex h
+  obtain ⟨hKXsz, rfl⟩ := encodeVector16_ok hKX
+  obtain ⟨KS, hKS, h⟩ := bind_ok_ex h
+  obtain ⟨SIDV, hSIDV, h⟩ := bind_ok_ex h
+  obtain ⟨EXTV, hEXTV, h⟩ := bind_ok_ex h
+  obtain ⟨hSVsz, hSVeq⟩ := encodeExtension_eq hSV
+  obtain ⟨hKSsz, hKSeq⟩ := encodeExtension_eq hKS
+  obtain ⟨hSIDsz, hSIDeq⟩ := encodeVector8_ok hSIDV
+  obtain ⟨hEXTsz, hEXTeq⟩ := encodeVector16_ok hEXTV
+  obtain ⟨hlt, hmsg⟩ := frame_spec h
+  have hR : random.size = 32 := by simpa using hc32
+  have hty : msg.msgType = serverHelloType := by rw [hmsg]
+  have hexts : extensionsBytes
+      [{ extensionType := supportedVersionsExtension,
+         data := appendUInt16 ByteArray.empty tls13Version },
+       { extensionType := keyShareExtension,
+         data := appendUInt16 ByteArray.empty group.toUInt16 ++
+           (appendUInt16 ByteArray.empty (UInt16.ofNat keyExchange.size) ++
+             keyExchange) }] = SV ++ KS := by
+    show extensionBytes _ ++ (extensionBytes _ ++ extensionsBytes []) = _
+    rw [← hSVeq, ← hKSeq,
+      show extensionsBytes ([] : List Extension) = ByteArray.empty from rfl,
+      ByteArray.append_empty]
+  have hbody : msg.body =
+      appendUInt16 ByteArray.empty legacyTls12Version ++ random ++
+          (ByteArray.empty.push (UInt8.ofNat legacySessionIdEcho.size) ++
+            legacySessionIdEcho) ++
+          appendUInt16 ByteArray.empty cipherSuite ++ ByteArray.empty.push 0 ++
+        (appendUInt16 ByteArray.empty (UInt16.ofNat (SV ++ KS).size) ++
+          (SV ++ KS)) := by
+    rw [hmsg]
+    show _ ++ _ ++ SIDV ++ _ ++ _ ++ EXTV = _
+    rw [hSIDeq, hEXTeq]
+  have s2 : (appendUInt16 ByteArray.empty legacyTls12Version).size = 2 := rfl
+  have s1 : (ByteArray.empty.push (UInt8.ofNat legacySessionIdEcho.size)).size = 1 :=
+    rfl
+  have sc : (appendUInt16 ByteArray.empty cipherSuite).size = 2 := rfl
+  have sz : (ByteArray.empty.push (0 : UInt8)).size = 1 := rfl
+  have se : ∀ n : Nat, (appendUInt16 ByteArray.empty (UInt16.ofNat n)).size = 2 :=
+    fun _ => rfl
+  have r1 : Reader.readUInt16 (Reader.mk msg.body 0) =
+      .ok (legacyTls12Version, Reader.mk msg.body (0 + 2)) :=
+    readUInt16_at' (W := msg.body) (off := 0) (P := ByteArray.empty)
+      (by rw [hbody]; simp only [ByteArray.append_assoc, ByteArray.empty_append]; rfl)
+      rfl
+  have r2 : Reader.take (Reader.mk msg.body (0 + 2)) 32 =
+      .ok (random, Reader.mk msg.body (0 + 2 + 32)) :=
+    take_at' (W := msg.body) (off := 0 + 2) (n := 32)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version) (X := random)
+      (by rw [hbody]; simp only [ByteArray.append_assoc]; rfl) rfl hR
+  have r3 : Reader.readVector8 (Reader.mk msg.body (0 + 2 + 32)) =
+      .ok (legacySessionIdEcho,
+        Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionIdEcho.size)) :=
+    readVector8_at' (W := msg.body) (off := 0 + 2 + 32)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version ++ random)
+      (X := legacySessionIdEcho)
+      (by rw [hbody]; simp only [ByteArray.append_assoc]; rfl)
+      (by rw [ByteArray.size_append, s2, hR]) hSIDsz
+  have r4 : Reader.readUInt16
+      (Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionIdEcho.size)) =
+      .ok (cipherSuite,
+        Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionIdEcho.size + 2)) :=
+    readUInt16_at' (W := msg.body)
+      (off := 0 + 2 + 32 + 1 + legacySessionIdEcho.size)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version ++ random ++
+        (ByteArray.empty.push (UInt8.ofNat legacySessionIdEcho.size) ++
+          legacySessionIdEcho))
+      (by rw [hbody]; simp only [ByteArray.append_assoc]; rfl)
+      (by rw [ByteArray.size_append, ByteArray.size_append,
+        ByteArray.size_append, s2, hR, s1]; omega)
+  have r5 : Reader.readUInt8
+      (Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionIdEcho.size + 2)) =
+      .ok (0,
+        Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionIdEcho.size + 2 + 1)) :=
+    readUInt8_at' (W := msg.body)
+      (off := 0 + 2 + 32 + 1 + legacySessionIdEcho.size + 2)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version ++ random ++
+        (ByteArray.empty.push (UInt8.ofNat legacySessionIdEcho.size) ++
+          legacySessionIdEcho) ++ appendUInt16 ByteArray.empty cipherSuite)
+      (by rw [hbody]; simp only [ByteArray.append_assoc]; rfl)
+      (by rw [ByteArray.size_append, ByteArray.size_append,
+        ByteArray.size_append, ByteArray.size_append, s2, hR, s1, sc]; omega)
+  have r6 : Reader.readVector16
+      (Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionIdEcho.size + 2 + 1)) =
+      .ok (SV ++ KS, Reader.mk msg.body
+        (0 + 2 + 32 + 1 + legacySessionIdEcho.size + 2 + 1 + 2 +
+          (SV ++ KS).size)) :=
+    readVector16_at' (W := msg.body)
+      (off := 0 + 2 + 32 + 1 + legacySessionIdEcho.size + 2 + 1)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version ++ random ++
+        (ByteArray.empty.push (UInt8.ofNat legacySessionIdEcho.size) ++
+          legacySessionIdEcho) ++ appendUInt16 ByteArray.empty cipherSuite ++
+        ByteArray.empty.push 0)
+      (X := SV ++ KS) (S := ByteArray.empty)
+      (by rw [hbody]; simp only [ByteArray.append_assoc, ByteArray.append_empty])
+      (by rw [ByteArray.size_append, ByteArray.size_append,
+        ByteArray.size_append, ByteArray.size_append, ByteArray.size_append,
+        s2, hR, s1, sc, sz]; omega) hEXTsz
+  have hend : 0 + 2 + 32 + 1 + legacySessionIdEcho.size + 2 + 1 + 2 +
+      (SV ++ KS).size = msg.body.size := by
+    rw [hbody]
+    simp only [ByteArray.size_append, s2, hR, s1, sc, sz, se]
+    omega
+  have hesz : ∀ e ∈ [Extension.mk supportedVersionsExtension
+        (appendUInt16 ByteArray.empty tls13Version),
+      Extension.mk keyShareExtension (appendUInt16 ByteArray.empty group.toUInt16 ++
+        (appendUInt16 ByteArray.empty (UInt16.ofNat keyExchange.size) ++
+          keyExchange))],
+      e.data.size < 2 ^ 16 := by
+    intro e he
+    cases he with
+    | head => exact (show (2 : Nat) < 2 ^ 16 by decide)
+    | tail _ he => cases he with
+      | head => exact hKSsz
+      | tail _ he => cases he
+  have hedist : List.Pairwise
+      (fun a b => (a.extensionType == b.extensionType) = false)
+      [Extension.mk supportedVersionsExtension
+          (appendUInt16 ByteArray.empty tls13Version),
+        Extension.mk keyShareExtension
+          (appendUInt16 ByteArray.empty group.toUInt16 ++
+            (appendUInt16 ByteArray.empty (UInt16.ofNat keyExchange.size) ++
+              keyExchange))] := by
+    refine List.Pairwise.cons ?_ (List.pairwise_singleton ..)
+    intro b hb
+    cases hb with
+    | head => rfl
+    | tail _ hb => cases hb
+  unfold parseServerHello
+  rw [hty, if_pos (show (serverHelloType == serverHelloType) = true from rfl)]
+  simp only [r1]
+  rw [if_pos (beq_self_eq_true legacyTls12Version)]
+  simp only [r2]
+  rw [if_neg (by rw [hrand]; exact Bool.false_ne_true)]
+  simp only [r3]
+  rw [if_neg hc]
+  simp only [r4, r5]
+  rw [if_pos (show ((0 : UInt8) == 0) = true from rfl)]
+  simp only [r6, requireEnd_eval (context := "ServerHello") hend]
+  rw [← hexts]
+  simp only [parseExtensions_extensionsBytes _ hesz hedist,
+    show requireExtension
+      [Extension.mk supportedVersionsExtension
+          (appendUInt16 ByteArray.empty tls13Version),
+        Extension.mk keyShareExtension
+          (appendUInt16 ByteArray.empty group.toUInt16 ++
+            (appendUInt16 ByteArray.empty (UInt16.ofNat keyExchange.size) ++
+              keyExchange))].toArray
+      supportedVersionsExtension "supported_versions" =
+      .ok (Extension.mk supportedVersionsExtension
+        (appendUInt16 ByteArray.empty tls13Version)) from rfl]
+  rw [if_pos (beq_self (appendUInt16 ByteArray.empty tls13Version))]
+  simp only [show requireExtension
+      [Extension.mk supportedVersionsExtension
+          (appendUInt16 ByteArray.empty tls13Version),
+        Extension.mk keyShareExtension
+          (appendUInt16 ByteArray.empty group.toUInt16 ++
+            (appendUInt16 ByteArray.empty (UInt16.ofNat keyExchange.size) ++
+              keyExchange))].toArray
+      keyShareExtension "key_share" =
+      .ok (Extension.mk keyShareExtension
+        (appendUInt16 ByteArray.empty group.toUInt16 ++
+          (appendUInt16 ByteArray.empty (UInt16.ofNat keyExchange.size) ++
+            keyExchange))) from rfl,
+    parseServerKeyShare_eq hKXsz hkey]
+
 /-! ### End-to-end: encode, take off the wire with residual, parse
 
 Each law below composes the framing roundtrip with the body inversion: the
@@ -3450,6 +3895,46 @@ theorem encodeCertificate_decodeOne_parse {leaf : ByteArray}
               ({ der := der, extensions := #[] } : CertificateEntry)).toArray,
           leafDer := leaf, encoded := msg.encoded } :=
   ⟨encodeCertificate_decodeOne h trailing, encodeCertificate_parse h⟩
+
+/-- ServerHello: wire roundtrip with residual, then parse inversion. -/
+theorem encodeServerHello_decodeOne_parse {random legacySessionIdEcho : ByteArray}
+    {group : NamedGroup} {keyExchange : ByteArray} {cipherSuite : UInt16}
+    {msg : Message}
+    (h : encodeServerHello random legacySessionIdEcho group keyExchange
+      cipherSuite = .ok msg)
+    (hrand : (random == helloRetryRequestRandom) = false)
+    (hkey : checkKeyShareSize group keyExchange = .ok ()) (rest : ByteArray) :
+    decodeOne (msg.encoded ++ rest) = .ok (msg, rest) ∧
+      parseServerHello msg = .ok
+        { random := random, legacySessionIdEcho := legacySessionIdEcho,
+          cipherSuite := cipherSuite, selectedGroup := group,
+          keyExchange := keyExchange,
+          extensions :=
+            #[{ extensionType := supportedVersionsExtension,
+                data := appendUInt16 ByteArray.empty tls13Version },
+              { extensionType := keyShareExtension,
+                data := appendUInt16 ByteArray.empty group.toUInt16 ++
+                  (appendUInt16 ByteArray.empty (UInt16.ofNat keyExchange.size) ++
+                    keyExchange) }],
+          encoded := msg.encoded } :=
+  ⟨encodeServerHello_decodeOne h rest, encodeServerHello_parse h hrand hkey⟩
+
+/-- HelloRetryRequest: wire roundtrip with residual, then parse inversion. -/
+theorem encodeHelloRetryRequest_decodeOne_parse {legacySessionIdEcho : ByteArray}
+    {group : NamedGroup} {cipherSuite : UInt16} {msg : Message}
+    (h : encodeHelloRetryRequest legacySessionIdEcho group cipherSuite = .ok msg)
+    (rest : ByteArray) :
+    decodeOne (msg.encoded ++ rest) = .ok (msg, rest) ∧
+      parseHelloRetryRequest msg = .ok
+        { legacySessionIdEcho := legacySessionIdEcho, cipherSuite := cipherSuite,
+          selectedGroup := group,
+          extensions :=
+            #[{ extensionType := supportedVersionsExtension,
+                data := appendUInt16 ByteArray.empty tls13Version },
+              { extensionType := keyShareExtension,
+                data := appendUInt16 ByteArray.empty group.toUInt16 }],
+          encoded := msg.encoded } :=
+  ⟨encodeHelloRetryRequest_decodeOne h rest, encodeHelloRetryRequest_parse h⟩
 
 /-- NewSessionTicket: wire roundtrip with residual, then parse inversion. -/
 theorem encodeNewSessionTicket_decodeOne_parse {ticketLifetime ticketAgeAdd : UInt32}
