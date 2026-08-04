@@ -2955,6 +2955,29 @@ private theorem extract_self_empty (W : ByteArray) (k : Nat) :
   · intro i hi hi'
     exact absurd hi' (by simp)
 
+/-- Splitting a slice at an interior point. -/
+private theorem extract_split {W : ByteArray} {i j k : Nat} (hij : i ≤ j)
+    (hjk : j ≤ k) : W.extract i k = W.extract i j ++ W.extract j k := by
+  rw [ByteArray.extract_append_extract, Nat.min_eq_left hij,
+    Nat.max_eq_right hjk]
+
+/-- Appending to a buffer does not change a slice that ends inside it. -/
+private theorem extract_append_prefix {a x : ByteArray} {k : Nat}
+    (hk : k ≤ a.size) : (a ++ x).extract 0 k = a.extract 0 k := by
+  rw [ByteArray.extract_append, Nat.zero_sub, Nat.sub_eq_zero_of_le hk,
+    extract_self_empty, ByteArray.append_empty]
+
+/-- Appending to a buffer only extends the tail of a slice that starts inside
+it. -/
+private theorem extract_append_suffix {a x : ByteArray} {k : Nat}
+    (hk : k ≤ a.size) :
+    (a ++ x).extract k (a ++ x).size = a.extract k a.size ++ x := by
+  rw [extract_split (W := a ++ x) (i := k) (j := a.size) hk
+    (by rw [ByteArray.size_append]; omega),
+    ByteArray.extract_append_eq_right rfl (by rw [ByteArray.size_append]),
+    ByteArray.extract_append, Nat.sub_eq_zero_of_le hk, Nat.sub_self,
+    extract_self_empty, ByteArray.append_empty]
+
 /-- The wire image of an extension read out of a buffer, followed by the image
 of what comes after it, is the whole remaining buffer. -/
 private theorem extract_cons_image {W : ByteArray} {off : Nat}
@@ -3911,6 +3934,33 @@ theorem takeMessage?_frame_split {msgType : UInt8} {body : ByteArray}
   ⟨fun hc => takeMessage?_prefix_none h hsplit hc, by
     rw [← ByteArray.append_assoc, hsplit]
     exact takeMessage?_frame h rest⟩
+
+/-- **Monotone on any buffer**: bytes that arrive after a message was already
+complete cannot change what is delivered. Whatever buffer `takeMessage?`
+succeeded on, appending more bytes returns the same message with those bytes
+appended to the residual — no framing hypothesis needed, so this covers
+buffers a state machine assembled from arbitrary record boundaries. -/
+theorem takeMessage?_append {buffered rest x : ByteArray} {msg : Message}
+    (h : takeMessage? buffered = .ok (some (msg, rest))) :
+    takeMessage? (buffered ++ x) = .ok (some (msg, rest ++ x)) := by
+  unfold takeMessage? at h ⊢
+  split at h
+  · cases h
+  · rename_i h4
+    split at h
+    · cases h
+    · rename_i hcomplete
+      have hc' : 4 + uint24AtOne buffered ≤ buffered.size := by omega
+      have hL : uint24AtOne (buffered ++ x) = uint24AtOne buffered :=
+        uint24AtOne_congr (fun i hi => get!_append_left (by omega))
+      split at h
+      · cases h
+      · rename_i message hdec
+        simp only [Except.ok.injEq, Option.some.injEq, Prod.mk.injEq] at h
+        obtain ⟨rfl, rfl⟩ := h
+        rw [if_neg (by rw [ByteArray.size_append]; omega), hL,
+          if_neg (by rw [ByteArray.size_append]; omega),
+          extract_append_prefix hc', hdec, extract_append_suffix hc']
 
 /-- **Conservation**: what `takeMessage?` delivers, followed by what it leaves
 behind, is exactly the buffer it was given — the handshake-layer mirror of
@@ -4996,12 +5046,6 @@ private theorem eq_push_of_size_one {X : ByteArray} (hsz : X.size = 1) :
     have hi0 : i = 0 := by omega
     subst hi0
     rw [getElem_push_empty, get!_eq_getElem (by omega)]
-
-/-- Splitting a slice at an interior point. -/
-private theorem extract_split {W : ByteArray} {i j k : Nat} (hij : i ≤ j)
-    (hjk : j ≤ k) : W.extract i k = W.extract i j ++ W.extract j k := by
-  rw [ByteArray.extract_append_extract, Nat.min_eq_left hij,
-    Nat.max_eq_right hjk]
 
 /-- A successful `take` returns exactly the slice at the cursor. -/
 private theorem take_extract {W : ByteArray} {off n : Nat} {X : ByteArray}
