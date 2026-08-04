@@ -1577,6 +1577,10 @@ theorem EpochOf.intro {H : Spec.Hkdf} {e : Spec.Epoch} {k : TrafficKeys}
 
 theorem EpochOf.idle {H : Spec.Hkdf} : EpochOf H none none := trivial
 
+/-- The traffic secret of the epoch a state is in. -/
+theorem EpochOf.secret_eq {H : Spec.Hkdf} {e : Spec.Epoch} {k : TrafficKeys}
+    (h : EpochOf H (some e) (some k)) : k.secret = e.secret H := h
+
 /-- A state that carries traffic keys is in a definite epoch. -/
 theorem EpochOf.some_inv {H : Spec.Hkdf} {o : Option Spec.Epoch} {k : TrafficKeys}
     (h : EpochOf H o (some k)) : ∃ e, o = some e ∧ k.secret = e.secret H := by
