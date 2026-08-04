@@ -35,7 +35,10 @@ Four Bazel packages:
 - **`Tls/`** — the sans-I/O protocol core: ChaCha20-Poly1305 record layer
   with KeyUpdate, handshake codecs for both roles (including
   HelloRetryRequest, ALPN, SNI), and the client (`Tls.Client`) and server
-  (`Tls.Server`) state machines.
+  (`Tls.Server`) state machines. `Tls.Record.Laws` proves kernel-checked
+  theorems about the record framer as implemented: byte conservation,
+  fragmentation independence, encode/decode roundtrips, and
+  sequence-number/nonce lemmas.
 - **`Test/`** — nine hermetic test binaries plus a manual loopback server
   harness for external-client interop runs.
 
@@ -198,4 +201,7 @@ build because it compiles and links the HACL\* C shim.
    scripted OpenSSL/Go interop gates
 8. AES-GCM suites; client-side HelloRetryRequest
 9. PSK, resumption, 0-RTT; client certificates
-10. Protocol-level proofs (key schedule, parsers, state-machine invariants)
+10. Protocol-level proofs — record-layer laws are done (`Tls.Record.Laws`:
+    framing conservation, fragmentation independence, roundtrips,
+    nonce/sequence lemmas); key schedule, handshake parsers, and
+    state-machine invariants remain
