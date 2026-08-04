@@ -744,16 +744,21 @@ private def concatByteArrays (parts : Array ByteArray) : ByteArray := Id.run do
     offset := offset + part.size
   return out
 
-private partial def sealChunks (keys : Record.TrafficKeys) (plaintext : ByteArray)
+private def sealChunks (keys : Record.TrafficKeys) (plaintext : ByteArray)
     (offset : Nat) (records : Array ByteArray) :
-    Except Error (Record.TrafficKeys × Array ByteArray) := do
-  if offset >= plaintext.size then
-    pure (keys, records)
+    Except Error (Record.TrafficKeys × Array ByteArray) :=
+  if plaintext.size ≤ offset then
+    .ok (keys, records)
   else
     let stop := min plaintext.size (offset + Record.maxPlaintextLength)
     let chunk := plaintext.extract offset stop
-    let (keys, wire) ← liftRecord (Record.«seal» keys .applicationData chunk)
-    sealChunks keys plaintext stop (records.push wire)
+    match liftRecord (Record.«seal» keys .applicationData chunk) with
+    | .error e => .error e
+    | .ok (keys, wire) => sealChunks keys plaintext stop (records.push wire)
+  termination_by plaintext.size - offset
+  decreasing_by
+    have : 0 < Record.maxPlaintextLength := by decide
+    omega
 
 /-- Protect application bytes, splitting them at TLS's 2^14-byte limit. -/
 def sealApplication (state : State) (plaintext : ByteArray) : Except Error Output := do

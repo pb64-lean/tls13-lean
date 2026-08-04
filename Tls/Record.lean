@@ -52,22 +52,22 @@ legacy version on TLSPlaintext records; authenticated TLSCiphertext is still
 checked by `open` because its header is AEAD additional data. -/
 def legacyClientHelloRecordVersion : UInt16 := 0x0301
 
-def headerLength : Nat := 5
+@[expose] def headerLength : Nat := 5
 
 /-- RFC 8446 §5.1: maximum `TLSPlaintext.fragment` length. -/
-def maxPlaintextLength : Nat := 1 <<< 14
+@[expose] def maxPlaintextLength : Nat := 1 <<< 14
 
 /-- RFC 8446 §5.2: maximum `TLSCiphertext.encrypted_record` length. -/
-def maxCiphertextLength : Nat := (1 <<< 14) + 256
+@[expose] def maxCiphertextLength : Nat := (1 <<< 14) + 256
 
-def aeadKeyLength : Nat := 32
+@[expose] def aeadKeyLength : Nat := 32
 
-def aeadIvLength : Nat := 12
+@[expose] def aeadIvLength : Nat := 12
 
-def aeadTagLength : Nat := 16
+@[expose] def aeadTagLength : Nat := 16
 
 /-- The largest encoded `TLSInnerPlaintext` accepted by this implementation. -/
-def maxInnerPlaintextLength : Nat := maxCiphertextLength - aeadTagLength
+@[expose] def maxInnerPlaintextLength : Nat := maxCiphertextLength - aeadTagLength
 
 inductive Error where
   | unsupportedContentType (value : UInt8)
@@ -140,13 +140,17 @@ structure TrafficKeys where
   seq : UInt64 := 0
   deriving BEq, Inhabited
 
-private def putUInt16 (out : ByteArray) (value : UInt16) : ByteArray :=
+/-- Append a big-endian 16-bit value. -/
+def putUInt16 (out : ByteArray) (value : UInt16) : ByteArray :=
   (out.push (value >>> 8).toUInt8).push value.toUInt8
 
-private def getUInt16 (bytes : ByteArray) (offset : Nat) : UInt16 :=
+/-- Read a big-endian 16-bit value at `offset`; the caller checks bounds. -/
+def getUInt16 (bytes : ByteArray) (offset : Nat) : UInt16 :=
   (bytes.get! offset).toUInt16 <<< 8 ||| (bytes.get! (offset + 1)).toUInt16
 
-private def encodeHeader (contentType : ContentType) (version : UInt16)
+/-- Encode the five-byte record header. `fragmentLength` is truncated to
+16 bits; encoders validate it beforehand. -/
+def encodeHeader (contentType : ContentType) (version : UInt16)
     (fragmentLength : Nat) : ByteArray :=
   let out := ByteArray.empty.push contentType.toUInt8
   let out := putUInt16 out version
@@ -154,6 +158,16 @@ private def encodeHeader (contentType : ContentType) (version : UInt16)
 
 def RawRecord.header (record : RawRecord) : ByteArray :=
   encodeHeader record.contentType record.legacyVersion record.fragment.size
+
+/-- Exact wire bytes of a raw record: the five-byte header followed by the
+fragment. `Tls.Record.Laws` proves that decoding is a left inverse of this
+encoding. -/
+def RawRecord.encode (record : RawRecord) : ByteArray :=
+  record.header ++ record.fragment
+
+/-- Concatenated wire encoding of framed records, in order. -/
+def encodeRawRecords (records : Array RawRecord) : ByteArray :=
+  records.foldl (fun out record => out ++ record.encode) ByteArray.empty
 
 /-- Encode an unprotected TLSPlaintext record. This is used for the initial
 ClientHello and compatibility ChangeCipherSpec records; callers enforce the
@@ -170,33 +184,79 @@ structure Decoder where
   buffered : ByteArray := ByteArray.empty
   deriving BEq, Inhabited
 
-private partial def decodeBuffered (buffered : ByteArray) (records : Array RawRecord) :
-    Except Error (ByteArray × Array RawRecord) := do
-  if buffered.size < headerLength then
-    pure (buffered, records)
-  else
-    let typeByte := buffered.get! 0
-    let some contentType := ContentType.ofUInt8? typeByte
-      | throw (.unsupportedContentType typeByte)
-    let version := getUInt16 buffered 1
-    -- RFC 8446 §5.1 deprecates TLSPlaintext.legacy_record_version and requires
-    -- receivers to ignore it. Preserve it in RawRecord for exact AEAD header
-    -- handling; `open` enforces 0x0303 on TLSCiphertext.
-    let fragmentLength := (getUInt16 buffered 3).toNat
-    if contentType == .applicationData then
-      if fragmentLength > maxCiphertextLength then
-        throw (.ciphertextTooLong fragmentLength)
-      if fragmentLength < aeadTagLength + 1 then
-        throw (.ciphertextTooShort fragmentLength)
-    else if fragmentLength > maxPlaintextLength then
-      throw (.plaintextTooLong fragmentLength)
-    let endPos := headerLength + fragmentLength
-    if buffered.size < endPos then
-      pure (buffered, records)
+/-- Validate a header's claimed fragment length as soon as the header is
+available, without waiting for the fragment itself. The extended TLSCiphertext
+limit applies only to outer `application_data` records. -/
+def checkFragmentLength (contentType : ContentType) (fragmentLength : Nat) :
+    Except Error Unit :=
+  if contentType == .applicationData then
+    if fragmentLength > maxCiphertextLength then
+      .error (.ciphertextTooLong fragmentLength)
+    else if fragmentLength < aeadTagLength + 1 then
+      .error (.ciphertextTooShort fragmentLength)
     else
-      let fragment := buffered.extract headerLength endPos
-      let rest := buffered.extract endPos buffered.size
-      decodeBuffered rest (records.push { contentType, legacyVersion := version, fragment })
+      .ok ()
+  else if fragmentLength > maxPlaintextLength then
+    .error (.plaintextTooLong fragmentLength)
+  else
+    .ok ()
+
+/-- Frame one record out of `buffered`. `some` carries the record and the
+unconsumed remainder; `none` means the buffer holds no complete record yet. -/
+def decodeStep (buffered : ByteArray) :
+    Except Error (Option (RawRecord × ByteArray)) :=
+  if buffered.size < headerLength then
+    .ok none
+  else
+    match ContentType.ofUInt8? (buffered.get! 0) with
+    | none => .error (.unsupportedContentType (buffered.get! 0))
+    | some contentType =>
+      match checkFragmentLength contentType (getUInt16 buffered 3).toNat with
+      | .error e => .error e
+      | .ok () =>
+        if buffered.size < headerLength + (getUInt16 buffered 3).toNat then
+          .ok none
+        else
+          -- RFC 8446 §5.1 deprecates TLSPlaintext.legacy_record_version and
+          -- requires receivers to ignore it. Preserve it in RawRecord for
+          -- exact AEAD header handling; `open` enforces 0x0303 on
+          -- TLSCiphertext.
+          .ok (some (
+            { contentType
+              legacyVersion := getUInt16 buffered 1
+              fragment :=
+                buffered.extract headerLength
+                  (headerLength + (getUInt16 buffered 3).toNat) },
+            buffered.extract (headerLength + (getUInt16 buffered 3).toNat)
+              buffered.size))
+
+/-- A successful `decodeStep` strictly shrinks the buffer: it consumes the
+five-byte header plus the fragment. -/
+theorem decodeStep_size_lt {buffered rest : ByteArray} {record : RawRecord}
+    (h : decodeStep buffered = .ok (some (record, rest))) :
+    rest.size < buffered.size := by
+  unfold decodeStep at h
+  split at h
+  · simp at h
+  · split at h
+    · simp at h
+    · split at h
+      · simp at h
+      · split at h
+        · simp at h
+        · simp only [Except.ok.injEq, Option.some.injEq, Prod.mk.injEq] at h
+          rw [← h.2, ByteArray.size_extract]
+          simp only [headerLength] at *
+          omega
+
+def decodeBuffered (buffered : ByteArray) (records : Array RawRecord) :
+    Except Error (ByteArray × Array RawRecord) :=
+  match h : decodeStep buffered with
+  | .error e => .error e
+  | .ok none => .ok (buffered, records)
+  | .ok (some (record, rest)) => decodeBuffered rest (records.push record)
+  termination_by buffered.size
+  decreasing_by exact decodeStep_size_lt h
 
 /-- Feed an arbitrary transport chunk and return every complete record in wire
 order. Header errors and oversized lengths are reported as soon as the header
@@ -243,7 +303,9 @@ record sequence number. -/
 def TrafficKeys.update (keys : TrafficKeys) : Except Error TrafficKeys := do
   deriveTrafficKeys (← updateTrafficSecret keys.secret)
 
-private def sequenceBytes (seq : UInt64) : ByteArray :=
+/-- The record sequence number left-zero-padded to the IV width, big endian
+(RFC 8446 §5.3). -/
+def sequenceBytes (seq : UInt64) : ByteArray :=
   ByteArray.mk #[
     0, 0, 0, 0,
     (seq >>> 56).toUInt8,
@@ -256,19 +318,22 @@ private def sequenceBytes (seq : UInt64) : ByteArray :=
     seq.toUInt8
   ]
 
+/-- Pointwise XOR of the first `count` bytes of `a` and `b`; the callers
+check bounds. -/
+def xorBytes (count : Nat) (a b : ByteArray) : ByteArray :=
+  match count with
+  | 0 => ByteArray.empty
+  | n + 1 => (xorBytes n a b).push (a.get! n ^^^ b.get! n)
+
 /-- Per-record nonce: the static IV XOR the left-zero-padded, big-endian
 64-bit record sequence number (RFC 8446 §5.3). -/
 def TrafficKeys.nonce (keys : TrafficKeys) : Except Error ByteArray := do
   unless keys.iv.size == aeadIvLength do
     throw (.invalidIvLength keys.iv.size)
-  let encoded := sequenceBytes keys.seq
-  pure <| Id.run do
-    let mut nonce := ByteArray.empty
-    for i in [0:aeadIvLength] do
-      nonce := nonce.push (keys.iv.get! i ^^^ encoded.get! i)
-    return nonce
+  pure (xorBytes aeadIvLength keys.iv (sequenceBytes keys.seq))
 
-private def advance (keys : TrafficKeys) : Except Error TrafficKeys := do
+/-- Advance the sequence number, rejecting wraparound. -/
+def advance (keys : TrafficKeys) : Except Error TrafficKeys := do
   if keys.seq == (0xffffffffffffffff : UInt64) then
     throw .sequenceExhausted
   pure { keys with seq := keys.seq + 1 }
