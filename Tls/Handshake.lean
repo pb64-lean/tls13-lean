@@ -128,9 +128,9 @@ def remaining (r : Reader) : Nat :=
 def atEnd (r : Reader) : Bool :=
   r.offset == r.bytes.size
 
--- `take`, `readUInt8`, and `readUInt24` are written as pure `if`/`match`
--- chains (not `do`) so `Tls.Handshake.decode_encoded` below can reason about
--- them by case analysis.
+-- The cursor primitives are written as pure `if`/`match` chains (not `do`) so
+-- the retention and wire-codec laws at the end of this file can reason about
+-- them by case analysis and evaluate them by rewriting.
 def take (r : Reader) (n : Nat) : Except String (ByteArray × Reader) :=
   if r.offset + n > r.bytes.size then
     .error s!"truncated input at offset {r.offset}: need {n} bytes, have {r.remaining}"
@@ -142,10 +142,11 @@ def readUInt8 (r : Reader) : Except String (UInt8 × Reader) :=
   | .error e => .error e
   | .ok (bytes, r) => .ok (bytes.get! 0, r)
 
-def readUInt16 (r : Reader) : Except String (UInt16 × Reader) := do
-  let (bytes, r) ← r.take 2
-  let n := (bytes.get! 0).toUInt16 <<< 8 ||| (bytes.get! 1).toUInt16
-  pure (n, r)
+def readUInt16 (r : Reader) : Except String (UInt16 × Reader) :=
+  match r.take 2 with
+  | .error e => .error e
+  | .ok (bytes, r) =>
+      .ok ((bytes.get! 0).toUInt16 <<< 8 ||| (bytes.get! 1).toUInt16, r)
 
 def readUInt24 (r : Reader) : Except String (Nat × Reader) :=
   match r.take 3 with
@@ -154,24 +155,28 @@ def readUInt24 (r : Reader) : Except String (Nat × Reader) :=
       .ok ((bytes.get! 0).toNat <<< 16 |||
         (bytes.get! 1).toNat <<< 8 ||| (bytes.get! 2).toNat, r)
 
-def readUInt32 (r : Reader) : Except String (UInt32 × Reader) := do
-  let (bytes, r) ← r.take 4
-  let n := (bytes.get! 0).toUInt32 <<< 24 |||
-    (bytes.get! 1).toUInt32 <<< 16 |||
-    (bytes.get! 2).toUInt32 <<< 8 ||| (bytes.get! 3).toUInt32
-  pure (n, r)
+def readUInt32 (r : Reader) : Except String (UInt32 × Reader) :=
+  match r.take 4 with
+  | .error e => .error e
+  | .ok (bytes, r) =>
+      .ok ((bytes.get! 0).toUInt32 <<< 24 |||
+        (bytes.get! 1).toUInt32 <<< 16 |||
+        (bytes.get! 2).toUInt32 <<< 8 ||| (bytes.get! 3).toUInt32, r)
 
-def readVector8 (r : Reader) : Except String (ByteArray × Reader) := do
-  let (len, r) ← r.readUInt8
-  r.take len.toNat
+def readVector8 (r : Reader) : Except String (ByteArray × Reader) :=
+  match r.readUInt8 with
+  | .error e => .error e
+  | .ok (len, r) => r.take len.toNat
 
-def readVector16 (r : Reader) : Except String (ByteArray × Reader) := do
-  let (len, r) ← r.readUInt16
-  r.take len.toNat
+def readVector16 (r : Reader) : Except String (ByteArray × Reader) :=
+  match r.readUInt16 with
+  | .error e => .error e
+  | .ok (len, r) => r.take len.toNat
 
-def readVector24 (r : Reader) : Except String (ByteArray × Reader) := do
-  let (len, r) ← r.readUInt24
-  r.take len
+def readVector24 (r : Reader) : Except String (ByteArray × Reader) :=
+  match r.readUInt24 with
+  | .error e => .error e
+  | .ok (len, r) => r.take len
 
 def requireEnd (r : Reader) (context : String) : Except String Unit := do
   unless r.atEnd do
@@ -240,6 +245,31 @@ private theorem readUInt8_ok {r r' : Reader} {v : UInt8}
     rw [← h.2]
     exact take_ok htake
 
+private theorem readUInt16_ok {r r' : Reader} {v : UInt16}
+    (h : r.readUInt16 = .ok (v, r')) :
+    r'.bytes = r.bytes ∧ r'.offset = r.offset + 2 ∧ r'.offset ≤ r.bytes.size := by
+  unfold Reader.readUInt16 at h
+  split at h
+  · cases h
+  · rename_i b r'' htake
+    simp only [Except.ok.injEq, Prod.mk.injEq] at h
+    rw [← h.2]
+    exact take_ok htake
+
+/-- A vector read consumes its two length bytes plus the payload, never
+running past the end of the buffer. -/
+private theorem readVector16_ok {r r' : Reader} {b : ByteArray}
+    (h : r.readVector16 = .ok (b, r')) :
+    r'.bytes = r.bytes ∧ r.offset + 2 ≤ r'.offset ∧ r'.offset ≤ r.bytes.size := by
+  unfold Reader.readVector16 at h
+  split at h
+  · cases h
+  · rename_i len r₁ h16
+    obtain ⟨hb1, ho1, hle1⟩ := readUInt16_ok h16
+    obtain ⟨hb2, ho2, hle2⟩ := take_ok h
+    rw [hb1] at hle2
+    exact ⟨hb2.trans hb1, by omega, hle2⟩
+
 private theorem readUInt24_ok {r r' : Reader} {n : Nat}
     (h : r.readUInt24 = .ok (n, r')) :
     r'.bytes = r.bytes ∧ r'.offset = r.offset + 3 ∧ r'.offset ≤ r.bytes.size := by
@@ -250,6 +280,18 @@ private theorem readUInt24_ok {r r' : Reader} {n : Nat}
     simp only [Except.ok.injEq, Prod.mk.injEq] at h
     rw [← h.2]
     exact take_ok htake
+
+private theorem readVector24_ok {r r' : Reader} {b : ByteArray}
+    (h : r.readVector24 = .ok (b, r')) :
+    r'.bytes = r.bytes ∧ r.offset + 3 ≤ r'.offset ∧ r'.offset ≤ r.bytes.size := by
+  unfold Reader.readVector24 at h
+  split at h
+  · cases h
+  · rename_i len r₁ h24
+    obtain ⟨hb1, ho1, hle1⟩ := readUInt24_ok h24
+    obtain ⟨hb2, ho2, hle2⟩ := take_ok h
+    rw [hb1] at hle2
+    exact ⟨hb2.trans hb1, by omega, hle2⟩
 
 private theorem decodeOne_ok {bytes rest : ByteArray} {msg : Message}
     (h : decodeOne bytes = .ok (msg, rest)) :
@@ -308,17 +350,38 @@ private def encodeExtension (extensionType : UInt16) (data : ByteArray) :
     Except String ByteArray := do
   pure (appendUInt16 ByteArray.empty extensionType ++ (← encodeVector16 data))
 
-private def parseExtensions (bytes : ByteArray) : Except String (Array Extension) := do
-  let mut r : Reader := { bytes }
-  let mut out : Array Extension := #[]
-  while !r.atEnd do
-    let (extensionType, r') ← r.readUInt16
-    let (data, r') ← r'.readVector16
-    if out.any (fun ext => ext.extensionType == extensionType) then
-      throw s!"duplicate TLS extension {extensionType}"
-    out := out.push { extensionType, data }
-    r := r'
-  pure out
+/-- One step of extension-list parsing: read `type ‖ uint16 length ‖ data`
+until the cursor is exhausted, rejecting duplicate extension types.
+
+Written as explicit well-founded recursion over the unconsumed bytes rather
+than a `while` loop (whose `Loop.forIn` is a `partial def`, hence opaque to
+the kernel) so the extension laws at the end of this file can evaluate it. -/
+private def parseExtensionsLoop (r : Reader) (out : Array Extension) :
+    Except String (Array Extension) :=
+  if r.atEnd then
+    .ok out
+  else
+    match h16 : r.readUInt16 with
+    | .error e => .error e
+    | .ok (extensionType, r₁) =>
+      match hv : r₁.readVector16 with
+      | .error e => .error e
+      | .ok (data, r₂) =>
+        if out.any (fun ext => ext.extensionType == extensionType) then
+          .error s!"duplicate TLS extension {extensionType}"
+        else
+          have hlt : r₂.bytes.size - r₂.offset < r.bytes.size - r.offset := by
+            obtain ⟨hb1, ho1, hle1⟩ := readUInt16_ok h16
+            obtain ⟨hb2, ho2, hle2⟩ := readVector16_ok hv
+            rw [hb2, hb1]
+            rw [hb1] at hle2
+            omega
+          parseExtensionsLoop r₂ (out.push { extensionType, data })
+  termination_by r.bytes.size - r.offset
+  decreasing_by exact hlt
+
+private def parseExtensions (bytes : ByteArray) : Except String (Array Extension) :=
+  parseExtensionsLoop { bytes } #[]
 
 private def findExtension? (extensions : Array Extension) (extensionType : UInt16) :
     Option Extension :=
@@ -471,55 +534,100 @@ structure ServerHello where
   encoded : ByteArray
   deriving Inhabited, BEq
 
-def parseServerHello (msg : Message) : Except String ServerHello := do
-  unless msg.msgType == serverHelloType do
-    throw s!"expected ServerHello ({serverHelloType}), got handshake type {msg.msgType}"
-  let r : Reader := { bytes := msg.body }
-  let (legacyVersion, r) ← r.readUInt16
-  unless legacyVersion == legacyTls12Version do
-    throw s!"ServerHello legacy_version must be 0x0303, got {legacyVersion}"
-  let (random, r) ← r.take 32
-  if random == helloRetryRequestRandom then
-    throw "expected ServerHello, got HelloRetryRequest"
-  let (sessionId, r) ← r.readVector8
-  if sessionId.size > 32 then
-    throw s!"ServerHello legacy session id exceeds 32 bytes ({sessionId.size})"
-  let (cipherSuite, r) ← r.readUInt16
-  let (compression, r) ← r.readUInt8
-  unless compression == 0 do
-    throw s!"ServerHello selected non-null legacy compression {compression}"
-  let (extensionBytes, r) ← r.readVector16
-  r.requireEnd "ServerHello"
-  let extensions ← parseExtensions extensionBytes
+/-- The per-group key-share size check shared by the ServerHello parser and
+its laws. -/
+private def checkKeyShareSize : NamedGroup → ByteArray → Except String Unit
+  | .x25519, keyExchange =>
+      if keyExchange.size == 32 then
+        .ok ()
+      else
+        .error s!"server x25519 public key must be 32 bytes, got {keyExchange.size}"
+  | .secp256r1, keyExchange =>
+      if keyExchange.size == 65 && keyExchange.get! 0 == 4 then
+        .ok ()
+      else
+        .error "server P-256 key share must be a 65-byte SEC1 uncompressed point"
 
-  let versionExt ← requireExtension extensions supportedVersionsExtension "supported_versions"
-  unless versionExt.data == appendUInt16 ByteArray.empty tls13Version do
-    throw "server did not select TLS 1.3"
+/-- The ServerHello key_share extension body: one `group ‖ uint16 key` entry.
+Split out of `parseServerHello` so its law can be stated on its own. -/
+private def parseServerKeyShare (data : ByteArray) :
+    Except String (NamedGroup × ByteArray) :=
+  match ({ bytes := data } : Reader).readUInt16 with
+  | .error e => .error e
+  | .ok (groupId, kr) =>
+    match NamedGroup.ofUInt16? groupId with
+    | none => .error s!"server selected unsupported key-share group {groupId}"
+    | some selectedGroup =>
+      match kr.readVector16 with
+      | .error e => .error e
+      | .ok (keyExchange, kr) =>
+        match kr.requireEnd "ServerHello key_share" with
+        | .error e => .error e
+        | .ok () =>
+          match checkKeyShareSize selectedGroup keyExchange with
+          | .error e => .error e
+          | .ok () => .ok (selectedGroup, keyExchange)
 
-  let keyExt ← requireExtension extensions keyShareExtension "key_share"
-  let kr : Reader := { bytes := keyExt.data }
-  let (groupId, kr) ← kr.readUInt16
-  let some selectedGroup := NamedGroup.ofUInt16? groupId
-    | throw s!"server selected unsupported key-share group {groupId}"
-  let (keyExchange, kr) ← kr.readVector16
-  kr.requireEnd "ServerHello key_share"
-  match selectedGroup with
-  | .x25519 =>
-    unless keyExchange.size == 32 do
-      throw s!"server x25519 public key must be 32 bytes, got {keyExchange.size}"
-  | .secp256r1 =>
-    unless keyExchange.size == 65 && keyExchange.get! 0 == 4 do
-      throw "server P-256 key share must be a 65-byte SEC1 uncompressed point"
-
-  pure {
-    random
-    legacySessionIdEcho := sessionId
-    cipherSuite
-    selectedGroup
-    keyExchange
-    extensions
-    encoded := msg.encoded
-  }
+/-- Parse a ServerHello. (Written as a pure `if`/`match` chain so the
+ServerHello laws below can evaluate it.) -/
+def parseServerHello (msg : Message) : Except String ServerHello :=
+  if msg.msgType == serverHelloType then
+    match ({ bytes := msg.body } : Reader).readUInt16 with
+    | .error e => .error e
+    | .ok (legacyVersion, r) =>
+      if legacyVersion == legacyTls12Version then
+        match r.take 32 with
+        | .error e => .error e
+        | .ok (random, r) =>
+          if random == helloRetryRequestRandom then
+            .error "expected ServerHello, got HelloRetryRequest"
+          else
+            match r.readVector8 with
+            | .error e => .error e
+            | .ok (sessionId, r) =>
+              if sessionId.size > 32 then
+                .error s!"ServerHello legacy session id exceeds 32 bytes ({sessionId.size})"
+              else
+                match r.readUInt16 with
+                | .error e => .error e
+                | .ok (cipherSuite, r) =>
+                  match r.readUInt8 with
+                  | .error e => .error e
+                  | .ok (compression, r) =>
+                    if compression == 0 then
+                      match r.readVector16 with
+                      | .error e => .error e
+                      | .ok (extensionBytes, r) =>
+                        match r.requireEnd "ServerHello" with
+                        | .error e => .error e
+                        | .ok () =>
+                          match parseExtensions extensionBytes with
+                          | .error e => .error e
+                          | .ok extensions =>
+                            match requireExtension extensions
+                                supportedVersionsExtension "supported_versions" with
+                            | .error e => .error e
+                            | .ok versionExt =>
+                              if versionExt.data ==
+                                  appendUInt16 ByteArray.empty tls13Version then
+                                match requireExtension extensions keyShareExtension
+                                    "key_share" with
+                                | .error e => .error e
+                                | .ok keyExt =>
+                                  match parseServerKeyShare keyExt.data with
+                                  | .error e => .error e
+                                  | .ok (selectedGroup, keyExchange) =>
+                                    .ok { random, legacySessionIdEcho := sessionId,
+                                          cipherSuite, selectedGroup, keyExchange,
+                                          extensions, encoded := msg.encoded }
+                              else
+                                .error "server did not select TLS 1.3"
+                    else
+                      .error s!"ServerHello selected non-null legacy compression {compression}"
+      else
+        .error s!"ServerHello legacy_version must be 0x0303, got {legacyVersion}"
+  else
+    .error s!"expected ServerHello ({serverHelloType}), got handshake type {msg.msgType}"
 
 /-- The parsed wire fields of a HelloRetryRequest. An HRR uses the
 ServerHello handshake type and is distinguished by its fixed random. -/
@@ -531,59 +639,100 @@ structure HelloRetryRequest where
   encoded : ByteArray
   deriving Inhabited, BEq
 
-def parseHelloRetryRequest (msg : Message) : Except String HelloRetryRequest := do
-  unless msg.msgType == serverHelloType do
-    throw s!"expected HelloRetryRequest ({serverHelloType}), got handshake type {msg.msgType}"
-  let r : Reader := { bytes := msg.body }
-  let (legacyVersion, r) ← r.readUInt16
-  unless legacyVersion == legacyTls12Version do
-    throw s!"HelloRetryRequest legacy_version must be 0x0303, got {legacyVersion}"
-  let (random, r) ← r.take 32
-  unless random == helloRetryRequestRandom do
-    throw "ServerHello random is not the HelloRetryRequest sentinel"
-  let (sessionId, r) ← r.readVector8
-  if sessionId.size > 32 then
-    throw s!"HelloRetryRequest legacy session id exceeds 32 bytes ({sessionId.size})"
-  let (cipherSuite, r) ← r.readUInt16
-  let (compression, r) ← r.readUInt8
-  unless compression == 0 do
-    throw s!"HelloRetryRequest selected non-null legacy compression {compression}"
-  let (extensionBytes, r) ← r.readVector16
-  r.requireEnd "HelloRetryRequest"
-  let extensions ← parseExtensions extensionBytes
+/-- The HelloRetryRequest key_share extension body: a bare selected group.
+Split out of `parseHelloRetryRequest` so its law can be stated on its own. -/
+private def parseHrrKeyShare (data : ByteArray) : Except String NamedGroup :=
+  match ({ bytes := data } : Reader).readUInt16 with
+  | .error e => .error e
+  | .ok (groupId, kr) =>
+    match kr.requireEnd "HelloRetryRequest key_share" with
+    | .error e => .error e
+    | .ok () =>
+      match NamedGroup.ofUInt16? groupId with
+      | none => .error s!"HelloRetryRequest selected unsupported group {groupId}"
+      | some selectedGroup => .ok selectedGroup
 
-  let versionExt ←
-    requireExtension extensions supportedVersionsExtension "supported_versions"
-  unless versionExt.data == appendUInt16 ByteArray.empty tls13Version do
-    throw "HelloRetryRequest did not select TLS 1.3"
-
-  let keyExt ← requireExtension extensions keyShareExtension "key_share"
-  let kr : Reader := { bytes := keyExt.data }
-  let (groupId, kr) ← kr.readUInt16
-  kr.requireEnd "HelloRetryRequest key_share"
-  let some selectedGroup := NamedGroup.ofUInt16? groupId
-    | throw s!"HelloRetryRequest selected unsupported group {groupId}"
-
-  pure {
-    legacySessionIdEcho := sessionId
-    cipherSuite
-    selectedGroup
-    extensions
-    encoded := msg.encoded
-  }
+/-- Parse a HelloRetryRequest. (Written as a pure `if`/`match` chain so the
+HelloRetryRequest laws below can evaluate it.) -/
+def parseHelloRetryRequest (msg : Message) : Except String HelloRetryRequest :=
+  if msg.msgType == serverHelloType then
+    match ({ bytes := msg.body } : Reader).readUInt16 with
+    | .error e => .error e
+    | .ok (legacyVersion, r) =>
+      if legacyVersion == legacyTls12Version then
+        match r.take 32 with
+        | .error e => .error e
+        | .ok (random, r) =>
+          if random == helloRetryRequestRandom then
+            match r.readVector8 with
+            | .error e => .error e
+            | .ok (sessionId, r) =>
+              if sessionId.size > 32 then
+                .error s!"HelloRetryRequest legacy session id exceeds 32 bytes ({sessionId.size})"
+              else
+                match r.readUInt16 with
+                | .error e => .error e
+                | .ok (cipherSuite, r) =>
+                  match r.readUInt8 with
+                  | .error e => .error e
+                  | .ok (compression, r) =>
+                    if compression == 0 then
+                      match r.readVector16 with
+                      | .error e => .error e
+                      | .ok (extensionBytes, r) =>
+                        match r.requireEnd "HelloRetryRequest" with
+                        | .error e => .error e
+                        | .ok () =>
+                          match parseExtensions extensionBytes with
+                          | .error e => .error e
+                          | .ok extensions =>
+                            match requireExtension extensions
+                                supportedVersionsExtension "supported_versions" with
+                            | .error e => .error e
+                            | .ok versionExt =>
+                              if versionExt.data ==
+                                  appendUInt16 ByteArray.empty tls13Version then
+                                match requireExtension extensions keyShareExtension
+                                    "key_share" with
+                                | .error e => .error e
+                                | .ok keyExt =>
+                                  match parseHrrKeyShare keyExt.data with
+                                  | .error e => .error e
+                                  | .ok selectedGroup =>
+                                    .ok { legacySessionIdEcho := sessionId, cipherSuite,
+                                          selectedGroup, extensions,
+                                          encoded := msg.encoded }
+                              else
+                                .error "HelloRetryRequest did not select TLS 1.3"
+                    else
+                      .error s!"HelloRetryRequest selected non-null legacy compression {compression}"
+          else
+            .error "ServerHello random is not the HelloRetryRequest sentinel"
+      else
+        .error s!"HelloRetryRequest legacy_version must be 0x0303, got {legacyVersion}"
+  else
+    .error s!"expected HelloRetryRequest ({serverHelloType}), got handshake type {msg.msgType}"
 
 structure EncryptedExtensions where
   extensions : Array Extension
   encoded : ByteArray
   deriving Inhabited, BEq
 
-def parseEncryptedExtensions (msg : Message) : Except String EncryptedExtensions := do
-  unless msg.msgType == encryptedExtensionsType do
-    throw s!"expected EncryptedExtensions ({encryptedExtensionsType}), got {msg.msgType}"
-  let r : Reader := { bytes := msg.body }
-  let (extensionBytes, r) ← r.readVector16
-  r.requireEnd "EncryptedExtensions"
-  pure { extensions := ← parseExtensions extensionBytes, encoded := msg.encoded }
+/-- Parse EncryptedExtensions. (Written as a pure `if`/`match` chain so
+`encodeEncryptedExtensions_parse` below can evaluate it.) -/
+def parseEncryptedExtensions (msg : Message) : Except String EncryptedExtensions :=
+  if msg.msgType == encryptedExtensionsType then
+    match ({ bytes := msg.body } : Reader).readVector16 with
+    | .error e => .error e
+    | .ok (extensionBytes, r) =>
+      match r.requireEnd "EncryptedExtensions" with
+      | .error e => .error e
+      | .ok () =>
+        match parseExtensions extensionBytes with
+        | .error e => .error e
+        | .ok extensions => .ok { extensions, encoded := msg.encoded }
+  else
+    .error s!"expected EncryptedExtensions ({encryptedExtensionsType}), got {msg.msgType}"
 
 /-- The single ALPN protocol a server selected (from EncryptedExtensions), if any. -/
 def selectedAlpnProtocol (ee : EncryptedExtensions) : Except String (Option String) := do
@@ -614,34 +763,63 @@ structure Certificate where
   encoded : ByteArray
   deriving Inhabited, BEq
 
-def parseCertificate (msg : Message) : Except String Certificate := do
-  unless msg.msgType == certificateType do
-    throw s!"expected Certificate ({certificateType}), got {msg.msgType}"
-  let r : Reader := { bytes := msg.body }
-  let (requestContext, r) ← r.readVector8
-  unless requestContext.isEmpty do
-    throw "server Certificate request_context must be empty"
-  let (certificateList, r) ← r.readVector24
-  r.requireEnd "Certificate"
+/-- One step of certificate_list parsing: `uint24 cert ‖ uint16 extensions`
+entries until the list is exhausted. Explicit well-founded recursion over the
+unconsumed bytes (not a `while` loop) so the Certificate laws below can
+evaluate it. -/
+private def parseCertificateEntries (r : Reader) (entries : Array CertificateEntry) :
+    Except String (Array CertificateEntry) :=
+  if r.atEnd then
+    .ok entries
+  else
+    match h24 : r.readVector24 with
+    | .error e => .error e
+    | .ok (der, r₁) =>
+      if der.isEmpty then
+        .error "Certificate contains an empty certificate entry"
+      else
+        match hv : r₁.readVector16 with
+        | .error e => .error e
+        | .ok (extensionBytes, r₂) =>
+          match parseExtensions extensionBytes with
+          | .error e => .error e
+          | .ok extensions =>
+            have hlt : r₂.bytes.size - r₂.offset < r.bytes.size - r.offset := by
+              obtain ⟨hb1, ho1, hle1⟩ := readVector24_ok h24
+              obtain ⟨hb2, ho2, hle2⟩ := readVector16_ok hv
+              rw [hb2, hb1]
+              rw [hb1] at hle2
+              omega
+            parseCertificateEntries r₂ (entries.push { der, extensions })
+  termination_by r.bytes.size - r.offset
+  decreasing_by exact hlt
 
-  let mut lr : Reader := { bytes := certificateList }
-  let mut entries : Array CertificateEntry := #[]
-  while !lr.atEnd do
-    let (der, lr') ← lr.readVector24
-    if der.isEmpty then
-      throw "Certificate contains an empty certificate entry"
-    let (extensionBytes, lr') ← lr'.readVector16
-    let extensions ← parseExtensions extensionBytes
-    entries := entries.push { der, extensions }
-    lr := lr'
-  if entries.isEmpty then
-    throw "server sent an empty certificate_list"
-  pure {
-    requestContext
-    entries
-    leafDer := entries[0]!.der
-    encoded := msg.encoded
-  }
+/-- Parse a server Certificate. (Written as a pure `if`/`match` chain so
+`encodeCertificate_parse` below can evaluate it.) -/
+def parseCertificate (msg : Message) : Except String Certificate :=
+  if msg.msgType == certificateType then
+    match ({ bytes := msg.body } : Reader).readVector8 with
+    | .error e => .error e
+    | .ok (requestContext, r) =>
+      if requestContext.isEmpty then
+        match r.readVector24 with
+        | .error e => .error e
+        | .ok (certificateList, r) =>
+          match r.requireEnd "Certificate" with
+          | .error e => .error e
+          | .ok () =>
+            match parseCertificateEntries { bytes := certificateList } #[] with
+            | .error e => .error e
+            | .ok entries =>
+              if entries.isEmpty then
+                .error "server sent an empty certificate_list"
+              else
+                .ok { requestContext, entries, leafDer := entries[0]!.der,
+                      encoded := msg.encoded }
+      else
+        .error "server Certificate request_context must be empty"
+  else
+    .error s!"expected Certificate ({certificateType}), got {msg.msgType}"
 
 structure CertificateVerify where
   algorithm : UInt16
@@ -698,32 +876,58 @@ structure NewSessionTicket where
   encoded : ByteArray
   deriving Inhabited, BEq
 
-def parseNewSessionTicket (msg : Message) : Except String NewSessionTicket := do
-  unless msg.msgType == newSessionTicketType do
-    throw s!"expected NewSessionTicket ({newSessionTicketType}), got {msg.msgType}"
-  let r : Reader := { bytes := msg.body }
-  let (lifetime, r) ← r.readUInt32
-  if lifetime > 604800 then
-    throw s!"NewSessionTicket lifetime exceeds seven days ({lifetime})"
-  let (ageAdd, r) ← r.readUInt32
-  let (nonce, r) ← r.readVector8
-  let (ticket, r) ← r.readVector16
-  if ticket.isEmpty then
-    throw "NewSessionTicket ticket must not be empty"
-  let (extensionBytes, r) ← r.readVector16
-  r.requireEnd "NewSessionTicket"
-  let extensions ← parseExtensions extensionBytes
-  if let some earlyData := findExtension? extensions earlyDataExtension then
-    unless earlyData.data.size == 4 do
-      throw "NewSessionTicket early_data extension must contain uint32 max_early_data_size"
-  pure {
-    ticketLifetime := lifetime
-    ticketAgeAdd := ageAdd
-    ticketNonce := nonce
-    ticket
-    extensions
-    encoded := msg.encoded
-  }
+/-- The early_data check applied to a parsed NewSessionTicket extension list.
+Split out so `parseNewSessionTicket` stays a flat `if`/`match` chain. -/
+private def checkTicketEarlyData (extensions : Array Extension) :
+    Except String Unit :=
+  match findExtension? extensions earlyDataExtension with
+  | none => .ok ()
+  | some earlyData =>
+      if earlyData.data.size == 4 then
+        .ok ()
+      else
+        .error
+          "NewSessionTicket early_data extension must contain uint32 max_early_data_size"
+
+/-- Parse a NewSessionTicket. (Written as a pure `if`/`match` chain so
+`encodeNewSessionTicket_parse` below can evaluate it.) -/
+def parseNewSessionTicket (msg : Message) : Except String NewSessionTicket :=
+  if msg.msgType == newSessionTicketType then
+    match ({ bytes := msg.body } : Reader).readUInt32 with
+    | .error e => .error e
+    | .ok (lifetime, r) =>
+      if lifetime > 604800 then
+        .error s!"NewSessionTicket lifetime exceeds seven days ({lifetime})"
+      else
+        match r.readUInt32 with
+        | .error e => .error e
+        | .ok (ageAdd, r) =>
+          match r.readVector8 with
+          | .error e => .error e
+          | .ok (nonce, r) =>
+            match r.readVector16 with
+            | .error e => .error e
+            | .ok (ticket, r) =>
+              if ticket.isEmpty then
+                .error "NewSessionTicket ticket must not be empty"
+              else
+                match r.readVector16 with
+                | .error e => .error e
+                | .ok (extensionBytes, r) =>
+                  match r.requireEnd "NewSessionTicket" with
+                  | .error e => .error e
+                  | .ok () =>
+                    match parseExtensions extensionBytes with
+                    | .error e => .error e
+                    | .ok extensions =>
+                      match checkTicketEarlyData extensions with
+                      | .error e => .error e
+                      | .ok () =>
+                        .ok { ticketLifetime := lifetime, ticketAgeAdd := ageAdd,
+                              ticketNonce := nonce, ticket, extensions,
+                              encoded := msg.encoded }
+  else
+    .error s!"expected NewSessionTicket ({newSessionTicketType}), got {msg.msgType}"
 
 inductive KeyUpdateRequest where
   | updateNotRequested
