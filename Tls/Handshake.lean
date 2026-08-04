@@ -1118,6 +1118,15 @@ private def parseSupportedGroups (bytes : ByteArray) :
     else
       .ok (ids, knownGroupsLoop ids.toList #[])
 
+/-- Record a client key share when its group is one this implementation
+offers. Unknown (including GREASE) groups are skipped here, but their
+identifiers are still retained in the group-id list. -/
+@[expose] def pushKnownKeyShare (groupId : UInt16) (keyExchange : ByteArray)
+    (out : Array ClientKeyShare) : Array ClientKeyShare :=
+  match NamedGroup.ofUInt16? groupId with
+  | some group => out.push { group, keyExchange }
+  | none => out
+
 /-- One step of key_share entry parsing: read `group ‖ uint16 key_exchange`
 until the cursor is exhausted, rejecting empty keys and duplicate groups and
 ignoring groups this implementation does not offer.
@@ -1148,21 +1157,40 @@ private def parseKeyShareEntriesLoop (r : Reader) (seenGroupIds : Array UInt16)
             rw [hb2, hb1]
             rw [hb1] at hle2
             omega
-          match NamedGroup.ofUInt16? groupId with
-          | some group =>
-              parseKeyShareEntriesLoop r₂ (seenGroupIds.push groupId)
-                (out.push { group, keyExchange })
-          | none =>
-              -- ignore groups we do not implement
-              parseKeyShareEntriesLoop r₂ (seenGroupIds.push groupId) out
+          parseKeyShareEntriesLoop r₂ (seenGroupIds.push groupId)
+            (pushKnownKeyShare groupId keyExchange out)
   termination_by r.bytes.size - r.offset
-  decreasing_by
-    · exact hlt
-    · exact hlt
+  decreasing_by exact hlt
 
-private def parseKeyShareEntries (bytes : ByteArray) :
+/-- Parse a client key_share list: `group ‖ uint16 key_exchange` repeated until
+the block is exhausted. Every group identifier offered is retained, including
+ones this implementation does not know (and therefore GREASE values). -/
+def parseKeyShareEntries (bytes : ByteArray) :
     Except String (Array UInt16 × Array ClientKeyShare) :=
   parseKeyShareEntriesLoop { bytes } #[] #[]
+
+/-- The wire image of one client key_share entry:
+`group ‖ uint16 length ‖ key_exchange`. -/
+def keyShareEntryBytes (groupId : UInt16) (keyExchange : ByteArray) : ByteArray :=
+  appendUInt16 ByteArray.empty groupId ++
+    (appendUInt16 ByteArray.empty (UInt16.ofNat keyExchange.size) ++ keyExchange)
+
+/-- The wire image of a client key_share list: its entries' images
+concatenated in order. -/
+def keyShareEntriesBytes : List (UInt16 × ByteArray) → ByteArray
+  | [] => ByteArray.empty
+  | e :: rest => keyShareEntryBytes e.1 e.2 ++ keyShareEntriesBytes rest
+
+/-- The key shares of an offered list whose groups this implementation knows,
+in wire order. -/
+@[expose] def knownKeySharesLoop :
+    List (UInt16 × ByteArray) → Array ClientKeyShare → Array ClientKeyShare
+  | [], out => out
+  | e :: rest, out => knownKeySharesLoop rest (pushKnownKeyShare e.1 e.2 out)
+
+/-- The key shares of an offered list whose groups this implementation knows. -/
+@[expose] def knownKeyShares (l : List (UInt16 × ByteArray)) : Array ClientKeyShare :=
+  knownKeySharesLoop l #[]
 
 /-- Whether `subset` occurs as a subsequence of `superset`. Explicit structural
 recursion (not the nested `while` scan it replaces) so the ClientHello laws
@@ -3493,6 +3521,161 @@ theorem parseUInt16List_uint16ListBytes (l : List UInt16) :
     rfl]
   rw [parseUInt16ListLoop_uint16ListBytes l ByteArray.empty #[]]
   rfl
+
+/-! ### Client key shares
+
+The key_share block a client offers is a list of `group ‖ uint16 key_exchange`
+entries. Groups this implementation does not offer must not be dropped from the
+group-id list (a retry has to be able to see them), so the law below is stated
+for arbitrary group identifiers, GREASE values included. -/
+
+private theorem size_keyShareEntryBytes (g : UInt16) (k : ByteArray) :
+    (keyShareEntryBytes g k).size = 4 + k.size := by
+  unfold keyShareEntryBytes
+  rw [ByteArray.size_append, ByteArray.size_append,
+    show (appendUInt16 ByteArray.empty g).size = 2 from rfl,
+    show (appendUInt16 ByteArray.empty (UInt16.ofNat k.size)).size = 2 from rfl]
+  omega
+
+private theorem contains_push_false {a : Array UInt16} {g x : UInt16}
+    (h : a.contains x = false) (hne : (g == x) = false) :
+    (a.push g).contains x = false := by
+  have hx : ¬(x = g) := fun hxg => by
+    rw [hxg, beq_self_eq_true] at hne
+    exact Bool.true_eq_false.mp hne
+  simp only [Array.contains, Array.any_push] at *
+  simp [h, hx]
+
+/-- An exhausted cursor ends the key_share loop with what it has. -/
+private theorem parseKeyShareEntriesLoop_end {E : ByteArray} {off : Nat}
+    {seen : Array UInt16} {out : Array ClientKeyShare} (h : off = E.size) :
+    parseKeyShareEntriesLoop { bytes := E, offset := off } seen out =
+      .ok (seen, out) := by
+  unfold parseKeyShareEntriesLoop
+  rw [if_pos]
+  show (off == E.size) = true
+  rw [h]
+  exact beq_self_eq_true E.size
+
+/-- One correctly-encoded key_share entry at the cursor advances the loop by
+exactly its wire size, recording the group identifier and (when the group is
+known) the share itself. -/
+private theorem parseKeyShareEntriesLoop_cons {P S : ByteArray} {g : UInt16}
+    {k : ByteArray} {seen : Array UInt16} {out : Array ClientKeyShare}
+    (hsz : k.size < 2 ^ 16) (hne : k.isEmpty = false)
+    (hfresh : seen.contains g = false) :
+    parseKeyShareEntriesLoop
+        { bytes := P ++ (keyShareEntryBytes g k ++ S), offset := P.size } seen out =
+      parseKeyShareEntriesLoop
+        { bytes := P ++ (keyShareEntryBytes g k ++ S),
+          offset := (P ++ keyShareEntryBytes g k).size } (seen.push g)
+        (pushKnownKeyShare g k out) := by
+  have hr16 : Reader.readUInt16
+      { bytes := P ++ (keyShareEntryBytes g k ++ S), offset := P.size } =
+      .ok (g, { bytes := P ++ (keyShareEntryBytes g k ++ S),
+                offset := P.size + 2 }) :=
+    readUInt16_at' (W := P ++ (keyShareEntryBytes g k ++ S)) (off := P.size)
+      (v := g) (P := P)
+      (by unfold keyShareEntryBytes; simp only [ByteArray.append_assoc]; rfl) rfl
+  have hv16 : Reader.readVector16
+      { bytes := P ++ (keyShareEntryBytes g k ++ S), offset := P.size + 2 } =
+      .ok (k, { bytes := P ++ (keyShareEntryBytes g k ++ S),
+                offset := P.size + 2 + 2 + k.size }) :=
+    readVector16_at' (W := P ++ (keyShareEntryBytes g k ++ S))
+      (off := P.size + 2) (P := P ++ appendUInt16 ByteArray.empty g) (X := k)
+      (by unfold keyShareEntryBytes; simp only [ByteArray.append_assoc]; rfl)
+      (by rw [ByteArray.size_append,
+        show (appendUInt16 ByteArray.empty g).size = 2 from rfl]) hsz
+  have hnotEnd : ¬((Reader.mk (P ++ (keyShareEntryBytes g k ++ S))
+      P.size).atEnd = true) := by
+    show ¬(P.size == (P ++ (keyShareEntryBytes g k ++ S)).size) = true
+    rw [beq_iff_eq, ByteArray.size_append, ByteArray.size_append,
+      size_keyShareEntryBytes]
+    omega
+  rw [show (P ++ keyShareEntryBytes g k).size = P.size + 2 + 2 + k.size from by
+    rw [ByteArray.size_append, size_keyShareEntryBytes]; omega]
+  rw [parseKeyShareEntriesLoop.eq_def]
+  rw [if_neg hnotEnd]
+  -- The loop matches on its reads with equation binders (needed for the
+  -- termination argument), so peel them with `split` rather than `rw`.
+  split
+  · rename_i err heq
+    rw [hr16] at heq
+    cases heq
+  · rename_i t r₁ heq
+    rw [hr16] at heq
+    simp only [Except.ok.injEq, Prod.mk.injEq] at heq
+    obtain ⟨rfl, rfl⟩ := heq
+    split
+    · rename_i err heq
+      rw [hv16] at heq
+      cases heq
+    · rename_i d r₂ heq
+      rw [hv16] at heq
+      simp only [Except.ok.injEq, Prod.mk.injEq] at heq
+      obtain ⟨rfl, rfl⟩ := heq
+      rw [if_neg (by rw [hne]; exact Bool.false_ne_true),
+        if_neg (by rw [hfresh]; exact Bool.false_ne_true)]
+
+/-- The key_share loop consumes a whole encoded entry list, keeping every
+group identifier in order. -/
+private theorem parseKeyShareEntriesLoop_entriesBytes :
+    ∀ (l : List (UInt16 × ByteArray)) (P : ByteArray) (seen : Array UInt16)
+      (out : Array ClientKeyShare),
+    (∀ e ∈ l, e.2.size < 2 ^ 16) → (∀ e ∈ l, e.2.isEmpty = false) →
+    (∀ e ∈ l, seen.contains e.1 = false) →
+    l.Pairwise (fun a b => (a.1 == b.1) = false) →
+    parseKeyShareEntriesLoop
+        { bytes := P ++ keyShareEntriesBytes l, offset := P.size } seen out =
+      .ok ((seen.toList ++ l.map Prod.fst).toArray, knownKeySharesLoop l out) := by
+  intro l
+  induction l with
+  | nil =>
+    intro P seen out _ _ _ _
+    rw [show keyShareEntriesBytes ([] : List (UInt16 × ByteArray)) =
+        ByteArray.empty from rfl,
+      ByteArray.append_empty, parseKeyShareEntriesLoop_end rfl, List.map_nil,
+      List.append_nil, Array.toArray_toList]
+    rfl
+  | cons e rest ih =>
+    intro P seen out hsz hne hfresh hpw
+    rw [List.pairwise_cons] at hpw
+    rw [show keyShareEntriesBytes (e :: rest) =
+      keyShareEntryBytes e.1 e.2 ++ keyShareEntriesBytes rest from rfl]
+    rw [parseKeyShareEntriesLoop_cons (hsz e (List.mem_cons_self ..))
+      (hne e (List.mem_cons_self ..)) (hfresh e (List.mem_cons_self ..))]
+    rw [show P ++ (keyShareEntryBytes e.1 e.2 ++ keyShareEntriesBytes rest) =
+      (P ++ keyShareEntryBytes e.1 e.2) ++ keyShareEntriesBytes rest from
+        ByteArray.append_assoc.symm]
+    rw [ih (P ++ keyShareEntryBytes e.1 e.2) (seen.push e.1)
+      (pushKnownKeyShare e.1 e.2 out)
+      (fun e' he' => hsz e' (List.mem_cons_of_mem e he'))
+      (fun e' he' => hne e' (List.mem_cons_of_mem e he'))
+      (fun e' he' => contains_push_false
+        (hfresh e' (List.mem_cons_of_mem e he')) (hpw.1 e' he'))
+      hpw.2]
+    rw [Array.toList_push, List.append_assoc]
+    rfl
+
+/-- **Client key_share roundtrip (GREASE tolerance)**: parsing the wire image of
+any list of key_share entries returns every offered group identifier, in order
+and undropped — the identifiers are arbitrary, so unknown and GREASE groups
+survive — together with the shares whose groups this implementation knows. -/
+theorem parseKeyShareEntries_keyShareEntriesBytes (l : List (UInt16 × ByteArray))
+    (hsz : ∀ e ∈ l, e.2.size < 2 ^ 16) (hne : ∀ e ∈ l, e.2.isEmpty = false)
+    (hdistinct : l.Pairwise (fun a b => (a.1 == b.1) = false)) :
+    parseKeyShareEntries (keyShareEntriesBytes l) =
+      .ok ((l.map Prod.fst).toArray, knownKeyShares l) := by
+  unfold parseKeyShareEntries
+  rw [show ({ bytes := keyShareEntriesBytes l } : Reader) =
+    { bytes := ByteArray.empty ++ keyShareEntriesBytes l,
+      offset := ByteArray.empty.size } from by
+    rw [ByteArray.empty_append]
+    rfl]
+  rw [parseKeyShareEntriesLoop_entriesBytes l ByteArray.empty #[] #[] hsz hne
+    (fun _ _ => by simp) hdistinct]
+  rfl
+
 
 /-! ### ServerHello and HelloRetryRequest body inversion
 
