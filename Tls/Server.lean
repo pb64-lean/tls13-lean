@@ -171,20 +171,11 @@ structure State where
   -- HelloRetryRequest state. `transcript` is message_hash(CH1) || HRR while
   -- waiting for CH2, and is cleared once the final server flight is built.
   retryGroup? : Option Handshake.NamedGroup := none
-  retryClientRandom : ByteArray := ByteArray.empty
-  retryLegacySessionId : ByteArray := ByteArray.empty
-  retryCipherSuites : Array UInt16 := #[]
-  retrySupportedVersionIds : Array UInt16 := #[]
-  retrySupportedGroupIds : Array UInt16 := #[]
-  retrySignatureAlgorithms : Array UInt16 := #[]
-  retryServerName : Option String := none
-  retryAlpnProtocols : Array String := #[]
-  retryStableExtensions : Array Handshake.Extension := #[]
-  /-- PSK identities paired with their binder hash width. Ages and binder
-  bytes may change in CH2; only identities incompatible with the selected
-  SHA-256 suite may be removed, while order is preserved. This server never
-  selects PSK. -/
-  retryPsks : Option (Array (ByteArray × Nat)) := none
+  /-- The first ClientHello, exactly as parsed. The second one is compared
+  against it field by field (`checkRetryClientHello`); by
+  `Handshake.parseClientHello_canonical` those fields *are* the message bytes,
+  which is what `checkRetryClientHello_body_eq` makes precise. -/
+  retryHello? : Option Handshake.ClientHello := none
   compatibilityCcsSent : Bool := false
   -- Traffic keys.
   readKeys? : Option Record.TrafficKeys := none
@@ -449,6 +440,68 @@ private def retryStableExtensions (hello : Handshake.ClientHello) :
       extension.extensionType != Handshake.cookieExtension &&
       extension.extensionType != Handshake.paddingExtension
 
+/-- RFC 8446 §4.1.2: everything a second ClientHello must repeat unchanged after
+a HelloRetryRequest, plus the retry-specific requirements on the fields it *is*
+allowed to change (early_data must be gone, no unsolicited cookie, the PSK offer
+may only lose identities incompatible with the selected hash, and key_share must
+carry exactly the requested group).
+
+The comparison is against the first ClientHello *as parsed*. That is exactly as
+strong as comparing the two messages byte for byte:
+`Handshake.parseClientHello_canonical` proves a parsed ClientHello re-encodes to
+the body it came from, and `checkRetryClientHello_body_eq` below turns this
+check plus an unchanged extension list into byte equality of the two bodies. -/
+private def checkRetryClientHello (first second : Handshake.ClientHello)
+    (group : Handshake.NamedGroup) : Except Error Unit := do
+  unless second.random == first.random do
+    throw (.invalidRetryClientHello "random changed")
+  unless second.legacySessionId == first.legacySessionId do
+    throw (.invalidRetryClientHello "legacy_session_id changed")
+  unless second.cipherSuites == first.cipherSuites do
+    throw (.invalidRetryClientHello "cipher_suites changed")
+  unless second.supportedVersionIds == first.supportedVersionIds do
+    throw (.invalidRetryClientHello "supported_versions changed")
+  unless second.supportedGroupIds == first.supportedGroupIds do
+    throw (.invalidRetryClientHello "supported_groups changed")
+  unless second.signatureAlgorithms == first.signatureAlgorithms do
+    throw (.invalidRetryClientHello "signature_algorithms changed")
+  unless second.serverName == first.serverName do
+    throw (.invalidRetryClientHello "server_name changed")
+  unless second.alpnProtocols == first.alpnProtocols do
+    throw (.invalidRetryClientHello "ALPN offer changed")
+  unless retryStableExtensions second == retryStableExtensions first do
+    throw (.invalidRetryClientHello "an extension not permitted to change was modified")
+  if second.extensions.any
+      (fun extension => extension.extensionType == Handshake.earlyDataExtension) then
+    throw (.invalidRetryClientHello "early_data was not removed")
+  if second.extensions.any
+      (fun extension => extension.extensionType == Handshake.cookieExtension) then
+    throw (.invalidRetryClientHello "unsolicited cookie extension")
+  let currentPsks ← liftHandshake (parseOfferedPsks second)
+  let originalPsks ← liftHandshake (parseOfferedPsks first)
+  match currentPsks, originalPsks with
+  | none, none => pure ()
+  | none, some original =>
+      if original.any (fun psk => psk.2 == 32) then
+        throw (.invalidRetryClientHello
+          "pre_shared_key removed despite containing a SHA-256 identity")
+  | some _, none =>
+      throw (.invalidRetryClientHello "pre_shared_key was added")
+  | some current, some original =>
+      let required := original.filter (fun psk => psk.2 == 32)
+      unless psksAreOrderedSubset current original &&
+          psksAreOrderedSubset required current do
+        throw (.invalidRetryClientHello
+          "pre_shared_key identities were added, reordered, changed, or \
+            removed despite matching SHA-256")
+  unless second.supportedGroups.contains group do
+    throw (.invalidRetryClientHello "requested group was removed from supported_groups")
+  unless second.keyShareGroupIds == #[group.toUInt16] do
+    throw (.invalidRetryClientHello
+      "key_share must contain exactly the single group requested by HelloRetryRequest")
+  unless (clientShare? second group).isSome do
+    throw (.invalidRetryClientHello "requested key share is still absent")
+
 private def checkConfig (state : State) : Except Error Unit := do
   unless state.serverRandom.size == 32 do
     throw (.invalidConfig s!"ServerHello random must be 32 bytes, got {state.serverRandom.size}")
@@ -573,16 +626,7 @@ private def completeClientHello (state : State) (hello : Handshake.ClientHello)
     cipherSuiteSelected := some Handshake.tlsChaCha20Poly1305Sha256
     groupSelected := some group
     retryGroup? := none
-    retryClientRandom := ByteArray.empty
-    retryLegacySessionId := ByteArray.empty
-    retryCipherSuites := #[]
-    retrySupportedVersionIds := #[]
-    retrySupportedGroupIds := #[]
-    retrySignatureAlgorithms := #[]
-    retryServerName := none
-    retryAlpnProtocols := #[]
-    retryStableExtensions := #[]
-    retryPsks := none
+    retryHello? := none
     compatibilityCcsSent := state.compatibilityCcsSent || sendCompatibilityCcs
   }, wireBytes)
 
@@ -595,7 +639,6 @@ private def sendHelloRetryRequest (state : State) (message : Handshake.Message)
     (Handshake.encodeHelloRetryRequest hello.legacySessionId group)
   let messageHash ← liftHandshake
     (Handshake.frame Handshake.messageHashType (HaclStar.sha256 message.encoded))
-  let retryPsks ← liftHandshake (parseOfferedPsks hello)
   let retryWire ← liftRecord (Record.encodePlaintext .handshake retry.encoded)
   let sendCompatibilityCcs := !hello.legacySessionId.isEmpty
   let ccsWire ←
@@ -609,16 +652,7 @@ private def sendHelloRetryRequest (state : State) (message : Handshake.Message)
     handshakeBuffered := ByteArray.empty
     transcript := messageHash.encoded ++ retry.encoded
     retryGroup? := some group
-    retryClientRandom := hello.random
-    retryLegacySessionId := hello.legacySessionId
-    retryCipherSuites := hello.cipherSuites
-    retrySupportedVersionIds := hello.supportedVersionIds
-    retrySupportedGroupIds := hello.supportedGroupIds
-    retrySignatureAlgorithms := hello.signatureAlgorithms
-    retryServerName := hello.serverName
-    retryAlpnProtocols := hello.alpnProtocols
-    retryStableExtensions := retryStableExtensions hello
-    retryPsks
+    retryHello? := some hello
     cipherSuiteSelected := some Handshake.tlsChaCha20Poly1305Sha256
     groupSelected := some group
     compatibilityCcsSent := sendCompatibilityCcs
@@ -641,53 +675,9 @@ private def acceptClientHello (state : State) (message : Handshake.Message) :
   | .waitingSecondClientHello =>
       let some group := state.retryGroup?
         | throw (.internalState "retry phase has no requested group")
-      unless hello.random == state.retryClientRandom do
-        throw (.invalidRetryClientHello "random changed")
-      unless hello.legacySessionId == state.retryLegacySessionId do
-        throw (.invalidRetryClientHello "legacy_session_id changed")
-      unless hello.cipherSuites == state.retryCipherSuites do
-        throw (.invalidRetryClientHello "cipher_suites changed")
-      unless hello.supportedVersionIds == state.retrySupportedVersionIds do
-        throw (.invalidRetryClientHello "supported_versions changed")
-      unless hello.supportedGroupIds == state.retrySupportedGroupIds do
-        throw (.invalidRetryClientHello "supported_groups changed")
-      unless hello.signatureAlgorithms == state.retrySignatureAlgorithms do
-        throw (.invalidRetryClientHello "signature_algorithms changed")
-      unless hello.serverName == state.retryServerName do
-        throw (.invalidRetryClientHello "server_name changed")
-      unless hello.alpnProtocols == state.retryAlpnProtocols do
-        throw (.invalidRetryClientHello "ALPN offer changed")
-      unless retryStableExtensions hello == state.retryStableExtensions do
-        throw (.invalidRetryClientHello "an extension not permitted to change was modified")
-      if hello.extensions.any
-          (fun extension => extension.extensionType == Handshake.earlyDataExtension) then
-        throw (.invalidRetryClientHello "early_data was not removed")
-      if hello.extensions.any
-          (fun extension => extension.extensionType == Handshake.cookieExtension) then
-        throw (.invalidRetryClientHello "unsolicited cookie extension")
-      let retryPsks ← liftHandshake (parseOfferedPsks hello)
-      match retryPsks, state.retryPsks with
-      | none, none => pure ()
-      | none, some original =>
-          if original.any (fun psk => psk.2 == 32) then
-            throw (.invalidRetryClientHello
-              "pre_shared_key removed despite containing a SHA-256 identity")
-      | some _, none =>
-          throw (.invalidRetryClientHello "pre_shared_key was added")
-      | some current, some original =>
-          let required := original.filter (fun psk => psk.2 == 32)
-          unless psksAreOrderedSubset current original &&
-              psksAreOrderedSubset required current do
-            throw (.invalidRetryClientHello
-              "pre_shared_key identities were added, reordered, changed, or \
-                removed despite matching SHA-256")
-      unless hello.supportedGroups.contains group do
-        throw (.invalidRetryClientHello "requested group was removed from supported_groups")
-      unless hello.keyShareGroupIds == #[group.toUInt16] do
-        throw (.invalidRetryClientHello
-          "key_share must contain exactly the single group requested by HelloRetryRequest")
-      unless (clientShare? hello group).isSome do
-        throw (.invalidRetryClientHello "requested key share is still absent")
+      let some first := state.retryHello?
+        | throw (.internalState "retry phase has no first ClientHello")
+      checkRetryClientHello first hello group
       completeClientHello state hello group (state.transcript ++ message.encoded)
   | phase =>
       throw (.internalState s!"acceptClientHello called while waiting for {phase.render}")
