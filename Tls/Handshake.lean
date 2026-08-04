@@ -233,7 +233,8 @@ def uint24AtOne (bytes : ByteArray) : Nat :=
 returning `none` — not an error — while the buffer still holds only a prefix of
 a message. This is the reassembly step both state machines run on the bytes the
 record layer hands up; its laws are `takeMessage?_frame`,
-`takeMessage?_prefix_none` and `takeMessage?_conservation`. -/
+`takeMessage?_prefix_none`, `takeMessage?_append` and
+`takeMessage?_conservation`. -/
 def takeMessage? (buffered : ByteArray) :
     Except String (Option (Message × ByteArray)) :=
   if buffered.size < 4 then
@@ -1483,11 +1484,16 @@ private def parseOptionalExtension {α : Type} (extensions : Array Extension)
 /-- Parse a ClientHello for the server flow. Extracts the fields the server needs
 to select a key-exchange group, verify TLS 1.3 support, and negotiate ALPN/SNI.
 (Written as a pure `if`/`match` chain so the ClientHello laws below can evaluate
-it.) `parseClientHello_clientHelloBody` proves it inverts `clientHelloBody`:
+it.) `parseClientHello_clientHelloBody_mem` proves it inverts `clientHelloBody`:
 cipher suites, versions, supported groups, key-share groups, signature schemes
 and the whole extension list come back verbatim and in order, whatever the
-values are (`parseClientHello_clientHelloBody_opaque` is the special case of a
-ClientHello whose extensions are all uninterpreted). -/
+values are and wherever the interpreted extensions sit in the list
+(`parseClientHello_clientHelloBody_opaque` is the special case of a ClientHello
+whose extensions are all uninterpreted, `parseClientHello_clientHelloBody` the
+one where the interpreted ones come last, and
+`parseClientHello_clientHelloBody_psk` the resumption shape).
+`parseClientHello_canonical` proves the converse direction: a ClientHello this
+accepts re-encodes to exactly the body it was parsed from. -/
 def parseClientHello (msg : Message) : Except String ClientHello :=
   if msg.msgType == clientHelloType then
     match ({ bytes := msg.body } : Reader).readUInt16 with

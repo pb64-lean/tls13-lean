@@ -23,8 +23,10 @@ machine-checked, and it matters which is which:
   fragmentation independence, sequence/nonce injectivity, seal/open
   inversion parametric over the opaque AEAD), the handshake codecs (wire
   roundtrips with explicit residual, body inversion, GREASE-tolerant
-  extension preservation, HelloRetryRequest discrimination, no partial
-  frame ever accepted), and the DER decoder (exact-slice retention carried
+  extension preservation, ClientHello canonicity — a parsed ClientHello
+  re-encodes to exactly the bytes it came from — HelloRetryRequest
+  discrimination, no partial frame ever accepted), and the DER decoder
+  (exact-slice retention carried
   through to the bytes certificate signatures are verified over). These are
   proofs about the executable definitions, not a parallel model.
 
@@ -75,19 +77,34 @@ Four Bazel packages:
   semantically, extension lists, `uint16` vectors and client key-share lists
   roundtrip for arbitrary (including unknown and GREASE) types and values, and
   HelloRetryRequest is discriminated from ServerHello by the RFC 8446 sentinel
-  random. `parseClientHello_clientHelloBody` lifts that to a whole ClientHello:
-  the cipher suites, offered versions, supported groups, key-share groups,
-  signature schemes and the entire extension list — unknown and GREASE entries
-  included — are returned in wire order with nothing dropped or reordered.
+  random. `parseClientHello_clientHelloBody_mem` lifts that to a whole
+  ClientHello: the cipher suites, offered versions, supported groups, key-share
+  groups, signature schemes and the entire extension list — unknown and GREASE
+  entries included — are returned in wire order with nothing dropped or
+  reordered, with the four interpreted extensions allowed anywhere in the list
+  in any interleaving (the only structural hypothesis left is that no two
+  extensions share a type, which RFC 8446 forbids and `parseExtensions`
+  rejects). `parseClientHello_clientHelloBody_psk` covers the resumption shape
+  as well — a `pre_shared_key` offer as the final extension with a non-empty
+  `psk_key_exchange_modes` is accepted and retained verbatim (PSK is still not
+  *negotiated*; see the scope list below).
   `Tls.Handshake.takeMessage?` — the reassembly step both state machines run on
   the bytes the record layer hands up — is proved monotone and exact: every
   proper prefix of a framed message yields nothing rather than an error, the
   arrival of its last byte delivers the whole message with the following bytes
-  untouched, and delivery conserves the buffer. The extension codec is also
-  proved lossless in the other direction: `parseExtensions_image` shows every
-  extension block the parser accepts *is* the wire image of the list it
-  produced, so re-encoding a parsed list reproduces the original bytes and
-  distinct buffers never parse alike.
+  untouched, delivery conserves the buffer, and bytes arriving after a message
+  is already complete never change what is delivered (`takeMessage?_append`,
+  for an arbitrary buffer). The list codecs are proved lossless in the other
+  direction too: `parseExtensions_image`, `parseUInt16List_image` and
+  `parseKeyShareEntries_image` show that every block the parser accepts *is*
+  the wire image of the list it produced, so re-encoding a parsed list
+  reproduces the original bytes (and for extension blocks and `uint16` vectors
+  distinct buffers never parse alike). `parseClientHello_canonical` composes
+  those into ClientHello canonicity: a ClientHello that parsed re-encodes to
+  exactly the body it came from, so comparing the parsed fields of a retry
+  ClientHello against the original is as strong as comparing the bytes
+  (`parseClientHello_body_injective`) — which is what the HelloRetryRequest
+  flow needs.
 - **`Test/`** — nine hermetic test binaries, a one-shot loopback server
   harness, and a scripted (manual-tag) interoperability gate that drives the
   harness with real OpenSSL, curl, and Go `crypto/tls` clients.
