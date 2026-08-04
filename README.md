@@ -50,7 +50,15 @@ Four Bazel packages:
   (parametrically over the opaque HACL\* AEAD binding) `open` inverts
   `seal`, wire bytes and all. The handshake layer mirrors framing
   conservation: a decoded message's retained `encoded` bytes plus the
-  remainder reproduce the input buffer exactly.
+  remainder reproduce the input buffer exactly. `Tls.Handshake` also ends in
+  kernel-checked wire-codec laws: every message encoder roundtrips through
+  the wire decoder with an explicit residual, the framing outcome depends
+  only on the reassembled byte stream and never accepts a partial frame,
+  the EncryptedExtensions/Certificate/CertificateVerify/Finished/
+  NewSessionTicket/KeyUpdate bodies invert semantically, extension lists and
+  `uint16` vectors roundtrip for arbitrary (including unknown and GREASE)
+  types and values, and HelloRetryRequest is discriminated from ServerHello
+  by the RFC 8446 sentinel random.
 - **`Test/`** — nine hermetic test binaries, a one-shot loopback server
   harness, and a scripted (manual-tag) interoperability gate that drives the
   harness with real OpenSSL, curl, and Go `crypto/tls` clients.
@@ -251,5 +259,9 @@ build because it compiles and links the HACL\* C shim.
     canonical length/identifier form lemmas) and their signed-bytes
     corollary (`Certificate.decode_tbs_encoded`, `checkIssuer_verifies`:
     the bytes the chain validator hands to signature verification are
-    exactly the TBS slice parsed out of the certificate); key schedule,
-    handshake parsers, and state-machine invariants remain
+    exactly the TBS slice parsed out of the certificate) and the handshake
+    wire-codec laws (`Tls.Handshake`: framing roundtrips with residual,
+    reassembly independence, per-message parse inversion, GREASE-tolerant
+    extension and `uint16`-vector roundtrips, HelloRetryRequest
+    discrimination); key schedule, the ClientHello/ServerHello body
+    parsers, and state-machine invariants remain

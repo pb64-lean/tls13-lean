@@ -567,7 +567,7 @@ private def checkKeyShareSize : NamedGroup → ByteArray → Except String Unit
         .error "server P-256 key share must be a 65-byte SEC1 uncompressed point"
 
 /-- The ServerHello key_share extension body: one `group ‖ uint16 key` entry.
-Split out of `parseServerHello` so its law can be stated on its own. -/
+Split out so `parseServerHello` stays a flat `if`/`match` chain. -/
 private def parseServerKeyShare (data : ByteArray) :
     Except String (NamedGroup × ByteArray) :=
   match ({ bytes := data } : Reader).readUInt16 with
@@ -658,7 +658,7 @@ structure HelloRetryRequest where
   deriving Inhabited, BEq
 
 /-- The HelloRetryRequest key_share extension body: a bare selected group.
-Split out of `parseHelloRetryRequest` so its law can be stated on its own. -/
+Split out so `parseHelloRetryRequest` stays a flat `if`/`match` chain. -/
 private def parseHrrKeyShare (data : ByteArray) : Except String NamedGroup :=
   match ({ bytes := data } : Reader).readUInt16 with
   | .error e => .error e
@@ -737,7 +737,7 @@ structure EncryptedExtensions where
   deriving Inhabited, BEq
 
 /-- Parse EncryptedExtensions. (Written as a pure `if`/`match` chain so
-`encodeEncryptedExtensions_parse` below can evaluate it.) -/
+`encodeEncryptedExtensions_parse_none`/`_some` below can evaluate it.) -/
 def parseEncryptedExtensions (msg : Message) : Except String EncryptedExtensions :=
   if msg.msgType == encryptedExtensionsType then
     match ({ bytes := msg.body } : Reader).readVector16 with
@@ -1383,12 +1383,29 @@ def encodeCertificateVerify (algorithm : UInt16) (signature : ByteArray) :
 /-!
 ## Wire-codec roundtrip laws
 
-Kernel-checked encode/parse inversion for the handshake framing layer:
-`frame` output is accepted byte-for-byte by `decodeOne` with an explicit
-residual (`decodeOne_frame`), and every message encoder therefore roundtrips
-through the wire decoder (`encode*_decode`). The loop-free message bodies
-also invert semantically (`encodeFinished_parse`, `encodeKeyUpdate_parse`,
-`encodeCertificateVerify_parse`). -/
+Kernel-checked encode/parse inversion for the handshake codecs.
+
+* Framing: `frame` output is accepted byte-for-byte by `decodeOne` with an
+  explicit residual (`decodeOne_frame`), so every message encoder roundtrips
+  through the wire decoder (`encode*_decodeOne`, `encode*_decode`).
+* Reassembly: the outcome depends only on the reassembled byte stream, not on
+  where the record layer split it (`decodeOne_frame_split`), back-to-back
+  messages are peeled in order (`decodeOne_frame_concat`), and no strict
+  prefix of a frame ever decodes (`decodeOne_prefix_error`).
+* Message bodies invert semantically: `encodeFinished_parse`,
+  `encodeKeyUpdate_parse`, `encodeCertificateVerify_parse`,
+  `encodeEncryptedExtensions_parse_none`/`_some`, `encodeCertificate_parse`,
+  and `encodeNewSessionTicket_parse`.
+* Tolerance: an extension list (`parseExtensions_extensionsBytes`) and a
+  `uint16` vector (`parseUInt16List_uint16ListBytes`) both roundtrip for
+  *arbitrary* types and values, so unknown, reserved and GREASE extensions,
+  cipher suites, groups, versions and signature schemes survive a
+  parse/re-encode cycle unchanged and in order.
+* HelloRetryRequest is discriminated from ServerHello by the RFC 8446
+  sentinel random (`encodeHelloRetryRequest_isHelloRetryRequest`,
+  `encodeServerHello_not_isHelloRetryRequest`), and each parser rejects the
+  other message (`encodeHelloRetryRequest_parseServerHello`,
+  `encodeServerHello_parseHelloRetryRequest`). -/
 
 /-! ### `ByteArray.get!` bridges -/
 
