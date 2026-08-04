@@ -83,7 +83,11 @@ Four Bazel packages:
   the bytes the record layer hands up — is proved monotone and exact: every
   proper prefix of a framed message yields nothing rather than an error, the
   arrival of its last byte delivers the whole message with the following bytes
-  untouched, and delivery conserves the buffer.
+  untouched, and delivery conserves the buffer. The extension codec is also
+  proved lossless in the other direction: `parseExtensions_image` shows every
+  extension block the parser accepts *is* the wire image of the list it
+  produced, so re-encoding a parsed list reproduces the original bytes and
+  distinct buffers never parse alike.
 - **`Test/`** — nine hermetic test binaries, a one-shot loopback server
   harness, and a scripted (manual-tag) interoperability gate that drives the
   harness with real OpenSSL, curl, and Go `crypto/tls` clients.

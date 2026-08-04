@@ -2866,6 +2866,202 @@ theorem parseExtensions_extensionsBytes (l : List Extension)
     (fun _ _ => Array.any_empty) hdistinct]
   rfl
 
+/-! ### Wire → list converse for extension lists
+
+`parseExtensions_extensionsBytes` says every extension list is recovered from
+its wire image. These laws say the opposite: every buffer the parser accepts
+*is* the wire image of what it produced, so re-encoding a parsed extension list
+reproduces the bytes it came from. -/
+
+private theorem uint16_hi (b0 b1 : UInt8) :
+    ((b0.toUInt16 <<< 8 ||| b1.toUInt16) >>> 8).toUInt8 = b0 := by
+  bv_decide
+
+private theorem uint16_lo (b0 b1 : UInt8) :
+    (b0.toUInt16 <<< 8 ||| b1.toUInt16).toUInt8 = b1 := by
+  bv_decide
+
+private theorem getElem_appendUInt16_zero (v : UInt16)
+    (h : 0 < (appendUInt16 ByteArray.empty v).size) :
+    (appendUInt16 ByteArray.empty v)[0] = (v >>> 8).toUInt8 := rfl
+
+private theorem getElem_appendUInt16_one (v : UInt16)
+    (h : 1 < (appendUInt16 ByteArray.empty v).size) :
+    (appendUInt16 ByteArray.empty v)[1] = v.toUInt8 := rfl
+
+/-- Two bytes of a buffer are the big-endian encoding of the `uint16` they
+decode to. -/
+private theorem extract_two {W : ByteArray} {off e : Nat} (he : e = off + 2)
+    (h : off + 2 ≤ W.size) :
+    W.extract off e = appendUInt16 ByteArray.empty
+      ((W.get! off).toUInt16 <<< 8 ||| (W.get! (off + 1)).toUInt16) := by
+  subst he
+  apply ByteArray.ext_getElem
+  · rw [ByteArray.size_extract, Nat.min_eq_left h]
+    show off + 2 - off = 2
+    omega
+  · intro i hi hi'
+    rw [ByteArray.size_extract, Nat.min_eq_left h] at hi
+    rw [ByteArray.getElem_extract]
+    match i, hi with
+    | 0, _ =>
+      rw [getElem_appendUInt16_zero, uint16_hi,
+        get!_eq_getElem (show off < W.size by omega)]
+      simp
+    | 1, _ =>
+      rw [getElem_appendUInt16_one, uint16_lo,
+        get!_eq_getElem (show off + 1 < W.size by omega)]
+
+/-- A `type ‖ uint16 length ‖ data` record read out of a buffer is exactly the
+wire image of the extension it decodes to. -/
+private theorem extract_extensionBytes {W : ByteArray} {off : Nat} {t Lv : UInt16}
+    (ht : t = (W.get! off).toUInt16 <<< 8 ||| (W.get! (off + 1)).toUInt16)
+    (hL : Lv = (W.get! (off + 2)).toUInt16 <<< 8 ||| (W.get! (off + 3)).toUInt16)
+    (hle : off + 4 + Lv.toNat ≤ W.size) :
+    W.extract off (off + 4 + Lv.toNat) =
+      extensionBytes (Extension.mk t (W.extract (off + 4) (off + 4 + Lv.toNat))) := by
+  have hdsize : (W.extract (off + 4) (off + 4 + Lv.toNat)).size = Lv.toNat := by
+    rw [ByteArray.size_extract]
+    omega
+  have hofNat :
+      UInt16.ofNat (W.extract (off + 4) (off + 4 + Lv.toNat)).size = Lv := by
+    rw [hdsize, UInt16.ofNat_toNat]
+  have hsplit1 : W.extract off (off + 2) ++
+      W.extract (off + 2) (off + 4 + Lv.toNat)
+      = W.extract off (off + 4 + Lv.toNat) := by
+    rw [ByteArray.extract_append_extract, Nat.min_eq_left (by omega),
+      Nat.max_eq_right (by omega)]
+  have hsplit2 : W.extract (off + 2) (off + 4) ++
+      W.extract (off + 4) (off + 4 + Lv.toNat)
+      = W.extract (off + 2) (off + 4 + Lv.toNat) := by
+    rw [ByteArray.extract_append_extract, Nat.min_eq_left (by omega),
+      Nat.max_eq_right (by omega)]
+  rw [← hsplit1, ← hsplit2,
+    extract_two (W := W) (off := off) (e := off + 2) rfl (by omega),
+    extract_two (W := W) (off := off + 2) (e := off + 4) (by omega) (by omega),
+    ← ht]
+  show _ = appendUInt16 ByteArray.empty t ++
+    (appendUInt16 ByteArray.empty
+        (UInt16.ofNat (W.extract (off + 4) (off + 4 + Lv.toNat)).size) ++
+      W.extract (off + 4) (off + 4 + Lv.toNat))
+  rw [hofNat, ← hL]
+
+private theorem extract_self_empty (W : ByteArray) (k : Nat) :
+    W.extract k k = ByteArray.empty := by
+  apply ByteArray.ext_getElem
+  · rw [ByteArray.size_extract]
+    show min k W.size - k = 0
+    omega
+  · intro i hi hi'
+    exact absurd hi' (by simp)
+
+/-- The wire image of an extension read out of a buffer, followed by the image
+of what comes after it, is the whole remaining buffer. -/
+private theorem extract_cons_image {W : ByteArray} {off : Nat}
+    {rest : List Extension}
+    (hle : off + 2 + 2 +
+      ((W.get! (off + 2)).toUInt16 <<< 8 |||
+        (W.get! (off + 2 + 1)).toUInt16).toNat ≤ W.size)
+    (hext : W.extract (off + 2 + 2 +
+        ((W.get! (off + 2)).toUInt16 <<< 8 |||
+          (W.get! (off + 2 + 1)).toUInt16).toNat) W.size = extensionsBytes rest) :
+    W.extract off W.size = extensionsBytes
+      (Extension.mk ((W.get! off).toUInt16 <<< 8 ||| (W.get! (off + 1)).toUInt16)
+        (W.extract (off + 2 + 2) (off + 2 + 2 +
+          ((W.get! (off + 2)).toUInt16 <<< 8 |||
+            (W.get! (off + 2 + 1)).toUInt16).toNat)) :: rest) := by
+  have hidx : off + 2 + 1 = off + 3 := by omega
+  have hidx2 : off + 2 + 2 = off + 4 := by omega
+  rw [hidx, hidx2] at hle hext ⊢
+  show W.extract off W.size = extensionBytes _ ++ extensionsBytes rest
+  rw [← hext, ← extract_extensionBytes (W := W) (off := off) rfl rfl hle,
+    ByteArray.extract_append_extract, Nat.min_eq_left (by omega),
+    Nat.max_eq_right (by omega)]
+
+/-- Everything the extension loop consumed is the wire image of what it
+produced. -/
+private theorem parseExtensionsLoop_image : ∀ (n : Nat) (W : ByteArray) (off : Nat)
+    (out res : Array Extension),
+    W.size - off ≤ n → off ≤ W.size →
+    parseExtensionsLoop (Reader.mk W off) out = .ok res →
+    ∃ rest, res.toList = out.toList ++ rest ∧
+      W.extract off W.size = extensionsBytes rest := by
+  intro n
+  induction n with
+  | zero =>
+    intro W off out res hn hle h
+    have hend : off = W.size := by omega
+    rw [parseExtensionsLoop_end (E := W) (off := off) hend] at h
+    cases h
+    exact ⟨[], by simp, by rw [hend]; exact extract_self_empty ..⟩
+  | succ n ih =>
+    intro W off out res hn hle h
+    by_cases hE : off = W.size
+    · rw [parseExtensionsLoop_end (E := W) (off := off) hE] at h
+      cases h
+      exact ⟨[], by simp, by rw [hE]; exact extract_self_empty ..⟩
+    have hlt : off < W.size := by omega
+    rw [parseExtensionsLoop.eq_def, if_neg (show ¬((Reader.mk W off).atEnd = true) from by
+      show ¬(off == W.size) = true
+      rw [beq_iff_eq]
+      exact hE)] at h
+    split at h
+    · cases h
+    · rename_i t r₁ h16
+      obtain ⟨hb1, ho1, hle1⟩ := readUInt16_ok h16
+      have ho1' : r₁.offset = off + 2 := ho1
+      have hle1' : r₁.offset ≤ W.size := hle1
+      rw [readUInt16_eval (b := W) (off := off) (by omega)] at h16
+      simp only [Except.ok.injEq, Prod.mk.injEq] at h16
+      obtain ⟨rfl, rfl⟩ := h16
+      split at h
+      · cases h
+      · rename_i d r₂ hv
+        obtain ⟨hb2, hlo2, hle2⟩ := readVector16_ok hv
+        have hlo2' : off + 2 + 2 ≤ r₂.offset := hlo2
+        have hle2' : r₂.offset ≤ W.size := hle2
+        unfold Reader.readVector16 at hv
+        simp only [readUInt16_eval (b := W) (off := off + 2) (by omega)] at hv
+        obtain ⟨hb3, ho3, hle3⟩ := take_ok hv
+        have ho3' : r₂.offset = off + 2 + 2 +
+            ((W.get! (off + 2)).toUInt16 <<< 8 |||
+              (W.get! (off + 2 + 1)).toUInt16).toNat := ho3
+        have hLbound : off + 2 + 2 +
+            ((W.get! (off + 2)).toUInt16 <<< 8 |||
+              (W.get! (off + 2 + 1)).toUInt16).toNat ≤ W.size := by omega
+        rw [take_eval (b := W) (off := off + 2 + 2) hLbound] at hv
+        simp only [Except.ok.injEq, Prod.mk.injEq] at hv
+        obtain ⟨rfl, rfl⟩ := hv
+        split at h
+        · cases h
+        · obtain ⟨rest, hres, hext⟩ := ih W (off + 2 + 2 +
+            ((W.get! (off + 2)).toUInt16 <<< 8 |||
+              (W.get! (off + 2 + 1)).toUInt16).toNat) _ _ (by omega) hLbound h
+          refine ⟨_ :: rest, ?_, extract_cons_image hLbound hext⟩
+          rw [hres, Array.toList_push, List.append_assoc]
+          rfl
+
+/-- **Wire → list converse**: every extension block the parser accepts is
+exactly the wire image of the list it produced, so re-encoding a parsed
+extension list reproduces the bytes it came from. Together with
+`parseExtensions_extensionsBytes` this makes the extension codec a bijection
+between accepted buffers and the lists they parse to. -/
+theorem parseExtensions_image {E : ByteArray} {exts : Array Extension}
+    (h : parseExtensions E = .ok exts) : E = extensionsBytes exts.toList := by
+  unfold parseExtensions at h
+  obtain ⟨rest, hres, hext⟩ :=
+    parseExtensionsLoop_image E.size E 0 #[] exts (by omega) (by omega) h
+  rw [ByteArray.extract_zero_size] at hext
+  rw [hext, hres]
+  rfl
+
+/-- **Injectivity on accepted buffers**: two extension blocks that parse to the
+same list are byte-identical. -/
+theorem parseExtensions_injective {E₁ E₂ : ByteArray} {exts : Array Extension}
+    (h₁ : parseExtensions E₁ = .ok exts) (h₂ : parseExtensions E₂ = .ok exts) :
+    E₁ = E₂ := by
+  rw [parseExtensions_image h₁, parseExtensions_image h₂]
+
 /-! ### EncryptedExtensions -/
 
 /-- A body that is exactly one `uint16`-prefixed vector reads back as that
