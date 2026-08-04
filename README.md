@@ -311,45 +311,41 @@ no `Repr` instance, handshake secrets and scalars are dropped from state on
 completion, and Finished verification is constant-time — but there is no
 zeroization of Lean-side key material.
 
-### The `bv_decide` LRAT certificates
+### Nothing inside the proofs
 
-One more item belongs on that list, and it sits *inside* the proofs rather than
-beside them. Seven byte-(de)composition identities — `hi_lo_recompose`,
-`recompose_hi`, `sequenceBytes_inj` and `nonceOf_inj` in `Tls.Record.Laws`,
-`uint16_recompose`, `uint32_recompose` and `uint16_hi` in `Tls.Handshake` — are
-discharged by `bv_decide`, which runs CaDiCaL on the reflected `BitVec` goal and
-checks the resulting LRAT refutation with a *natively compiled* checker rather
-than in the kernel. Lean records that shortcut honestly: each call site gets its
-own axiom, `<lemma>._native.bv_decide.ax_1_5`, whose statement is
+That list is the whole of it: no proof in this repository adds to it. Every
+constant in the first-party closure — `HaclStar`, `TLS13`, `Tls`, theorems and
+definitions alike — closes over exactly the three standard Lean axioms,
+`propext`, `Classical.choice` and `Quot.sound`, and often fewer. Nothing depends
+on `sorryAx`, on `Lean.ofReduceBool`/`ofReduceNat`, or on a generated axiom of
+any kind.
+
+This used to be untrue in one narrow place. The byte-(de)composition identities
+that record framing, nonce non-reuse and ClientHello canonicity rest on —
+`hi_lo_recompose`, `recompose_hi`, `recompose_lo`, `sequenceBytes_inj` and
+`nonceOf_inj` in `Tls.Record.Laws`, `uint16_recompose`, `uint32_recompose`,
+`uint16_hi` and `uint16_lo` in `Tls.Handshake` — were discharged by `bv_decide`,
+which runs CaDiCaL on the reflected `BitVec` goal and checks the resulting LRAT
+refutation with a *natively compiled* checker rather than in the kernel. Lean
+records that shortcut honestly: each call site that actually invokes the solver
+gets its own axiom, `<lemma>._native.bv_decide.ax_1_5`, asserting
 `Std.Tactic.BVDecide.Reflect.verifyBVExpr <that goal> <that certificate> = true`.
+Seven such axioms existed, and three families of headline theorems reached one.
 
-So the trust item is narrow and specific — the compiled LRAT checker and the
-compiler that built it, applied to seven fixed certificates — but it is real,
-and it **does** reach headline theorems. Precisely three families:
+They are now proved arithmetically instead, the way `decodeOne_canonical`'s
+converse `uint24` recomposition always was: `Nat.shiftLeft_add_eq_or_of_lt`
+rewrites a disjoint `|||` as `+` (packaged as the local `or_add_lt`), byte
+extraction becomes division and remainder by a literal, and `omega` closes the
+result — a kernel-checked term, no solver, no certificate. `sequenceBytes_inj`
+falls to a single `omega` over the eight extracted bytes, and `nonceOf_inj`
+reduces to it by cancelling the IV out of the XOR (`UInt8.xor_assoc`,
+`xor_self`, `zero_xor`). `bv_decide` remains available in the toolchain and is a
+perfectly sound tactic; this repository simply no longer relies on it, and the
+`Std.Tactic.BVDecide` imports are gone.
 
-- **nonce non-reuse** — `Record.WriteRun.nodup`, both engines'
-  `run_nonce_nodup` and `feed_nonce_nodup`, `Record.nonceOf_inj`,
-  `TrafficKeys.nonce_inj` (the `nonceOf_inj` certificate) and
-  `Record.sequenceBytes_inj` (its own);
-- **record framing** — `decodeStep_conservation`,
-  `decodeBuffered_conservation`, `Decoder.feed_conservation`,
-  `Decoder.feed_append`, `decodeStep_seal_open` (the `recompose_hi` and
-  `hi_lo_recompose` certificates);
-- **ClientHello canonicity** — `parseClientHello_canonical`(`_of_offersTls13`),
-  `parseClientHello_body_injective`, `parseExtensions_injective` and the retry
-  check `checkRetryClientHello_body_eq` (the `uint16_hi` certificate).
-
-Everything else the audit certifies closes over nothing but `propext`,
-`Classical.choice` and `Quot.sound`: the whole X.509/DER tier, `open_seal`,
-`seal_nonce`, `Decoder.feed_residual`, the handshake message roundtrips and the
-frame-canonicity laws, and every state-machine transition and invariant law.
-(Two of the seven certificates, `uint16_recompose`'s and `uint32_recompose`'s,
-are not reached by any headline theorem at all; they are allowed because they
-are declared inside the audited scope.) The audit prints the exact axiom set of
-each theorem, so all of this is checked rather than asserted. Eliminating the
-certificates by proving the seven identities from core's `BitVec` `getLsbD`
-lemmas — as `decodeOne_canonical`'s converse `uint24` recomposition is proved,
-arithmetically and certificate-free — is open follow-up work.
+The audit below prints the exact axiom set of every principal theorem and
+rejects anything outside the standard three, so this is checked on every build
+rather than asserted here.
 
 ## Proof assurance
 
@@ -369,9 +365,9 @@ Each target also scans every constant of the whole first-party closure
 `@[extern]` constant may live outside the `HaclStar` modules**. That last check
 is what makes the FFI-boundary claim in the previous section mechanical: native
 code appearing anywhere else in the closure fails the build. The allowed-axiom
-set is the standard three plus the seven `bv_decide` certificates named above,
-listed one by one — so a *new* `bv_decide` call site fails the audit until it is
-reviewed and added.
+set is exactly `propext`, `Classical.choice` and `Quot.sound` — nothing else is
+tolerated, so a `bv_decide` call site (or any other axiom-generating tactic)
+reaching a principal theorem fails the audit the moment it is introduced.
 
 ## Tests
 
