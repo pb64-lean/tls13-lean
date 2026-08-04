@@ -288,6 +288,36 @@ private theorem takeHandshake?_size {buffered rest : ByteArray}
         rw [← h.2, ByteArray.size_extract]
         omega
 
+private theorem liftHandshake_ok {α : Type} {result : Except String α}
+    {value : α} (h : liftHandshake result = .ok value) : result = .ok value := by
+  unfold liftHandshake at h
+  cases result with
+  | error e => simp [Except.mapError] at h
+  | ok b => simpa [Except.mapError] using h
+
+/-- A successful `takeHandshake?` conserves bytes: the decoded message's
+retained exact encoding followed by the returned remainder is the input
+buffer — the handshake-layer mirror of the record-framing conservation law
+(`Tls.Record.Laws.decodeStep_conservation`). -/
+private theorem takeHandshake?_conservation {buffered rest : ByteArray}
+    {message : Handshake.Message}
+    (h : takeHandshake? buffered = .ok (some (message, rest))) :
+    message.encoded ++ rest = buffered := by
+  unfold takeHandshake? at h
+  split at h
+  · simp at h
+  · split at h
+    · simp at h
+    · rename_i hcomplete
+      split at h
+      · simp at h
+      · rename_i decoded hdec
+        simp only [Except.ok.injEq, Option.some.injEq, Prod.mk.injEq] at h
+        rw [← h.1, ← h.2, Handshake.decode_encoded (liftHandshake_ok hdec),
+          ByteArray.extract_append_extract,
+          Nat.min_eq_left (Nat.zero_le _), Nat.max_eq_right (by omega)]
+        exact ByteArray.extract_zero_size
+
 private def constantTimeEq (left right : ByteArray) : Bool :=
   if left.size != right.size then
     false

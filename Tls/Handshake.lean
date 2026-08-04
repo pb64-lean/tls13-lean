@@ -125,26 +125,31 @@ def remaining (r : Reader) : Nat :=
 def atEnd (r : Reader) : Bool :=
   r.offset == r.bytes.size
 
-def take (r : Reader) (n : Nat) : Except String (ByteArray × Reader) := do
+-- `take`, `readUInt8`, and `readUInt24` are written as pure `if`/`match`
+-- chains (not `do`) so `Tls.Handshake.decode_encoded` below can reason about
+-- them by case analysis.
+def take (r : Reader) (n : Nat) : Except String (ByteArray × Reader) :=
   if r.offset + n > r.bytes.size then
-    throw s!"truncated input at offset {r.offset}: need {n} bytes, have {r.remaining}"
-  let stop := r.offset + n
-  pure (r.bytes.extract r.offset stop, { r with offset := stop })
+    .error s!"truncated input at offset {r.offset}: need {n} bytes, have {r.remaining}"
+  else
+    .ok (r.bytes.extract r.offset (r.offset + n), { r with offset := r.offset + n })
 
-def readUInt8 (r : Reader) : Except String (UInt8 × Reader) := do
-  let (bytes, r) ← r.take 1
-  pure (bytes.get! 0, r)
+def readUInt8 (r : Reader) : Except String (UInt8 × Reader) :=
+  match r.take 1 with
+  | .error e => .error e
+  | .ok (bytes, r) => .ok (bytes.get! 0, r)
 
 def readUInt16 (r : Reader) : Except String (UInt16 × Reader) := do
   let (bytes, r) ← r.take 2
   let n := (bytes.get! 0).toUInt16 <<< 8 ||| (bytes.get! 1).toUInt16
   pure (n, r)
 
-def readUInt24 (r : Reader) : Except String (Nat × Reader) := do
-  let (bytes, r) ← r.take 3
-  let n := (bytes.get! 0).toNat <<< 16 |||
-    (bytes.get! 1).toNat <<< 8 ||| (bytes.get! 2).toNat
-  pure (n, r)
+def readUInt24 (r : Reader) : Except String (Nat × Reader) :=
+  match r.take 3 with
+  | .error e => .error e
+  | .ok (bytes, r) =>
+      .ok ((bytes.get! 0).toNat <<< 16 |||
+        (bytes.get! 1).toNat <<< 8 ||| (bytes.get! 2).toNat, r)
 
 def readUInt32 (r : Reader) : Except String (UInt32 × Reader) := do
   let (bytes, r) ← r.take 4
@@ -184,22 +189,112 @@ def frame (msgType : UInt8) (body : ByteArray) : Except String Message := do
   pure { msgType, body, encoded }
 
 /-- Decode the first complete handshake message and return unconsumed bytes. -/
-def decodeOne (bytes : ByteArray) : Except String (Message × ByteArray) := do
-  let start : Reader := { bytes }
-  let (msgType, r) ← start.readUInt8
-  let (len, r) ← r.readUInt24
-  let (body, r) ← r.take len
-  let consumed := r.offset
-  let encoded := bytes.extract 0 consumed
-  let rest := bytes.extract consumed bytes.size
-  pure ({ msgType, body, encoded }, rest)
+def decodeOne (bytes : ByteArray) : Except String (Message × ByteArray) :=
+  match ({ bytes } : Reader).readUInt8 with
+  | .error e => .error e
+  | .ok (msgType, r) =>
+    match r.readUInt24 with
+    | .error e => .error e
+    | .ok (len, r) =>
+      match r.take len with
+      | .error e => .error e
+      | .ok (body, r) =>
+          .ok ({ msgType, body, encoded := bytes.extract 0 r.offset },
+            bytes.extract r.offset bytes.size)
 
 /-- Decode exactly one framed handshake message. -/
-def decode (bytes : ByteArray) : Except String Message := do
-  let (msg, rest) ← decodeOne bytes
-  unless rest.isEmpty do
-    throw s!"handshake message has {rest.size} trailing bytes"
-  pure msg
+def decode (bytes : ByteArray) : Except String Message :=
+  match decodeOne bytes with
+  | .error e => .error e
+  | .ok (msg, rest) =>
+      if rest.isEmpty then
+        .ok msg
+      else
+        .error s!"handshake message has {rest.size} trailing bytes"
+
+/-! Retention laws: a decoded message's `encoded` field holds exactly the
+input bytes, so appending it to a transcript never re-encodes. -/
+
+private theorem take_ok {r r' : Reader} {n : Nat} {b : ByteArray}
+    (h : r.take n = .ok (b, r')) :
+    r'.bytes = r.bytes ∧ r'.offset = r.offset + n ∧ r'.offset ≤ r.bytes.size := by
+  unfold Reader.take at h
+  split at h
+  · cases h
+  · rename_i hle
+    simp only [Except.ok.injEq, Prod.mk.injEq] at h
+    rw [← h.2]
+    exact ⟨rfl, rfl, show r.offset + n ≤ r.bytes.size by omega⟩
+
+private theorem readUInt8_ok {r r' : Reader} {v : UInt8}
+    (h : r.readUInt8 = .ok (v, r')) :
+    r'.bytes = r.bytes ∧ r'.offset = r.offset + 1 ∧ r'.offset ≤ r.bytes.size := by
+  unfold Reader.readUInt8 at h
+  split at h
+  · cases h
+  · rename_i b r'' htake
+    simp only [Except.ok.injEq, Prod.mk.injEq] at h
+    rw [← h.2]
+    exact take_ok htake
+
+private theorem readUInt24_ok {r r' : Reader} {n : Nat}
+    (h : r.readUInt24 = .ok (n, r')) :
+    r'.bytes = r.bytes ∧ r'.offset = r.offset + 3 ∧ r'.offset ≤ r.bytes.size := by
+  unfold Reader.readUInt24 at h
+  split at h
+  · cases h
+  · rename_i b r'' htake
+    simp only [Except.ok.injEq, Prod.mk.injEq] at h
+    rw [← h.2]
+    exact take_ok htake
+
+private theorem decodeOne_ok {bytes rest : ByteArray} {msg : Message}
+    (h : decodeOne bytes = .ok (msg, rest)) :
+    ∃ consumed, consumed ≤ bytes.size ∧
+      msg.encoded = bytes.extract 0 consumed ∧
+      rest = bytes.extract consumed bytes.size := by
+  unfold decodeOne at h
+  split at h
+  · cases h
+  · rename_i msgType r1 h1
+    split at h
+    · cases h
+    · rename_i len r2 h2
+      split at h
+      · cases h
+      · rename_i body r3 h3
+        simp only [Except.ok.injEq, Prod.mk.injEq] at h
+        refine ⟨r3.offset, ?_, ?_, ?_⟩
+        · have hb2 : r2.bytes = bytes := by
+            rw [(readUInt24_ok h2).1, (readUInt8_ok h1).1]
+          rw [← hb2]
+          exact (take_ok h3).2.2
+        · rw [← h.1]
+        · rw [← h.2]
+
+/-- A successfully decoded handshake message retains exactly its input bytes
+in `encoded`. -/
+theorem decode_encoded {bytes : ByteArray} {msg : Message}
+    (h : decode bytes = .ok msg) : msg.encoded = bytes := by
+  unfold decode at h
+  split at h
+  · cases h
+  · rename_i m rest hone
+    split at h
+    · rename_i hempty
+      cases h
+      obtain ⟨consumed, hle, henc, hrest⟩ := decodeOne_ok hone
+      have hrest0 : rest = ByteArray.empty := by
+        simpa [ByteArray.isEmpty] using hempty
+      have hsize : rest.size = 0 := by
+        rw [hrest0]
+        rfl
+      have hconsumed : consumed = bytes.size := by
+        rw [hrest, ByteArray.size_extract] at hsize
+        omega
+      rw [henc, hconsumed]
+      exact ByteArray.extract_zero_size
+    · cases h
 
 structure Extension where
   extensionType : UInt16

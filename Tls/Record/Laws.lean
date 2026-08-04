@@ -1,6 +1,9 @@
 module
 
 public import Tls.Record
+-- The open∘seal law quantifies over the opaque AEAD binding, so its statement
+-- names the HACL* functions.
+public import HaclStar.Aead
 import all Tls.Record
 import Std.Tactic.BVDecide
 public meta import Std.Tactic.BVDecide.Reflect
@@ -771,6 +774,313 @@ theorem TrafficKeys.seq_update {keys keys' : TrafficKeys}
       rw [hs] at h
       rw [except_bind_ok] at h
       exact seq_deriveTrafficKeys h
+
+/-! ## Seal and open
+
+Laws about record protection. The AEAD itself is an opaque HACL* FFI
+binding, so the open∘seal identity is stated parametrically: *given* that
+the binding inverts on identical key, nonce, and additional data, `open`
+recovers exactly what `seal` protected, and both directions advance the
+sequence number identically. -/
+
+/-- No TLS content-type byte is zero, so the inner content type is never
+mistaken for padding. -/
+theorem ContentType.toUInt8_ne_zero (ct : ContentType) : ct.toUInt8 ≠ 0 := by
+  cases ct <;> decide
+
+theorem size_zeroBytes (count : Nat) : (zeroBytes count).size = count := by
+  induction count with
+  | zero => rfl
+  | succ n ih => simp [zeroBytes, ByteArray.size_push, ih]
+
+theorem get!_zeroBytes {count i : Nat} (h : i < count) :
+    (zeroBytes count).get! i = 0 := by
+  induction count with
+  | zero => omega
+  | succ n ih =>
+      show ((zeroBytes n).push 0).get! i = 0
+      rw [get!_push (by rw [size_zeroBytes]; omega)]
+      rcases Nat.lt_or_ge i n with hi | hi
+      · rw [if_pos (by rw [size_zeroBytes]; exact hi)]
+        exact ih hi
+      · rw [if_neg (by rw [size_zeroBytes]; omega)]
+
+theorem size_innerPlaintext (ct : ContentType) (fragment : ByteArray)
+    (paddingLength : Nat) :
+    (innerPlaintext ct fragment paddingLength).size =
+      fragment.size + 1 + paddingLength := by
+  simp [innerPlaintext, ByteArray.size_append, ByteArray.size_push,
+    size_zeroBytes]
+
+private theorem get!_append_right {a b : ByteArray} {i : Nat}
+    (h1 : a.size ≤ i) (h2 : i < a.size + b.size) :
+    (a ++ b).get! i = b.get! (i - a.size) := by
+  rw [get!_eq_getElem (by rw [ByteArray.size_append]; omega),
+    get!_eq_getElem (by omega),
+    ByteArray.getElem_append_right h1]
+
+/-- The inner content-type byte sits directly after the content. -/
+private theorem get!_innerPlaintext_type (ct : ContentType)
+    (fragment : ByteArray) (paddingLength : Nat) :
+    (innerPlaintext ct fragment paddingLength).get! fragment.size =
+      ct.toUInt8 := by
+  unfold innerPlaintext
+  rw [get!_append_left (by rw [ByteArray.size_push]; omega),
+    get!_push (by omega), if_neg (by omega)]
+
+/-- Every byte after the inner content type is zero padding. -/
+private theorem get!_innerPlaintext_pad {ct : ContentType}
+    {fragment : ByteArray} {paddingLength i : Nat}
+    (hlo : fragment.size + 1 ≤ i) (hhi : i < fragment.size + 1 + paddingLength) :
+    (innerPlaintext ct fragment paddingLength).get! i = 0 := by
+  unfold innerPlaintext
+  rw [get!_append_right (by rw [ByteArray.size_push]; omega)
+    (by rw [ByteArray.size_push, size_zeroBytes]; omega)]
+  rw [ByteArray.size_push]
+  exact get!_zeroBytes (by omega)
+
+private theorem lastNonZero_innerPlaintext (ct : ContentType)
+    (fragment : ByteArray) (paddingLength : Nat) :
+    ∀ k, k ≤ paddingLength →
+      lastNonZero (innerPlaintext ct fragment paddingLength)
+          (fragment.size + 1 + k) =
+        some fragment.size := by
+  intro k
+  induction k with
+  | zero =>
+      intro _
+      show lastNonZero _ (fragment.size + 1) = _
+      simp only [lastNonZero, get!_innerPlaintext_type]
+      rw [if_pos (by
+        cases ct <;> decide)]
+  | succ n ih =>
+      intro hk
+      show lastNonZero (innerPlaintext ct fragment paddingLength)
+        ((fragment.size + 1 + n) + 1) = some fragment.size
+      simp only [lastNonZero]
+      rw [get!_innerPlaintext_pad (by omega) (by omega),
+        if_neg (by decide)]
+      exact ih (by omega)
+
+/-- The padding scan finds exactly the inner content-type position. -/
+theorem findInnerContentType_innerPlaintext (ct : ContentType)
+    (fragment : ByteArray) (paddingLength : Nat) :
+    findInnerContentType (innerPlaintext ct fragment paddingLength) =
+      some fragment.size := by
+  unfold findInnerContentType
+  rw [size_innerPlaintext]
+  exact lastNonZero_innerPlaintext ct fragment paddingLength paddingLength
+    (Nat.le_refl paddingLength)
+
+private theorem get!_extract {a : ByteArray} {start stop i : Nat}
+    (hstop : stop ≤ a.size) (h : i < stop - start) :
+    (a.extract start stop).get! i = a.get! (start + i) := by
+  have hsz : i < (a.extract start stop).size := by
+    rw [ByteArray.size_extract]
+    omega
+  rw [get!_eq_getElem hsz, ByteArray.getElem_extract,
+    get!_eq_getElem (show start + i < a.size by omega)]
+
+/-- Truncating the inner plaintext at the content-type position recovers the
+original fragment. -/
+private theorem extract_innerPlaintext (ct : ContentType)
+    (fragment : ByteArray) (paddingLength : Nat) :
+    (innerPlaintext ct fragment paddingLength).extract 0 fragment.size =
+      fragment := by
+  apply ext_get!
+  · rw [ByteArray.size_extract, size_innerPlaintext]
+    omega
+  · intro i hi
+    have hi' : i < fragment.size := by
+      rw [ByteArray.size_extract, size_innerPlaintext] at hi
+      omega
+    have hstop : fragment.size ≤ (innerPlaintext ct fragment paddingLength).size := by
+      rw [size_innerPlaintext]
+      omega
+    rw [get!_extract hstop (by omega), Nat.zero_add]
+    unfold innerPlaintext
+    rw [get!_append_left (by rw [ByteArray.size_push]; omega),
+      get!_push (by omega), if_pos hi']
+
+/-- **`seal` advances the sequence number exactly once** and preserves the
+secret, key, and IV: the returned traffic state is the input with `seq`
+incremented and nothing else changed. -/
+theorem seal_keys {keys next : TrafficKeys} {contentType : ContentType}
+    {fragment wire : ByteArray} {paddingLength : Nat}
+    (h : «seal» keys contentType fragment paddingLength = .ok (next, wire)) :
+    next = { keys with seq := keys.seq + 1 } := by
+  unfold «seal» at h
+  split at h
+  · cases h
+  · split at h
+    · cases h
+    · split at h
+      · cases h
+      · split at h
+        · cases h
+        · rename_i nextKeys hadv
+          split at h
+          · cases h
+          · split at h
+            · cases h
+            · split at h
+              · cases h
+              · simp only [Except.ok.injEq, Prod.mk.injEq] at h
+                rw [← h.1]
+                exact (advance_ok_iff.mp hadv).2
+
+theorem seal_seq {keys next : TrafficKeys} {contentType : ContentType}
+    {fragment wire : ByteArray} {paddingLength : Nat}
+    (h : «seal» keys contentType fragment paddingLength = .ok (next, wire)) :
+    next.seq = keys.seq + 1 := by
+  rw [seal_keys h]
+
+theorem seal_key_eq {keys next : TrafficKeys} {contentType : ContentType}
+    {fragment wire : ByteArray} {paddingLength : Nat}
+    (h : «seal» keys contentType fragment paddingLength = .ok (next, wire)) :
+    next.key = keys.key := by
+  rw [seal_keys h]
+
+theorem seal_iv_eq {keys next : TrafficKeys} {contentType : ContentType}
+    {fragment wire : ByteArray} {paddingLength : Nat}
+    (h : «seal» keys contentType fragment paddingLength = .ok (next, wire)) :
+    next.iv = keys.iv := by
+  rw [seal_keys h]
+
+theorem seal_secret_eq {keys next : TrafficKeys} {contentType : ContentType}
+    {fragment wire : ByteArray} {paddingLength : Nat}
+    (h : «seal» keys contentType fragment paddingLength = .ok (next, wire)) :
+    next.secret = keys.secret := by
+  rw [seal_keys h]
+
+/-- **`open` inverts `seal`, modulo the opaque AEAD.** `haead` states that
+the HACL* binding round-trips on identical key, nonce, and additional data —
+it is an `@[extern] opaque` FFI import, so this is the precise boundary of
+what Lean can know about it. Under that assumption, a successful `seal`
+produced the wire encoding of a single well-formed TLSCiphertext record, and
+`open` under the same initial keys returns the original content type,
+fragment, and padding length together with the identically advanced traffic
+state. -/
+theorem open_seal
+    (haead : ∀ key nonce aad plaintext,
+      HaclStar.ChaCha20Poly1305.decrypt key nonce aad
+          (HaclStar.ChaCha20Poly1305.encrypt key nonce aad plaintext) =
+        some plaintext)
+    {keys next : TrafficKeys} {contentType : ContentType}
+    {fragment wire : ByteArray} {paddingLength : Nat}
+    (h : «seal» keys contentType fragment paddingLength = .ok (next, wire)) :
+    ∃ ciphertext : ByteArray,
+      wire = encodeHeader .applicationData legacyRecordVersion
+          ciphertext.size ++ ciphertext ∧
+      RawRecord.WellFormed ⟨.applicationData, legacyRecordVersion, ciphertext⟩ ∧
+      «open» keys ⟨.applicationData, legacyRecordVersion, ciphertext⟩ =
+        .ok (next, { contentType, fragment, paddingLength }) := by
+  unfold «seal» at h
+  split at h
+  · cases h
+  · rename_i u hval
+    split at h
+    · cases h
+    · rename_i hfrag
+      split at h
+      · cases h
+      · rename_i hinnerLen
+        split at h
+        · cases h
+        · rename_i nextKeys hadv
+          split at h
+          · cases h
+          · rename_i hctLen
+            split at h
+            · cases h
+            · rename_i nonce hnonce
+              split at h
+              · cases h
+              · rename_i hsize
+                simp only [Except.ok.injEq, Prod.mk.injEq] at h
+                obtain ⟨hnext, hwire⟩ := h
+                have hcs : (sealedCiphertext keys contentType fragment
+                    paddingLength nonce).size =
+                    fragment.size + 1 + paddingLength + aeadTagLength :=
+                  Decidable.of_not_not hsize
+                refine ⟨sealedCiphertext keys contentType fragment
+                  paddingLength nonce, ?_, ?_, ?_⟩
+                · rw [← hwire, hcs]
+                · show aeadTagLength + 1 ≤
+                      (sealedCiphertext keys contentType fragment paddingLength
+                        nonce).size ∧
+                    (sealedCiphertext keys contentType fragment paddingLength
+                      nonce).size ≤ maxCiphertextLength
+                  rw [hcs]
+                  exact ⟨by omega, Nat.le_of_not_lt hctLen⟩
+                · have hdec : HaclStar.ChaCha20Poly1305.decrypt keys.key nonce
+                      (RawRecord.header ⟨.applicationData, legacyRecordVersion,
+                        sealedCiphertext keys contentType fragment paddingLength
+                          nonce⟩)
+                      (sealedCiphertext keys contentType fragment paddingLength
+                        nonce) =
+                      some (innerPlaintext contentType fragment
+                        paddingLength) := by
+                    rw [show RawRecord.header ⟨.applicationData,
+                        legacyRecordVersion, sealedCiphertext keys contentType
+                          fragment paddingLength nonce⟩ =
+                        encodeHeader .applicationData legacyRecordVersion
+                          (sealedCiphertext keys contentType fragment
+                            paddingLength nonce).size from rfl]
+                    rw [hcs]
+                    rw [show sealedCiphertext keys contentType fragment
+                        paddingLength nonce =
+                        HaclStar.ChaCha20Poly1305.encrypt keys.key nonce
+                          (encodeHeader .applicationData legacyRecordVersion
+                            (fragment.size + 1 + paddingLength +
+                              aeadTagLength))
+                          (innerPlaintext contentType fragment paddingLength)
+                      from rfl]
+                    exact haead keys.key nonce _ _
+                  have hg_short : ¬(fragment.size + 1 + paddingLength +
+                      aeadTagLength < aeadTagLength + 1) := by
+                    omega
+                  have hsub : fragment.size + 1 + paddingLength +
+                      aeadTagLength - aeadTagLength =
+                      fragment.size + 1 + paddingLength := by
+                    omega
+                  have hpad : fragment.size + 1 + paddingLength -
+                      fragment.size - 1 = paddingLength := by
+                    omega
+                  unfold «open»
+                  simp only [hval, hadv, hnonce, hdec, hcs, hnext, hsub, hpad,
+                    hctLen, hg_short, hinnerLen, hfrag,
+                    size_innerPlaintext, findInnerContentType_innerPlaintext,
+                    get!_innerPlaintext_type, ContentType.ofUInt8?_toUInt8,
+                    extract_innerPlaintext]
+                  simp
+                  decide
+
+/-- **Record-layer round trip**: the wire bytes of a successful `seal` frame
+back (via `decodeStep`) as exactly one record with no residual, and that
+record `open`s — under the AEAD round-trip assumption — to the original
+plaintext with the identically advanced keys. -/
+theorem decodeStep_seal_open
+    (haead : ∀ key nonce aad plaintext,
+      HaclStar.ChaCha20Poly1305.decrypt key nonce aad
+          (HaclStar.ChaCha20Poly1305.encrypt key nonce aad plaintext) =
+        some plaintext)
+    {keys next : TrafficKeys} {contentType : ContentType}
+    {fragment wire : ByteArray} {paddingLength : Nat}
+    (h : «seal» keys contentType fragment paddingLength = .ok (next, wire)) :
+    ∃ record : RawRecord,
+      decodeStep wire = .ok (some (record, ByteArray.empty)) ∧
+      «open» keys record =
+        .ok (next, { contentType, fragment, paddingLength }) := by
+  obtain ⟨ciphertext, hwire, hwf, hopen⟩ := open_seal haead h
+  refine ⟨⟨.applicationData, legacyRecordVersion, ciphertext⟩, ?_, hopen⟩
+  have hencode : wire =
+      RawRecord.encode ⟨.applicationData, legacyRecordVersion, ciphertext⟩ ++
+        ByteArray.empty := by
+    rw [ByteArray.append_empty, hwire]
+    rfl
+  rw [hencode]
+  exact decodeStep_encode_append ByteArray.empty hwf
 
 end Record
 end Tls

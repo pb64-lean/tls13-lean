@@ -349,80 +349,126 @@ def advance (keys : TrafficKeys) : Except Error TrafficKeys := do
     throw .sequenceExhausted
   pure { keys with seq := keys.seq + 1 }
 
-private def zeroBytes (count : Nat) : ByteArray := Id.run do
-  let mut out := ByteArray.empty
-  for _ in [0:count] do
-    out := out.push 0
-  return out
+/-- `count` zero bytes. Structural recursion so proofs can compute with it. -/
+@[expose] def zeroBytes : Nat → ByteArray
+  | 0 => ByteArray.empty
+  | count + 1 => (zeroBytes count).push 0
+
+/-- The encoded TLSInnerPlaintext: content, inner content type, zero padding
+(RFC 8446 §5.2). -/
+@[expose] def innerPlaintext (contentType : ContentType) (fragment : ByteArray)
+    (paddingLength : Nat) : ByteArray :=
+  (fragment.push contentType.toUInt8) ++ zeroBytes paddingLength
+
+/-- The AEAD output `seal` frames, named so `Tls.Record.Laws` can state the
+open∘seal identity parametrically over the opaque HACL* binding. (Not
+`@[expose]`d: the body mentions the privately imported HACL* binding.) -/
+def sealedCiphertext (keys : TrafficKeys) (contentType : ContentType)
+    (fragment : ByteArray) (paddingLength : Nat) (nonce : ByteArray) :
+    ByteArray :=
+  HaclStar.ChaCha20Poly1305.encrypt keys.key nonce
+    (encodeHeader .applicationData legacyRecordVersion
+      (fragment.size + 1 + paddingLength + aeadTagLength))
+    (innerPlaintext contentType fragment paddingLength)
 
 /-- Protect one TLSInnerPlaintext record. The returned traffic state has its
 sequence number advanced exactly once. `paddingLength` counts zero bytes after
-the inner content type. -/
+the inner content type. Written as a pure `match`/`if` chain so
+`Tls.Record.Laws` can reason about it by case analysis. -/
 def «seal» (keys : TrafficKeys) (contentType : ContentType) (fragment : ByteArray)
-    (paddingLength : Nat := 0) : Except Error (TrafficKeys × ByteArray) := do
-  validateKeyAndIv keys
-  if fragment.size > maxPlaintextLength then
-    throw (.plaintextTooLong fragment.size)
-  let innerLength := fragment.size + 1 + paddingLength
-  if innerLength > maxInnerPlaintextLength then
-    throw (.innerPlaintextTooLong innerLength)
-  -- Reject before encryption so a caller can never accidentally reuse the
-  -- final sequence number after failing to represent its successor.
-  let nextKeys ← advance keys
-  let inner := (fragment.push contentType.toUInt8) ++ zeroBytes paddingLength
-  let ciphertextLength := inner.size + aeadTagLength
-  if ciphertextLength > maxCiphertextLength then
-    throw (.ciphertextTooLong ciphertextLength)
-  let header := encodeHeader .applicationData legacyRecordVersion ciphertextLength
-  let nonce ← keys.nonce
-  let ciphertext :=
-    HaclStar.ChaCha20Poly1305.encrypt keys.key nonce header inner
-  unless ciphertext.size == ciphertextLength do
-    throw (.aeadOutputLengthMismatch ciphertextLength ciphertext.size)
-  pure (nextKeys, header ++ ciphertext)
+    (paddingLength : Nat := 0) : Except Error (TrafficKeys × ByteArray) :=
+  match validateKeyAndIv keys with
+  | .error e => .error e
+  | .ok _ =>
+    if fragment.size > maxPlaintextLength then
+      .error (.plaintextTooLong fragment.size)
+    else if fragment.size + 1 + paddingLength > maxInnerPlaintextLength then
+      .error (.innerPlaintextTooLong (fragment.size + 1 + paddingLength))
+    else
+      -- Reject before encryption so a caller can never accidentally reuse the
+      -- final sequence number after failing to represent its successor.
+      match advance keys with
+      | .error e => .error e
+      | .ok nextKeys =>
+        if fragment.size + 1 + paddingLength + aeadTagLength >
+            maxCiphertextLength then
+          .error (.ciphertextTooLong
+            (fragment.size + 1 + paddingLength + aeadTagLength))
+        else
+          match keys.nonce with
+          | .error e => .error e
+          | .ok nonce =>
+            if (sealedCiphertext keys contentType fragment paddingLength
+                  nonce).size ≠
+                fragment.size + 1 + paddingLength + aeadTagLength then
+              .error (.aeadOutputLengthMismatch
+                (fragment.size + 1 + paddingLength + aeadTagLength)
+                (sealedCiphertext keys contentType fragment paddingLength
+                  nonce).size)
+            else
+              .ok (nextKeys,
+                encodeHeader .applicationData legacyRecordVersion
+                    (fragment.size + 1 + paddingLength + aeadTagLength) ++
+                  sealedCiphertext keys contentType fragment paddingLength nonce)
 
-private def findInnerContentType (inner : ByteArray) : Option Nat := Id.run do
-  let mut i := inner.size
-  while i > 0 do
-    i := i - 1
-    if inner.get! i != 0 then
-      return some i
-  return none
+/-- Index of the last nonzero byte strictly below `i`, scanning backward. -/
+@[expose] def lastNonZero (inner : ByteArray) : Nat → Option Nat
+  | 0 => none
+  | i + 1 => if inner.get! i != 0 then some i else lastNonZero inner i
+
+/-- Position of the TLSInnerPlaintext content-type byte: the last nonzero
+byte, skipping the zero padding. -/
+@[expose] def findInnerContentType (inner : ByteArray) : Option Nat :=
+  lastNonZero inner inner.size
 
 /-- Authenticate and decrypt one TLSCiphertext record. The exact encoded outer
 header is supplied as AEAD additional data. Zero padding is stripped by
-searching backward for the nonzero inner content-type byte. -/
+searching backward for the nonzero inner content-type byte. Written as a pure
+`match`/`if` chain so `Tls.Record.Laws` can reason about it by case
+analysis. -/
 def «open» (keys : TrafficKeys) (record : RawRecord) :
-    Except Error (TrafficKeys × Plaintext) := do
-  validateKeyAndIv keys
-  unless record.contentType == .applicationData do
-    throw (.unsupportedContentType record.contentType.toUInt8)
-  unless record.legacyVersion == legacyRecordVersion do
-    throw (.invalidLegacyVersion record.legacyVersion)
-  if record.fragment.size > maxCiphertextLength then
-    throw (.ciphertextTooLong record.fragment.size)
-  if record.fragment.size < aeadTagLength + 1 then
-    throw (.ciphertextTooShort record.fragment.size)
-  let nextKeys ← advance keys
-  let nonce ← keys.nonce
-  let some inner :=
-      HaclStar.ChaCha20Poly1305.decrypt keys.key nonce record.header record.fragment
-    | throw .authenticationFailed
-  let expectedInnerLength := record.fragment.size - aeadTagLength
-  unless inner.size == expectedInnerLength do
-    throw (.aeadOutputLengthMismatch expectedInnerLength inner.size)
-  if inner.size > maxInnerPlaintextLength then
-    throw (.innerPlaintextTooLong inner.size)
-  let some typePos := findInnerContentType inner
-    | throw .missingInnerContentType
-  let typeByte := inner.get! typePos
-  let some contentType := ContentType.ofUInt8? typeByte
-    | throw (.unsupportedContentType typeByte)
-  let fragment := inner.extract 0 typePos
-  if fragment.size > maxPlaintextLength then
-    throw (.plaintextTooLong fragment.size)
-  let paddingLength := inner.size - typePos - 1
-  pure (nextKeys, { contentType, fragment, paddingLength })
+    Except Error (TrafficKeys × Plaintext) :=
+  match validateKeyAndIv keys with
+  | .error e => .error e
+  | .ok _ =>
+    if record.contentType != .applicationData then
+      .error (.unsupportedContentType record.contentType.toUInt8)
+    else if record.legacyVersion != legacyRecordVersion then
+      .error (.invalidLegacyVersion record.legacyVersion)
+    else if record.fragment.size > maxCiphertextLength then
+      .error (.ciphertextTooLong record.fragment.size)
+    else if record.fragment.size < aeadTagLength + 1 then
+      .error (.ciphertextTooShort record.fragment.size)
+    else
+      match advance keys with
+      | .error e => .error e
+      | .ok nextKeys =>
+        match keys.nonce with
+        | .error e => .error e
+        | .ok nonce =>
+          match HaclStar.ChaCha20Poly1305.decrypt keys.key nonce record.header
+              record.fragment with
+          | none => .error .authenticationFailed
+          | some inner =>
+            if inner.size ≠ record.fragment.size - aeadTagLength then
+              .error (.aeadOutputLengthMismatch
+                (record.fragment.size - aeadTagLength) inner.size)
+            else if inner.size > maxInnerPlaintextLength then
+              .error (.innerPlaintextTooLong inner.size)
+            else
+              match findInnerContentType inner with
+              | none => .error .missingInnerContentType
+              | some typePos =>
+                match ContentType.ofUInt8? (inner.get! typePos) with
+                | none => .error (.unsupportedContentType (inner.get! typePos))
+                | some contentType =>
+                  if (inner.extract 0 typePos).size > maxPlaintextLength then
+                    .error (.plaintextTooLong (inner.extract 0 typePos).size)
+                  else
+                    .ok (nextKeys, {
+                      contentType
+                      fragment := inner.extract 0 typePos
+                      paddingLength := inner.size - typePos - 1 })
 
 end Record
 end Tls
