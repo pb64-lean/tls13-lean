@@ -2633,5 +2633,285 @@ theorem encodeServerHello_parseHelloRetryRequest {random legacySessionIdEcho : B
     (X := random) (S := T) hbody rfl hR]
   rw [if_neg (by rw [hrand]; exact Bool.false_ne_true)]
 
+/-! ### Certificate -/
+
+private theorem encodeLength8_ok {n : Nat} {out : ByteArray}
+    (h : encodeLength8 n = .ok out) :
+    n < 2 ^ 8 ∧ out = ByteArray.empty.push (UInt8.ofNat n) := by
+  unfold encodeLength8 at h
+  obtain ⟨hc, h⟩ | ⟨hc, h⟩ := ite_ok_cases h
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+  · exact ⟨by omega, (pure_eq_ok h).symm⟩
+
+private theorem encodeVector8_ok {b out : ByteArray}
+    (h : encodeVector8 b = .ok out) :
+    b.size < 2 ^ 8 ∧ out = ByteArray.empty.push (UInt8.ofNat b.size) ++ b := by
+  unfold encodeVector8 at h
+  obtain ⟨len, hlen, h⟩ := bind_ok_ex h
+  obtain ⟨hsize, hbytes⟩ := encodeLength8_ok hlen
+  refine ⟨hsize, ?_⟩
+  rw [← pure_eq_ok h, hbytes]
+
+private theorem encodeVector24_ok {b out : ByteArray}
+    (h : encodeVector24 b = .ok out) :
+    b.size < 2 ^ 24 ∧ out = length24Bytes b.size ++ b := by
+  unfold encodeVector24 at h
+  obtain ⟨len, hlen, h⟩ := bind_ok_ex h
+  obtain ⟨hsize, hbytes⟩ := encodeLength24_ok hlen
+  refine ⟨hsize, ?_⟩
+  rw [← pure_eq_ok h, hbytes]
+
+/-- The wire image of one certificate_list entry: the DER, then an empty
+extensions vector. -/
+private def certificateEntryBytes (der : ByteArray) : ByteArray :=
+  length24Bytes der.size ++ (der ++
+    (appendUInt16 ByteArray.empty (UInt16.ofNat ByteArray.empty.size) ++
+      ByteArray.empty))
+
+/-- The wire image of a whole certificate_list. -/
+private def certificateListBytes : List ByteArray → ByteArray
+  | [] => ByteArray.empty
+  | der :: rest => certificateEntryBytes der ++ certificateListBytes rest
+
+private theorem encodeCertificateList_eq : ∀ {l : List ByteArray} {B : ByteArray},
+    encodeCertificateList l = .ok B →
+    B = certificateListBytes l ∧ (∀ der ∈ l, der.size < 2 ^ 24) ∧
+      (∀ der ∈ l, der.isEmpty = false) := by
+  intro l
+  induction l with
+  | nil =>
+    intro B h
+    refine ⟨?_, by simp, by simp⟩
+    unfold encodeCertificateList at h
+    cases h
+    rfl
+  | cons der rest ih =>
+    intro B h
+    unfold encodeCertificateList at h
+    split at h
+    · cases h
+    · rename_i hne
+      split at h
+      · cases h
+      · rename_i entry h24
+        split at h
+        · cases h
+        · rename_i noExt h16
+          split at h
+          · cases h
+          · rename_i tail htail
+            obtain ⟨hszder, hentry⟩ := encodeVector24_ok h24
+            obtain ⟨_, hnoext⟩ := encodeVector16_ok h16
+            obtain ⟨htailEq, htailSz, htailNe⟩ := ih htail
+            cases h
+            refine ⟨?_, ?_, ?_⟩
+            · rw [hentry, hnoext, htailEq]
+              show _ = certificateEntryBytes der ++ certificateListBytes rest
+              unfold certificateEntryBytes
+              simp only [ByteArray.append_assoc]
+            · intro d hd
+              rcases List.mem_cons.mp hd with rfl | hd
+              · exact hszder
+              · exact htailSz d hd
+            · intro d hd
+              rcases List.mem_cons.mp hd with rfl | hd
+              · exact Bool.eq_false_iff.mpr hne
+              · exact htailNe d hd
+
+private theorem size_certificateEntryBytes (der : ByteArray) :
+    (certificateEntryBytes der).size = 5 + der.size := by
+  unfold certificateEntryBytes
+  rw [ByteArray.size_append, ByteArray.size_append, ByteArray.size_append,
+    show (length24Bytes der.size).size = 3 from rfl,
+    show (appendUInt16 ByteArray.empty
+      (UInt16.ofNat ByteArray.empty.size)).size = 2 from rfl,
+    show ByteArray.empty.size = 0 from rfl]
+  omega
+
+private theorem parseExtensions_empty : parseExtensions ByteArray.empty = .ok #[] :=
+  parseExtensions_extensionsBytes [] (by simp) List.Pairwise.nil
+
+/-- One correctly-encoded certificate entry at the cursor advances the
+certificate_list loop by exactly its wire size. -/
+private theorem parseCertificateEntries_cons {P S der : ByteArray}
+    {entries : Array CertificateEntry}
+    (hsz : der.size < 2 ^ 24) (hne : der.isEmpty = false) :
+    parseCertificateEntries
+        (Reader.mk (P ++ (certificateEntryBytes der ++ S)) P.size) entries =
+      parseCertificateEntries
+        (Reader.mk (P ++ (certificateEntryBytes der ++ S))
+          (P ++ certificateEntryBytes der).size)
+        (entries.push { der := der, extensions := #[] }) := by
+  have hA : Reader.readVector24
+      (Reader.mk (P ++ (certificateEntryBytes der ++ S)) P.size) =
+      .ok (der, Reader.mk (P ++ (certificateEntryBytes der ++ S))
+        (P.size + 3 + der.size)) :=
+    readVector24_at' (W := P ++ (certificateEntryBytes der ++ S)) (off := P.size)
+      (P := P) (X := der)
+      (S := (appendUInt16 ByteArray.empty (UInt16.ofNat ByteArray.empty.size) ++
+        ByteArray.empty) ++ S)
+      (by unfold certificateEntryBytes; simp only [ByteArray.append_assoc]) rfl hsz
+  have hB : Reader.readVector16
+      (Reader.mk (P ++ (certificateEntryBytes der ++ S))
+        (P.size + 3 + der.size)) =
+      .ok (ByteArray.empty, Reader.mk (P ++ (certificateEntryBytes der ++ S))
+        (P.size + 3 + der.size + 2 + ByteArray.empty.size)) :=
+    readVector16_at' (W := P ++ (certificateEntryBytes der ++ S))
+      (off := P.size + 3 + der.size) (P := P ++ length24Bytes der.size ++ der)
+      (X := ByteArray.empty) (S := S)
+      (by unfold certificateEntryBytes; simp only [ByteArray.append_assoc])
+      (by rw [ByteArray.size_append, ByteArray.size_append,
+        show (length24Bytes der.size).size = 3 from rfl]) (by simp)
+  have hoff : (P ++ certificateEntryBytes der).size =
+      P.size + 3 + der.size + 2 + ByteArray.empty.size := by
+    rw [ByteArray.size_append, size_certificateEntryBytes,
+      show ByteArray.empty.size = 0 from rfl]
+    omega
+  have hnotend : ¬((Reader.mk (P ++ (certificateEntryBytes der ++ S))
+      P.size).atEnd = true) := by
+    show ¬(P.size == (P ++ (certificateEntryBytes der ++ S)).size) = true
+    rw [beq_iff_eq, ByteArray.size_append, ByteArray.size_append,
+      size_certificateEntryBytes]
+    omega
+  rw [hoff, parseCertificateEntries.eq_def, if_neg hnotend]
+  split
+  · rename_i err heq
+    rw [hA] at heq
+    cases heq
+  · rename_i d r₁ heq
+    rw [hA] at heq
+    simp only [Except.ok.injEq, Prod.mk.injEq] at heq
+    obtain ⟨rfl, rfl⟩ := heq
+    rw [if_neg (by rw [hne]; exact Bool.false_ne_true)]
+    split
+    · rename_i err heq
+      rw [hB] at heq
+      cases heq
+    · rename_i eb r₂ heq
+      rw [hB] at heq
+      simp only [Except.ok.injEq, Prod.mk.injEq] at heq
+      obtain ⟨rfl, rfl⟩ := heq
+      simp only [parseExtensions_empty]
+
+private theorem parseCertificateEntries_end {E : ByteArray} {off : Nat}
+    {entries : Array CertificateEntry} (h : off = E.size) :
+    parseCertificateEntries (Reader.mk E off) entries = .ok entries := by
+  unfold parseCertificateEntries
+  rw [if_pos]
+  show (off == E.size) = true
+  rw [h]
+  exact beq_self_eq_true E.size
+
+/-- The certificate_list loop consumes a whole encoded list, in order. -/
+private theorem parseCertificateEntries_listBytes : ∀ (l : List ByteArray)
+    (P : ByteArray) (entries : Array CertificateEntry),
+    (∀ der ∈ l, der.size < 2 ^ 24) → (∀ der ∈ l, der.isEmpty = false) →
+    parseCertificateEntries (Reader.mk (P ++ certificateListBytes l) P.size)
+        entries =
+      .ok (entries.toList ++ l.map (fun der =>
+        ({ der := der, extensions := #[] } : CertificateEntry))).toArray := by
+  intro l
+  induction l with
+  | nil =>
+    intro P entries _ _
+    rw [show certificateListBytes ([] : List ByteArray) = ByteArray.empty from rfl,
+      ByteArray.append_empty, parseCertificateEntries_end rfl, List.map_nil,
+      List.append_nil, Array.toArray_toList]
+  | cons der rest ih =>
+    intro P entries hsz hne
+    rw [show certificateListBytes (der :: rest) =
+      certificateEntryBytes der ++ certificateListBytes rest from rfl]
+    rw [parseCertificateEntries_cons (hsz der (List.mem_cons_self ..))
+      (hne der (List.mem_cons_self ..))]
+    rw [show P ++ (certificateEntryBytes der ++ certificateListBytes rest) =
+      (P ++ certificateEntryBytes der) ++ certificateListBytes rest from
+        ByteArray.append_assoc.symm]
+    rw [ih (P ++ certificateEntryBytes der)
+      (entries.push { der := der, extensions := #[] })
+      (fun d hd => hsz d (List.mem_cons_of_mem der hd))
+      (fun d hd => hne d (List.mem_cons_of_mem der hd))]
+    rw [Array.toList_push, List.append_assoc, List.map_cons]
+    rfl
+
+/-- **Parse inverts encode for Certificate**: every DER of the chain comes back
+in order, with the empty request context and empty per-entry extensions the
+encoder emitted, and the leaf first. -/
+theorem encodeCertificate_parse {leaf : ByteArray} {rest : List ByteArray}
+    {msg : Message} (h : encodeCertificate (leaf :: rest).toArray = .ok msg) :
+    parseCertificate msg = .ok
+      { requestContext := ByteArray.empty,
+        entries :=
+          ((leaf :: rest).map fun der => { der := der, extensions := #[] }).toArray,
+        leafDer := leaf, encoded := msg.encoded } := by
+  unfold encodeCertificate at h
+  split at h
+  · cases h
+  · split at h
+    · cases h
+    · rename_i list hlist
+      split at h
+      · cases h
+      · rename_i ctx hctx
+        split at h
+        · cases h
+        · rename_i v24 hv24
+          rw [List.toList_toArray] at hlist
+          obtain ⟨hlistEq, hlistSz, hlistNe⟩ := encodeCertificateList_eq hlist
+          obtain ⟨_, hctxEq⟩ := encodeVector8_ok hctx
+          obtain ⟨hv24Sz, hv24Eq⟩ := encodeVector24_ok hv24
+          obtain ⟨hlt, hmsg⟩ := frame_spec h
+          have hty : msg.msgType = certificateType := by rw [hmsg]
+          have hbody : msg.body =
+              (ByteArray.empty.push (UInt8.ofNat ByteArray.empty.size) ++
+                ByteArray.empty) ++ (length24Bytes list.size ++ list) := by
+            rw [hmsg]
+            show ctx ++ v24 = _
+            rw [hctxEq, hv24Eq]
+          have hA : Reader.readVector8 (Reader.mk msg.body 0) =
+              .ok (ByteArray.empty,
+                Reader.mk msg.body (0 + 1 + ByteArray.empty.size)) :=
+            readVector8_at' (W := msg.body) (off := 0) (P := ByteArray.empty)
+              (X := ByteArray.empty) (S := length24Bytes list.size ++ list)
+              (by rw [hbody]; simp only [ByteArray.append_assoc,
+                ByteArray.empty_append]) rfl (by simp)
+          have hB : Reader.readVector24
+              (Reader.mk msg.body (0 + 1 + ByteArray.empty.size)) =
+              .ok (list, Reader.mk msg.body
+                (0 + 1 + ByteArray.empty.size + 3 + list.size)) :=
+            readVector24_at' (W := msg.body) (off := 0 + 1 + ByteArray.empty.size)
+              (P := ByteArray.empty.push (UInt8.ofNat ByteArray.empty.size) ++
+                ByteArray.empty)
+              (X := list) (S := ByteArray.empty)
+              (by rw [hbody]; simp only [ByteArray.append_empty]) rfl hv24Sz
+          have hend : 0 + 1 + ByteArray.empty.size + 3 + list.size =
+              msg.body.size := by
+            rw [hbody, ByteArray.size_append, ByteArray.size_append,
+              ByteArray.size_append,
+              show (ByteArray.empty.push (UInt8.ofNat ByteArray.empty.size)).size
+                = 1 from rfl,
+              show (length24Bytes list.size).size = 3 from rfl,
+              show ByteArray.empty.size = 0 from rfl]
+            omega
+          have hloop : parseCertificateEntries (Reader.mk list 0) #[] =
+              .ok ((leaf :: rest).map
+                fun der => { der := der, extensions := #[] }).toArray := by
+            rw [hlistEq]
+            have := parseCertificateEntries_listBytes (leaf :: rest)
+              ByteArray.empty #[] hlistSz hlistNe
+            rw [ByteArray.empty_append] at this
+            rw [show (0 : Nat) = ByteArray.empty.size from rfl]
+            rw [this]
+            rfl
+          unfold parseCertificate
+          rw [hty, if_pos (show (certificateType == certificateType) = true from rfl)]
+          simp only [hA]
+          rw [if_pos (show ByteArray.empty.isEmpty = true from rfl)]
+          simp only [hB]
+          simp only [requireEnd_eval (context := "Certificate") hend]
+          simp only [hloop]
+          rw [if_neg (by simp)]
+          rfl
+
 end Handshake
 end Tls
