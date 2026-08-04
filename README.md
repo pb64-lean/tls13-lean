@@ -150,7 +150,15 @@ Four Bazel packages:
   and transcript; the server has the client application epoch installed and has
   consumed the expected client Finished — established by `start` and preserved
   by `feed`, `feedWithFailure`, `sealApplication`, `closeNotify`,
-  `sealFatalAlert`, and whole `run`s (`run_wellFormed`). The transition laws
+  `sealFatalAlert`, and whole `run`s (`run_wellFormed`). The server's invariant
+  carries a second, phase-indexed clause (`WellFormed.writeKeys`): from
+  `waitingClientFinished` onwards it always holds a write epoch. It has to be
+  phase-indexed rather than a bare `connected → …` because the server installs
+  its write keys one transition earlier than the client does — in
+  `completeClientHello`, since the flight it emits right there is already
+  encrypted — and it is what makes `sealApplication`, `closeNotify`,
+  `sealFatalAlert` and a KeyUpdate response total on an established
+  connection. The transition laws
   cover the rest of the state-machine list: a connection becomes established
   only by verifying the peer `Finished` (`completeServerHandshake_verified`,
   `acceptClientFinished_verified`), application data is protected only by an
