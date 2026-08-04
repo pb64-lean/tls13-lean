@@ -4042,6 +4042,85 @@ theorem parseUInt16List_uint16ListBytes (l : List UInt16) :
   rw [parseUInt16ListLoop_uint16ListBytes l ByteArray.empty #[]]
   rfl
 
+/-! ### Wire → list converse for `uint16` vectors -/
+
+/-- The wire image of a `uint16` read out of a buffer, followed by the image of
+what comes after it, is the whole remaining buffer. -/
+private theorem extract_cons_uint16 {W : ByteArray} {off : Nat} {rest : List UInt16}
+    (hle : off + 2 ≤ W.size)
+    (hext : W.extract (off + 2) W.size = uint16ListBytes rest) :
+    W.extract off W.size = uint16ListBytes
+      (((W.get! off).toUInt16 <<< 8 ||| (W.get! (off + 1)).toUInt16) :: rest) := by
+  show W.extract off W.size =
+    appendUInt16 ByteArray.empty _ ++ uint16ListBytes rest
+  rw [← hext, ← extract_two (W := W) (off := off) (e := off + 2) rfl hle,
+    ByteArray.extract_append_extract, Nat.min_eq_left (by omega),
+    Nat.max_eq_right hle]
+
+/-- Everything the `uint16`-vector loop consumed is the wire image of what it
+produced. -/
+private theorem parseUInt16ListLoop_image : ∀ (n : Nat) (W : ByteArray) (off : Nat)
+    (out res : Array UInt16),
+    W.size - off ≤ n → off ≤ W.size →
+    parseUInt16ListLoop (Reader.mk W off) out = .ok res →
+    ∃ rest, res.toList = out.toList ++ rest ∧
+      W.extract off W.size = uint16ListBytes rest := by
+  intro n
+  induction n with
+  | zero =>
+    intro W off out res hn hle h
+    have hend : off = W.size := by omega
+    rw [parseUInt16ListLoop_end (E := W) (off := off) hend] at h
+    cases h
+    exact ⟨[], by simp, by rw [hend]; exact extract_self_empty ..⟩
+  | succ n ih =>
+    intro W off out res hn hle h
+    by_cases hE : off = W.size
+    · rw [parseUInt16ListLoop_end (E := W) (off := off) hE] at h
+      cases h
+      exact ⟨[], by simp, by rw [hE]; exact extract_self_empty ..⟩
+    have hlt : off < W.size := by omega
+    rw [parseUInt16ListLoop.eq_def, if_neg (show ¬((Reader.mk W off).atEnd = true) from by
+      show ¬(off == W.size) = true
+      rw [beq_iff_eq]
+      exact hE)] at h
+    split at h
+    · cases h
+    · rename_i v r₁ h16
+      obtain ⟨hb1, ho1, hle1⟩ := readUInt16_ok h16
+      have ho1' : r₁.offset = off + 2 := ho1
+      have hle1' : r₁.offset ≤ W.size := hle1
+      rw [readUInt16_eval (b := W) (off := off) (by omega)] at h16
+      simp only [Except.ok.injEq, Prod.mk.injEq] at h16
+      obtain ⟨rfl, rfl⟩ := h16
+      obtain ⟨rest, hres, hext⟩ := ih W (off + 2) _ _ (by omega) (by omega) h
+      refine ⟨_ :: rest, ?_, extract_cons_uint16 (by omega) hext⟩
+      rw [hres, Array.toList_push, List.append_assoc]
+      rfl
+
+/-- **Wire → list converse**: every `uint16` vector body the parser accepts is
+exactly the wire image of the list it produced, so re-encoding a parsed vector
+reproduces the bytes it came from. Together with
+`parseUInt16List_uint16ListBytes` this makes the `uint16`-vector codec a
+bijection between accepted buffers and the lists they parse to. -/
+theorem parseUInt16List_image {E : ByteArray} {vs : Array UInt16}
+    (h : parseUInt16List E = .ok vs) : E = uint16ListBytes vs.toList := by
+  unfold parseUInt16List at h
+  split at h
+  · cases h
+  · obtain ⟨rest, hres, hext⟩ :=
+      parseUInt16ListLoop_image E.size E 0 #[] vs (by omega) (by omega) h
+    rw [ByteArray.extract_zero_size] at hext
+    rw [hext, hres]
+    rfl
+
+/-- **Injectivity on accepted buffers**: two `uint16` vector bodies that parse
+to the same list are byte-identical. -/
+theorem parseUInt16List_injective {E₁ E₂ : ByteArray} {vs : Array UInt16}
+    (h₁ : parseUInt16List E₁ = .ok vs) (h₂ : parseUInt16List E₂ = .ok vs) :
+    E₁ = E₂ := by
+  rw [parseUInt16List_image h₁, parseUInt16List_image h₂]
+
 /-! ### ClientHello -/
 
 private theorem except_bind_ok {α β : Type} (a : α) (f : α → Except String β) :
@@ -4402,6 +4481,136 @@ theorem parseKeyShareEntries_keyShareEntriesBytes (l : List (UInt16 × ByteArray
   rw [parseKeyShareEntriesLoop_entriesBytes l ByteArray.empty #[] #[] hsz hne
     (fun _ _ => by simp) hdistinct]
   rfl
+
+/-! ### Wire → list converse for client key_share lists
+
+A key_share entry has the same wire shape as an extension — a `uint16` tag, a
+`uint16` length and that many bytes — so the extension retention lemma
+`extract_extensionBytes` carries over unchanged. -/
+
+private theorem extensionBytes_mk (t : UInt16) (d : ByteArray) :
+    extensionBytes (Extension.mk t d) = keyShareEntryBytes t d := rfl
+
+/-- The wire image of one key_share entry read out of a buffer, followed by the
+image of what comes after it, is the whole remaining buffer. -/
+private theorem extract_cons_keyShare {W : ByteArray} {off : Nat}
+    {rest : List (UInt16 × ByteArray)}
+    (hle : off + 2 + 2 +
+      ((W.get! (off + 2)).toUInt16 <<< 8 |||
+        (W.get! (off + 2 + 1)).toUInt16).toNat ≤ W.size)
+    (hext : W.extract (off + 2 + 2 +
+        ((W.get! (off + 2)).toUInt16 <<< 8 |||
+          (W.get! (off + 2 + 1)).toUInt16).toNat) W.size =
+      keyShareEntriesBytes rest) :
+    W.extract off W.size = keyShareEntriesBytes
+      (((W.get! off).toUInt16 <<< 8 ||| (W.get! (off + 1)).toUInt16,
+        W.extract (off + 2 + 2) (off + 2 + 2 +
+          ((W.get! (off + 2)).toUInt16 <<< 8 |||
+            (W.get! (off + 2 + 1)).toUInt16).toNat)) :: rest) := by
+  have hidx : off + 2 + 1 = off + 3 := by omega
+  have hidx2 : off + 2 + 2 = off + 4 := by omega
+  rw [hidx, hidx2] at hle hext ⊢
+  show W.extract off W.size = keyShareEntryBytes _ _ ++ keyShareEntriesBytes rest
+  rw [← hext, ← extensionBytes_mk,
+    ← extract_extensionBytes (W := W) (off := off) rfl rfl hle,
+    ByteArray.extract_append_extract, Nat.min_eq_left (by omega),
+    Nat.max_eq_right (by omega)]
+
+/-- Everything the key_share loop consumed is the wire image of the entry list
+it produced. -/
+private theorem parseKeyShareEntriesLoop_image : ∀ (n : Nat) (W : ByteArray)
+    (off : Nat) (seen ids : Array UInt16) (out shares : Array ClientKeyShare),
+    W.size - off ≤ n → off ≤ W.size →
+    parseKeyShareEntriesLoop (Reader.mk W off) seen out = .ok (ids, shares) →
+    ∃ l : List (UInt16 × ByteArray),
+      ids.toList = seen.toList ++ l.map Prod.fst ∧
+      shares = knownKeySharesLoop l out ∧
+      W.extract off W.size = keyShareEntriesBytes l := by
+  intro n
+  induction n with
+  | zero =>
+    intro W off seen ids out shares hn hle h
+    have hend : off = W.size := by omega
+    rw [parseKeyShareEntriesLoop_end (E := W) (off := off) hend] at h
+    simp only [Except.ok.injEq, Prod.mk.injEq] at h
+    obtain ⟨rfl, rfl⟩ := h
+    exact ⟨[], by simp, rfl, by rw [hend]; exact extract_self_empty ..⟩
+  | succ n ih =>
+    intro W off seen ids out shares hn hle h
+    by_cases hE : off = W.size
+    · rw [parseKeyShareEntriesLoop_end (E := W) (off := off) hE] at h
+      simp only [Except.ok.injEq, Prod.mk.injEq] at h
+      obtain ⟨rfl, rfl⟩ := h
+      exact ⟨[], by simp, rfl, by rw [hE]; exact extract_self_empty ..⟩
+    have hlt : off < W.size := by omega
+    rw [parseKeyShareEntriesLoop.eq_def,
+      if_neg (show ¬((Reader.mk W off).atEnd = true) from by
+        show ¬(off == W.size) = true
+        rw [beq_iff_eq]
+        exact hE)] at h
+    split at h
+    · cases h
+    · rename_i g r₁ h16
+      obtain ⟨hb1, ho1, hle1⟩ := readUInt16_ok h16
+      have ho1' : r₁.offset = off + 2 := ho1
+      have hle1' : r₁.offset ≤ W.size := hle1
+      rw [readUInt16_eval (b := W) (off := off) (by omega)] at h16
+      simp only [Except.ok.injEq, Prod.mk.injEq] at h16
+      obtain ⟨rfl, rfl⟩ := h16
+      split at h
+      · cases h
+      · rename_i k r₂ hv
+        obtain ⟨hb2, hlo2, hle2⟩ := readVector16_ok hv
+        have hlo2' : off + 2 + 2 ≤ r₂.offset := hlo2
+        have hle2' : r₂.offset ≤ W.size := hle2
+        unfold Reader.readVector16 at hv
+        simp only [readUInt16_eval (b := W) (off := off + 2) (by omega)] at hv
+        obtain ⟨hb3, ho3, hle3⟩ := take_ok hv
+        have ho3' : r₂.offset = off + 2 + 2 +
+            ((W.get! (off + 2)).toUInt16 <<< 8 |||
+              (W.get! (off + 2 + 1)).toUInt16).toNat := ho3
+        have hLbound : off + 2 + 2 +
+            ((W.get! (off + 2)).toUInt16 <<< 8 |||
+              (W.get! (off + 2 + 1)).toUInt16).toNat ≤ W.size := by omega
+        rw [take_eval (b := W) (off := off + 2 + 2) hLbound] at hv
+        simp only [Except.ok.injEq, Prod.mk.injEq] at hv
+        obtain ⟨rfl, rfl⟩ := hv
+        split at h
+        · cases h
+        · split at h
+          · cases h
+          · obtain ⟨l, hids, hshares, hext⟩ := ih W (off + 2 + 2 +
+              ((W.get! (off + 2)).toUInt16 <<< 8 |||
+                (W.get! (off + 2 + 1)).toUInt16).toNat) _ _ _ _
+              (by omega) hLbound h
+            refine ⟨_ :: l, ?_, ?_, extract_cons_keyShare hLbound hext⟩
+            · rw [hids, Array.toList_push, List.append_assoc]
+              rfl
+            · exact hshares
+
+/-- **Wire → list converse**: every key_share block the parser accepts is
+exactly the wire image of the entry list it produced — every offered group
+identifier in order, each with the exact bytes of its key share — so
+re-encoding a parsed key_share list reproduces the bytes it came from. -/
+theorem parseKeyShareEntries_image {E : ByteArray} {ids : Array UInt16}
+    {shares : Array ClientKeyShare}
+    (h : parseKeyShareEntries E = .ok (ids, shares)) :
+    ∃ l : List (UInt16 × ByteArray),
+      ids = (l.map Prod.fst).toArray ∧ shares = knownKeyShares l ∧
+      E = keyShareEntriesBytes l := by
+  unfold parseKeyShareEntries at h
+  obtain ⟨l, hids, hshares, hext⟩ :=
+    parseKeyShareEntriesLoop_image E.size E 0 #[] ids #[] shares (by omega)
+      (by omega) h
+  rw [ByteArray.extract_zero_size] at hext
+  refine ⟨l, ?_, hshares, hext⟩
+  have hids' : ids.toList = l.map Prod.fst := by simpa using hids
+  rw [← hids', Array.toArray_toList]
+
+-- No injectivity companion: the parse result keeps only the group identifiers
+-- and the shares of groups this implementation knows, so two buffers offering
+-- the same identifiers with different key bytes for an *unknown* group parse
+-- to the same pair. The `l` returned above is what pins the bytes down.
 
 
 /-! ### ClientHello with the extensions this implementation interprets -/
