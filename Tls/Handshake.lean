@@ -1291,18 +1291,40 @@ def encodeEncryptedExtensions (alpnSelected : Option String := none) :
     extensions := extensions ++ (← encodeAlpnServerExtension protocol)
   frame encryptedExtensionsType (← encodeVector16 extensions)
 
+/-- Encode a certificate_list body: `uint24 cert ‖ uint16 extensions` per
+entry, with empty per-entry extensions. Explicit recursion (not a `for` loop)
+so the Certificate laws below can evaluate it. -/
+private def encodeCertificateList : List ByteArray → Except String ByteArray
+  | [] => .ok ByteArray.empty
+  | der :: rest =>
+    if der.isEmpty then
+      .error "server Certificate chain contains an empty entry"
+    else
+      match encodeVector24 der with
+      | .error e => .error e
+      | .ok entry =>
+        match encodeVector16 ByteArray.empty with
+        | .error e => .error e
+        | .ok noExtensions =>
+          match encodeCertificateList rest with
+          | .error e => .error e
+          | .ok tail => .ok (entry ++ noExtensions ++ tail)
+
 /-- Build a server Certificate message from a DER chain (leaf first). Uses an
 empty certificate_request_context and empty per-entry extensions. -/
-def encodeCertificate (chain : Array ByteArray) : Except String Message := do
+def encodeCertificate (chain : Array ByteArray) : Except String Message :=
   if chain.isEmpty then
-    throw "server Certificate chain must not be empty"
-  let mut list := ByteArray.empty
-  for der in chain do
-    if der.isEmpty then
-      throw "server Certificate chain contains an empty entry"
-    list := list ++ (← encodeVector24 der) ++ (← encodeVector16 ByteArray.empty)
-  let body := (← encodeVector8 ByteArray.empty) ++ (← encodeVector24 list)
-  frame certificateType body
+    .error "server Certificate chain must not be empty"
+  else
+    match encodeCertificateList chain.toList with
+    | .error e => .error e
+    | .ok list =>
+      match encodeVector8 ByteArray.empty with
+      | .error e => .error e
+      | .ok requestContext =>
+        match encodeVector24 list with
+        | .error e => .error e
+        | .ok certificateList => frame certificateType (requestContext ++ certificateList)
 
 /-- Build a CertificateVerify from a signature scheme and signature bytes. -/
 def encodeCertificateVerify (algorithm : UInt16) (signature : ByteArray) :
@@ -1617,14 +1639,15 @@ private theorem encodeCertificate_frame {chain : Array ByteArray}
     {msg : Message} (h : encodeCertificate chain = .ok msg) :
     ∃ body, frame certificateType body = .ok msg := by
   unfold encodeCertificate at h
-  obtain ⟨hc, h⟩ | ⟨hc, h⟩ := ite_ok_cases h
-  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
-    cases hu
-  · obtain ⟨_, _, h⟩ := bind_ok_ex h
-    obtain ⟨_, _, h⟩ := bind_ok_ex h
-    obtain ⟨_, _, h⟩ := bind_ok_ex h
-    obtain ⟨_, _, h⟩ := bind_ok_ex h
-    exact ⟨_, h⟩
+  split at h
+  · cases h
+  · split at h
+    · cases h
+    · split at h
+      · cases h
+      · split at h
+        · cases h
+        · exact ⟨_, h⟩
 
 private theorem encodeClientHello_frame {cfg : ClientHelloConfig}
     {msg : Message} (h : encodeClientHello cfg = .ok msg) :
