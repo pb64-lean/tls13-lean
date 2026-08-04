@@ -5526,6 +5526,18 @@ theorem parseClientHello_canonical_of_offersTls13 {msg : Message}
     rw [(parseClientHello_spec h).1 hE] at h13
     exact absurd h13 Bool.false_ne_true
 
+/-- A ClientHello that offered TLS 1.3 carried an extension block: that is where
+`supported_versions` lives. This is the side condition every canonicity
+consumer needs, discharged from a field the parser returns. -/
+theorem parseClientHello_extensions_of_offersTls13 {msg : Message}
+    {ch : ClientHello} (h : parseClientHello msg = .ok ch)
+    (h13 : ch.offersTls13 = true) : ch.extensions.isEmpty = false := by
+  cases hE : ch.extensions.isEmpty with
+  | false => rfl
+  | true =>
+    rw [(parseClientHello_spec h).1 hE] at h13
+    exact absurd h13 Bool.false_ne_true
+
 /-- **Retry comparison**: two ClientHellos whose parses agree on the random, the
 legacy session id, the cipher suites and the whole extension list have
 byte-identical bodies. This is the check RFC 8446 section 4.1.2 demands of a

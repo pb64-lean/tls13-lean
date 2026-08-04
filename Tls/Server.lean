@@ -451,7 +451,7 @@ strong as comparing the two messages byte for byte:
 `Handshake.parseClientHello_canonical` proves a parsed ClientHello re-encodes to
 the body it came from, and `checkRetryClientHello_body_eq` below turns this
 check plus an unchanged extension list into byte equality of the two bodies. -/
-private def checkRetryClientHello (first second : Handshake.ClientHello)
+def checkRetryClientHello (first second : Handshake.ClientHello)
     (group : Handshake.NamedGroup) : Except Error Unit := do
   unless second.random == first.random do
     throw (.invalidRetryClientHello "random changed")
@@ -1042,6 +1042,48 @@ def sealFatalAlert (state : State) (description : UInt8) : Except Error Output :
         throw (.internalState "missing write keys for fatal alert")
       let wireBytes ← liftRecord (Record.encodePlaintext .alert fragment)
       pure { state := { state with localClosed := true }, wireBytes }
+
+/-! ## Runs
+
+A connection is driven by a sequence of caller operations. `run` folds them
+purely, which gives the state-machine laws in `Tls.Server.Laws` a single object
+to quantify over — in particular the nonce non-reuse theorem, which is about
+everything one run of the engine protects. -/
+
+/-- One caller-driven step of a server connection. -/
+inductive Op where
+  /-- Transport bytes arrived. -/
+  | feed (chunk : ByteArray)
+  /-- Application bytes to protect and send. -/
+  | send (plaintext : ByteArray)
+  /-- Send `close_notify`. -/
+  | close
+  /-- Seal a fatal alert; the caller discards the connection afterwards. -/
+  | fatalAlert (description : UInt8)
+  deriving Inhabited
+
+def step (state : State) (op : Op) : Except Error Output :=
+  match op with
+  | .feed chunk => feed state chunk
+  | .send plaintext => sealApplication state plaintext
+  | .close => closeNotify state
+  | .fatalAlert description => sealFatalAlert state description
+
+/-- Drive a sequence of operations from `state`, concatenating produced wire
+bytes and plaintext in order. -/
+def run (state : State) (ops : List Op) : Except Error Output :=
+  match ops with
+  | [] => .ok { state }
+  | op :: rest =>
+    match step state op with
+    | .error e => .error e
+    | .ok out =>
+      match run out.state rest with
+      | .error e => .error e
+      | .ok final =>
+        .ok { final with
+          wireBytes := out.wireBytes ++ final.wireBytes
+          plaintext := out.plaintext ++ final.plaintext }
 
 end Server
 end Tls
