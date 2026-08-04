@@ -612,6 +612,14 @@ private theorem requireReadKeys_isSome {state : State}
   · rename_i hk; rw [hk]; rfl
   · cases h
 
+/-- Opening a record uses the read epoch the state carries. -/
+private theorem requireReadKeys_ok {state : State} {keys : Record.TrafficKeys}
+    (h : requireReadKeys state = .ok keys) : state.readKeys? = some keys := by
+  unfold requireReadKeys at h
+  cases hk : state.readKeys? with
+  | none => rw [hk] at h; cases h
+  | some k => rw [hk] at h; cases h; rfl
+
 /-- Protecting a record needs a write epoch, so a successful `requireWriteKeys`
 witnesses that the state holds one. -/
 private theorem requireWriteKeys_isSome {state : State}
@@ -2681,6 +2689,676 @@ theorem start_run_nonce_nodup {H : Spec.Hkdf} (hi : Implements H)
       Record.WriteRun started.state.writeKeys? out.state.writeKeys? secrets nonces ∧
         nonces.Nodup :=
   run_nonce_nodup_spec hi hinj (start_wellFormed hstart) (start_phase hstart) h
+
+/-! ## Threading the key-schedule linkage out to `feed`
+
+`processHandshakeBuffer_keySchedule` links the *whole encrypted server flight* to
+the RFC 8446 §7.1 application epochs, but `processHandshakeBuffer` is an internal
+function. `feed_keySchedule` below states the same guarantee at the API boundary
+a caller actually uses, by threading the link out through `processRecords`,
+`processRecord` and `processProtectedRecord` — the transport plumbing, which
+moves bytes and touches no key state.
+
+One thing genuinely changes on the way out. A single `feed` may carry the server
+Finished *and* a post-handshake KeyUpdate, in separate records; by the time the
+feed returns, the epochs installed at establishment may already have been rolled
+forward under `"traffic upd"`. The statement therefore concludes that the final
+epochs are `Spec.trafficIter H (…) n` — the §7.1 application secrets after `n`
+§7.2 updates, with `n = 0` exactly when no KeyUpdate followed in the same
+chunk — and keeps the §7.3 key/IV content via `TrafficKeys.ProtectsWith`, which
+is `DerivedFrom` minus the "sequence number is zero" clause that protecting a
+record legitimately breaks. -/
+
+/-- The read and write epochs both moved forward within the schedule: records
+protected or opened, and possibly some §7.2 KeyUpdates. -/
+def RolledEpochs (H : Spec.Hkdf) (before after : State) : Prop :=
+  Record.Rolled H before.readKeys? after.readKeys? ∧
+    Record.Rolled H before.writeKeys? after.writeKeys?
+
+theorem RolledEpochs.refl {H : Spec.Hkdf} (s : State) : RolledEpochs H s s :=
+  ⟨Record.Rolled.refl _, Record.Rolled.refl _⟩
+
+theorem RolledEpochs.trans {H : Spec.Hkdf} {a b c : State}
+    (h1 : RolledEpochs H a b) (h2 : RolledEpochs H b c) : RolledEpochs H a c :=
+  ⟨h1.1.trans h2.1, h1.2.trans h2.2⟩
+
+theorem RolledEpochs.of_eq {H : Spec.Hkdf} {a b : State}
+    (hr : b.readKeys? = a.readKeys?) (hw : b.writeKeys? = a.writeKeys?) :
+    RolledEpochs H a b :=
+  ⟨Record.Rolled.of_eq hr, Record.Rolled.of_eq hw⟩
+
+private theorem emitCloseNotify_rolled {H : Spec.Hkdf} {state next : State}
+    {wire : ByteArray} (h : emitCloseNotify state = .ok (next, wire)) :
+    RolledEpochs H state next := by
+  unfold emitCloseNotify at h
+  split at h
+  · cases h; exact RolledEpochs.refl _
+  · obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
+    obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
+    obtain ⟨sealedKeys, wireBytes⟩ := sealed
+    cases h
+    refine ⟨Record.Rolled.refl _, ?_⟩
+    show Record.Rolled H state.writeKeys? (some sealedKeys)
+    rw [requireWriteKeys_ok hk]
+    exact Record.Rolled.of_seal (liftRecord_ok hs)
+
+private theorem processAlert_rolled {H : Spec.Hkdf} {state next : State}
+    {fragment : ByteArray} {duringHandshake : Bool} {wire : ByteArray}
+    (h : processAlert state fragment duringHandshake = .ok (next, wire)) :
+    RolledEpochs H state next := by
+  unfold processAlert at h
+  simp only [pure_bind] at h
+  split at h
+  case isFalse => cases h
+  split at h
+  case isFalse => cases h
+  split at h
+  · split at h
+    · cases h
+    · have hw := emitCloseNotify_rolled (H := H) h
+      exact hw
+  · cases h
+
+private theorem sendKeyUpdateResponse_rolled {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {wire : ByteArray}
+    (h : sendKeyUpdateResponse state = .ok (next, wire)) :
+    RolledEpochs H state next := by
+  have hread := sendKeyUpdateResponse_readKeys h
+  unfold sendKeyUpdateResponse at h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
+  obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
+  obtain ⟨advancedKeys, wireBytes⟩ := sealed
+  obtain ⟨updatedKeys, hu, h⟩ := except_bind_ok_inv h
+  cases h
+  refine ⟨Record.Rolled.of_eq hread, ?_⟩
+  show Record.Rolled H state.writeKeys? (some updatedKeys)
+  rw [requireWriteKeys_ok hk]
+  exact (Record.Rolled.of_seal (liftRecord_ok hs)).trans
+    (Record.Rolled.of_update hi (liftRecord_ok hu))
+
+private theorem acceptKeyUpdate_rolled {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {message : Handshake.Message} {wire : ByteArray}
+    (h : acceptKeyUpdate state message = .ok (next, wire)) :
+    RolledEpochs H state next := by
+  unfold acceptKeyUpdate at h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨readKeys, hrk, h⟩ := except_bind_ok_inv h
+  obtain ⟨updatedReadKeys, hu, h⟩ := except_bind_ok_inv h
+  have hstep : RolledEpochs H state
+      { state with readKeys? := some updatedReadKeys } := by
+    refine ⟨?_, Record.Rolled.refl _⟩
+    show Record.Rolled H state.readKeys? (some updatedReadKeys)
+    rw [requireReadKeys_ok hrk]
+    exact Record.Rolled.of_update hi (liftRecord_ok hu)
+  split at h
+  · cases h; exact hstep
+  · exact hstep.trans (sendKeyUpdateResponse_rolled hi h)
+
+/-- In `connected` the only post-handshake messages the engine accepts are
+NewSessionTicket, which touches no key state, and KeyUpdate, which rolls the
+epochs forward. -/
+private theorem processHandshakeBuffer_rolled {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {wire : ByteArray}
+    (h : processHandshakeBuffer state = .ok (next, wire))
+    (hc : state.phase = .connected) : RolledEpochs H state next := by
+  unfold processHandshakeBuffer at h
+  split at h
+  · cases h
+  · cases h; exact RolledEpochs.refl _
+  · rename_i message rest htake
+    have hsize : rest.size < state.handshakeBuffered.size := takeHandshake?_size htake
+    simp only [pure_bind] at h
+    split at h
+    · cases h
+    · rename_i hph
+      have hph' : state.phase = Phase.waitingEncryptedExtensions := hph
+      rw [hc] at hph'; cases hph'
+    · rename_i hph
+      have hph' : state.phase = Phase.waitingCertificate := hph
+      rw [hc] at hph'; cases hph'
+    · rename_i hph
+      have hph' : state.phase = Phase.waitingCertificateVerify := hph
+      rw [hc] at hph'; cases hph'
+    · rename_i hph
+      have hph' : state.phase = Phase.waitingServerFinished := hph
+      rw [hc] at hph'; cases hph'
+    · split at h
+      · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        have hw := processHandshakeBuffer_rolled hi h hc
+        exact hw
+      · split at h
+        · split at h
+          · cases h
+          · rename_i stateK wireK hacc
+            split at h
+            · cases h
+            · rename_i stateF moreWire hnext
+              have hbuf : stateK.handshakeBuffered.size <
+                  state.handshakeBuffered.size := by
+                rw [acceptKeyUpdate_buffered hacc]; exact hsize
+              have hck : stateK.phase = Phase.connected := by
+                rw [acceptKeyUpdate_phase hacc]; exact hc
+              have h1 := acceptKeyUpdate_rolled hi hacc
+              have h2 := processHandshakeBuffer_rolled hi hnext hck
+              cases h
+              exact h1.trans h2
+        · cases h
+  termination_by state.handshakeBuffered.size
+  decreasing_by
+    all_goals first
+      | exact hsize
+      | exact hbuf
+
+private theorem processProtectedRecord_rolled {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {record : Record.RawRecord} {plain wire : ByteArray}
+    (h : processProtectedRecord state record = .ok (next, plain, wire))
+    (hc : state.phase = .connected) : RolledEpochs H state next := by
+  unfold processProtectedRecord at h
+  simp only [pure_bind] at h
+  obtain ⟨readKeys, hrk, h⟩ := except_bind_ok_inv h
+  obtain ⟨opened, hop, h⟩ := except_bind_ok_inv h
+  obtain ⟨nextReadKeys, plaintext⟩ := opened
+  have hstep : RolledEpochs H state
+      { state with readKeys? := some nextReadKeys } := by
+    refine ⟨?_, Record.Rolled.refl _⟩
+    show Record.Rolled H state.readKeys? (some nextReadKeys)
+    rw [requireReadKeys_ok hrk]
+    exact Record.Rolled.of_open (liftRecord_ok hop)
+  refine hstep.trans ?_
+  split at h
+  · obtain ⟨_, h⟩ := if_throw_ok h
+    split at h
+    · obtain ⟨_, h⟩ := unless_ok h
+      cases h
+      exact RolledEpochs.refl _
+    · obtain ⟨pair, hpb, h⟩ := except_bind_ok_inv h
+      obtain ⟨stateH, wireH⟩ := pair
+      cases h
+      have hw := processHandshakeBuffer_rolled hi hpb hc
+      exact hw
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨pair, hpa, h⟩ := except_bind_ok_inv h
+      obtain ⟨stateA, wireA⟩ := pair
+      cases h
+      have hw := processAlert_rolled (H := H) hpa
+      exact hw
+    · cases h
+  · rename_i hph
+    have hph' : ((({ state with readKeys? := some nextReadKeys } : State).phase
+        == Phase.connected)) = false := Bool.eq_false_iff.mpr hph
+    have : (state.phase == Phase.connected) = false := hph'
+    rw [hc] at this
+    exact absurd this (by decide)
+
+private theorem processRecord_rolled {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {record : Record.RawRecord} {plain wire : ByteArray}
+    (h : processRecord state record = .ok (next, plain, wire))
+    (hc : state.phase = .connected) : RolledEpochs H state next := by
+  unfold processRecord at h
+  simp only [pure_bind] at h
+  split at h
+  · rename_i hph
+    have hph' : state.phase = Phase.waitingServerHello := hph
+    rw [hc] at hph'; cases hph'
+  · rename_i hph
+    have hph' : state.phase = Phase.waitingEncryptedExtensions := hph
+    rw [hc] at hph'; cases hph'
+  · rename_i hph
+    have hph' : state.phase = Phase.waitingCertificate := hph
+    rw [hc] at hph'; cases hph'
+  · rename_i hph
+    have hph' : state.phase = Phase.waitingCertificateVerify := hph
+    rw [hc] at hph'; cases hph'
+  · rename_i hph
+    have hph' : state.phase = Phase.waitingServerFinished := hph
+    rw [hc] at hph'; cases hph'
+  · split at h
+    · exact processProtectedRecord_rolled hi h hc
+    · cases h
+
+private theorem completeServerHandshake_phase {state next : State}
+    {message : Handshake.Message} {wire : ByteArray}
+    (h : completeServerHandshake state message = .ok (next, wire)) :
+    next.phase = .connected := by
+  unfold completeServerHandshake at h
+  simp only [pure_bind] at h
+  obtain ⟨finished, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverSecret, _, h⟩ := except_bind_ok_inv h
+  split at h
+  case isFalse => cases h
+  obtain ⟨handshake, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientApplicationKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverApplicationKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientHandshakeSecret, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientFinished, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨handshakeWriteKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨sealed, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨advancedKeys, finishedWire⟩ := sealed
+  split at h
+  · cases h; rfl
+  · obtain ⟨compatibilityWire, _, h⟩ := except_bind_ok_inv h
+    cases h
+    rfl
+
+private theorem emitCloseNotify_handshakeSecret {state next : State} {wire : ByteArray}
+    (h : emitCloseNotify state = .ok (next, wire)) :
+    next.handshakeSecret? = state.handshakeSecret? ∧ next.phase = state.phase := by
+  unfold emitCloseNotify at h
+  split at h
+  · cases h; exact ⟨rfl, rfl⟩
+  · obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
+    obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
+    obtain ⟨sealedKeys, wireBytes⟩ := sealed
+    cases h
+    exact ⟨rfl, rfl⟩
+
+private theorem processAlert_handshakeSecret {state next : State}
+    {fragment : ByteArray} {duringHandshake : Bool} {wire : ByteArray}
+    (h : processAlert state fragment duringHandshake = .ok (next, wire)) :
+    next.handshakeSecret? = state.handshakeSecret? := by
+  unfold processAlert at h
+  simp only [pure_bind] at h
+  split at h
+  case isFalse => cases h
+  split at h
+  case isFalse => cases h
+  split at h
+  · split at h
+    · cases h
+    · exact (emitCloseNotify_handshakeSecret h).1
+  · cases h
+
+/-- No transition ever returns to `waitingServerHello`: the phase only moves
+forward. -/
+private theorem processHandshakeBuffer_phase_ne {state next : State}
+    {wire : ByteArray} (h : processHandshakeBuffer state = .ok (next, wire))
+    (hph : state.phase ≠ .waitingServerHello) :
+    next.phase ≠ .waitingServerHello := by
+  unfold processHandshakeBuffer at h
+  split at h
+  · cases h
+  · cases h; exact hph
+  · rename_i message rest htake
+    have hsize : rest.size < state.handshakeBuffered.size := takeHandshake?_size htake
+    simp only [pure_bind] at h
+    split at h
+    · cases h
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+      obtain ⟨alpn, _, h⟩ := except_bind_ok_inv h
+      split at h
+      · obtain ⟨_, h⟩ := unless_ok h
+        exact processHandshakeBuffer_phase_ne h (by intro hc; cases hc)
+      · exact processHandshakeBuffer_phase_ne h (by intro hc; cases hc)
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+      exact processHandshakeBuffer_phase_ne h (by intro hc; cases hc)
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+      split at h
+      · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        obtain ⟨_, h⟩ := unless_ok h
+        obtain ⟨_, h⟩ := unless_ok h
+        exact processHandshakeBuffer_phase_ne h (by intro hc; cases hc)
+      · cases h
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨_, h⟩ := unless_ok h
+      rw [completeServerHandshake_phase h]
+      intro hc; cases hc
+    · rename_i hph'
+      have hc : state.phase = Phase.connected := hph'
+      split at h
+      · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        exact processHandshakeBuffer_phase_ne h hph
+      · split at h
+        · split at h
+          · cases h
+          · rename_i stateK wireK hacc
+            split at h
+            · cases h
+            · rename_i stateF moreWire hnext
+              have hbuf : stateK.handshakeBuffered.size <
+                  state.handshakeBuffered.size := by
+                rw [acceptKeyUpdate_buffered hacc]; exact hsize
+              have hck : stateK.phase ≠ Phase.waitingServerHello := by
+                rw [acceptKeyUpdate_phase hacc, hc]; intro hx; cases hx
+              have h2 := processHandshakeBuffer_phase_ne hnext hck
+              cases h
+              exact h2
+        · cases h
+  termination_by state.handshakeBuffered.size
+  decreasing_by
+    all_goals first
+      | exact hsize
+      | exact hbuf
+
+private theorem processProtectedRecord_phase_ne {state next : State}
+    {record : Record.RawRecord} {plain wire : ByteArray}
+    (h : processProtectedRecord state record = .ok (next, plain, wire))
+    (hph : state.phase ≠ .waitingServerHello) :
+    next.phase ≠ .waitingServerHello := by
+  unfold processProtectedRecord at h
+  simp only [pure_bind] at h
+  obtain ⟨readKeys, hrk, h⟩ := except_bind_ok_inv h
+  obtain ⟨opened, hop, h⟩ := except_bind_ok_inv h
+  obtain ⟨nextReadKeys, plaintext⟩ := opened
+  split at h
+  · obtain ⟨_, h⟩ := if_throw_ok h
+    split at h
+    · obtain ⟨_, h⟩ := unless_ok h
+      cases h
+      exact hph
+    · obtain ⟨pair, hpb, h⟩ := except_bind_ok_inv h
+      obtain ⟨stateH, wireH⟩ := pair
+      cases h
+      exact processHandshakeBuffer_phase_ne hpb hph
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨pair, hpa, h⟩ := except_bind_ok_inv h
+      obtain ⟨stateA, wireA⟩ := pair
+      cases h
+      rw [processAlert_phase hpa]
+      exact hph
+    · cases h
+  · split at h
+    · obtain ⟨pair, hpb, h⟩ := except_bind_ok_inv h
+      obtain ⟨stateH, wireH⟩ := pair
+      cases h
+      exact processHandshakeBuffer_phase_ne hpb hph
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨pair, hpa, h⟩ := except_bind_ok_inv h
+      obtain ⟨stateA, wireA⟩ := pair
+      cases h
+      rw [processAlert_phase hpa]
+      exact hph
+    · cases h
+
+private theorem processRecord_phase_ne {state next : State}
+    {record : Record.RawRecord} {plain wire : ByteArray}
+    (h : processRecord state record = .ok (next, plain, wire))
+    (hph : state.phase ≠ .waitingServerHello) :
+    next.phase ≠ .waitingServerHello := by
+  unfold processRecord at h
+  simp only [pure_bind] at h
+  split at h <;>
+    first
+      | (rename_i hph'
+         exact absurd (show state.phase = Phase.waitingServerHello from hph') hph)
+      | (split at h <;>
+          first
+            | (obtain ⟨_, h⟩ := unless_ok h
+               cases h
+               exact hph)
+            | (obtain ⟨_, h⟩ := unless_ok h
+               obtain ⟨pair, hpa, h⟩ := except_bind_ok_inv h
+               obtain ⟨stateA, wireA⟩ := pair
+               cases h
+               rw [processAlert_phase hpa]
+               exact hph)
+            | exact processProtectedRecord_phase_ne h hph
+            | cases h)
+
+
+/-- The conclusion the key-schedule link carries out to `feed`: the connection is
+established, and its epochs are the RFC 8446 §7.1 application secrets over a
+definite transcript, rolled forward by however many §7.2 KeyUpdates arrived in
+the same chunk. -/
+def EstablishedEpochs (H : Spec.Hkdf) (before after : State) : Prop :=
+  after.phase = .connected ∧
+  ∃ transcript : ByteArray, ∀ inp : Spec.Inputs,
+    inp.hash .empty = HaclStar.sha256 ByteArray.empty →
+    inp.hash .serverFinished = HaclStar.sha256 transcript →
+    before.handshakeSecret? = some (Spec.secret H inp .handshake) →
+    (∃ (wk : Record.TrafficKeys) (n : Nat), after.writeKeys? = some wk ∧
+      wk.ProtectsWith H (Spec.trafficIter H (Spec.derived H inp .cApTraffic) n)) ∧
+    (∃ (rk : Record.TrafficKeys) (n : Nat), after.readKeys? = some rk ∧
+      rk.ProtectsWith H (Spec.trafficIter H (Spec.derived H inp .sApTraffic) n))
+
+private theorem rolled_epoch {H : Spec.Hkdf}
+    {before after : Option Record.TrafficKeys} (hr : Record.Rolled H before after)
+    {k : Record.TrafficKeys} {s : ByteArray} {n : Nat} (hk : before = some k)
+    (hp : k.ProtectsWith H (Spec.trafficIter H s n)) :
+    ∃ (k' : Record.TrafficKeys) (m : Nat), after = some k' ∧
+      k'.ProtectsWith H (Spec.trafficIter H s m) := by
+  obtain ⟨k', m, hk', hp'⟩ := hr.apply hk hp
+  exact ⟨k', n + m, hk', by rw [← Record.trafficIter_add]; exact hp'⟩
+
+/-- An established link survives whatever the rest of the same feed does to the
+epochs: records protected or opened, and KeyUpdates, only roll them forward. -/
+private theorem EstablishedEpochs.roll {H : Spec.Hkdf} {a b c : State}
+    (h : EstablishedEpochs H a b) (hr : RolledEpochs H b c)
+    (hc : c.phase = .connected) : EstablishedEpochs H a c := by
+  obtain ⟨-, transcript, ht⟩ := h
+  refine ⟨hc, transcript, fun inp h1 h2 h3 => ?_⟩
+  obtain ⟨⟨wk, n, hwk, hpw⟩, ⟨rk, m, hrk, hpr⟩⟩ := ht inp h1 h2 h3
+  exact ⟨rolled_epoch hr.2 hwk hpw, rolled_epoch hr.1 hrk hpr⟩
+
+/-- **The client's whole encrypted server flight, with the phase it lands in.**
+`processHandshakeBuffer_keySchedule` with the extra fact that the second case is
+exactly the transition into `connected` — which is what lets the link be carried
+past the records that follow in the same feed. -/
+private theorem processHandshakeBuffer_established {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {wire : ByteArray}
+    (h : processHandshakeBuffer state = .ok (next, wire)) :
+    next.handshakeSecret? = state.handshakeSecret? ∨ EstablishedEpochs H state next := by
+  unfold processHandshakeBuffer at h
+  split at h
+  · cases h
+  · cases h; exact Or.inl rfl
+  · rename_i message rest htake
+    have hsize : rest.size < state.handshakeBuffered.size := takeHandshake?_size htake
+    simp only [pure_bind] at h
+    split at h
+    · cases h
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+      obtain ⟨alpn, _, h⟩ := except_bind_ok_inv h
+      split at h
+      · obtain ⟨_, h⟩ := unless_ok h
+        have hw := processHandshakeBuffer_established hi h
+        exact hw
+      · have hw := processHandshakeBuffer_established hi h
+        exact hw
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+      have hw := processHandshakeBuffer_established hi h
+      exact hw
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+      split at h
+      · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        obtain ⟨_, h⟩ := unless_ok h
+        obtain ⟨_, h⟩ := unless_ok h
+        have hw := processHandshakeBuffer_established hi h
+        exact hw
+      · cases h
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨_, h⟩ := unless_ok h
+      refine Or.inr ⟨completeServerHandshake_phase h,
+        state.transcript ++ message.encoded, fun inp h1 h2 h3 => ?_⟩
+      obtain ⟨⟨wk, hwk, hdw⟩, ⟨rk, hrk, hdr⟩⟩ :=
+        completeServerHandshake_keySchedule hi inp h1 h2 h3 h
+      exact ⟨⟨wk, 0, hwk, hdw.protectsWith⟩, ⟨rk, 0, hrk, hdr.protectsWith⟩⟩
+    · split at h
+      · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        have hw := processHandshakeBuffer_established hi h
+        exact hw
+      · split at h
+        · split at h
+          · cases h
+          · rename_i stateK wireK hacc
+            split at h
+            · cases h
+            · rename_i stateF moreWire hnext
+              cases h
+              have hbuf : stateK.handshakeBuffered.size <
+                  state.handshakeBuffered.size := by
+                rw [acceptKeyUpdate_buffered hacc]; exact hsize
+              have hk := acceptKeyUpdate_handshakeSecret hacc
+              rcases processHandshakeBuffer_established hi hnext with hl | ⟨hcon, t, ht⟩
+              · exact Or.inl (by rw [hl, hk])
+              · exact Or.inr ⟨hcon, t, fun inp h1 h2 h3 => ht inp h1 h2 (by rw [hk]; exact h3)⟩
+        · cases h
+  termination_by state.handshakeBuffered.size
+  decreasing_by
+    all_goals first
+      | exact hsize
+      | exact hbuf
+
+private theorem processProtectedRecord_established {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {record : Record.RawRecord} {plain wire : ByteArray}
+    (h : processProtectedRecord state record = .ok (next, plain, wire)) :
+    next.handshakeSecret? = state.handshakeSecret? ∨ EstablishedEpochs H state next := by
+  unfold processProtectedRecord at h
+  simp only [pure_bind] at h
+  obtain ⟨readKeys, hrk, h⟩ := except_bind_ok_inv h
+  obtain ⟨opened, hop, h⟩ := except_bind_ok_inv h
+  obtain ⟨nextReadKeys, plaintext⟩ := opened
+  split at h
+  · obtain ⟨_, h⟩ := if_throw_ok h
+    split at h
+    · obtain ⟨_, h⟩ := unless_ok h
+      cases h
+      exact Or.inl rfl
+    · obtain ⟨pair, hpb, h⟩ := except_bind_ok_inv h
+      obtain ⟨stateH, wireH⟩ := pair
+      cases h
+      have hw := processHandshakeBuffer_established hi hpb
+      exact hw
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨pair, hpa, h⟩ := except_bind_ok_inv h
+      obtain ⟨stateA, wireA⟩ := pair
+      cases h
+      have hw := processAlert_handshakeSecret hpa
+      exact Or.inl hw
+    · cases h
+  · split at h
+    · obtain ⟨pair, hpb, h⟩ := except_bind_ok_inv h
+      obtain ⟨stateH, wireH⟩ := pair
+      cases h
+      have hw := processHandshakeBuffer_established hi hpb
+      exact hw
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨pair, hpa, h⟩ := except_bind_ok_inv h
+      obtain ⟨stateA, wireA⟩ := pair
+      cases h
+      have hw := processAlert_handshakeSecret hpa
+      exact Or.inl hw
+    · cases h
+
+private theorem processRecord_established {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {record : Record.RawRecord} {plain wire : ByteArray}
+    (h : processRecord state record = .ok (next, plain, wire))
+    (hph : state.phase ≠ .waitingServerHello) :
+    next.handshakeSecret? = state.handshakeSecret? ∨ EstablishedEpochs H state next := by
+  unfold processRecord at h
+  simp only [pure_bind] at h
+  split at h <;>
+    first
+      | (rename_i hph'
+         exact absurd (show state.phase = Phase.waitingServerHello from hph') hph)
+      | (split at h <;>
+          first
+            | (obtain ⟨_, h⟩ := unless_ok h
+               cases h
+               exact Or.inl rfl)
+            | (obtain ⟨_, h⟩ := unless_ok h
+               obtain ⟨pair, hpa, h⟩ := except_bind_ok_inv h
+               obtain ⟨stateA, wireA⟩ := pair
+               cases h
+               have hw := processAlert_handshakeSecret hpa
+               exact Or.inl hw)
+            | exact processProtectedRecord_established hi h
+            | cases h)
+
+private theorem processRecords_rolled {H : Spec.Hkdf} (hi : Implements H)
+    {records : List Record.RawRecord} :
+    ∀ {state : State} {plaintext wireBytes : ByteArray} {out : Output},
+      processRecords state records plaintext wireBytes = .ok out →
+      state.phase = .connected → RolledEpochs H state out.state := by
+  induction records with
+  | nil =>
+      intro state plaintext wireBytes out h hc
+      unfold processRecords at h
+      cases h
+      exact RolledEpochs.refl _
+  | cons record rest ih =>
+      intro state plaintext wireBytes out h hc
+      unfold processRecords at h
+      split at h
+      · cases h
+      · rename_i stateN cleartext outbound hpr
+        exact (processRecord_rolled hi hpr hc).trans
+          (ih h (processRecord_plaintext hpr (.inl hc)))
+
+private theorem processRecords_established {H : Spec.Hkdf} (hi : Implements H)
+    {records : List Record.RawRecord} :
+    ∀ {state : State} {plaintext wireBytes : ByteArray} {out : Output},
+      processRecords state records plaintext wireBytes = .ok out →
+      state.phase ≠ .waitingServerHello →
+      out.state.handshakeSecret? = state.handshakeSecret? ∨
+        EstablishedEpochs H state out.state := by
+  induction records with
+  | nil =>
+      intro state plaintext wireBytes out h hph
+      unfold processRecords at h
+      cases h
+      exact Or.inl rfl
+  | cons record rest ih =>
+      intro state plaintext wireBytes out h hph
+      unfold processRecords at h
+      split at h
+      · cases h
+      · rename_i stateN cleartext outbound hpr
+        rcases processRecord_established hi hpr hph with hl | hcon
+        · rcases ih h (processRecord_phase_ne hpr hph) with hl' | ⟨hc, t, ht⟩
+          · exact Or.inl (hl'.trans hl)
+          · exact Or.inr ⟨hc, t, fun inp h1 h2 h3 => ht inp h1 h2 (by rw [hl]; exact h3)⟩
+        · refine Or.inr (hcon.roll ?_ ?_)
+          · exact processRecords_rolled hi h hcon.1
+          · exact processRecords_connected h hcon.1
+
+/-- **`feed` installs the RFC 8446 §7.1 application epochs.** Either the feed did
+not complete the handshake — and the handshake secret is untouched — or it did,
+and there is a definite transcript (the ClientHello…server Finished sequence the
+engine accumulated) such that, for any key-schedule inputs agreeing with the
+engine on the empty and ClientHello…server Finished transcript hashes and on the
+handshake secret the state carried, the connection is `connected` and its write
+and read epochs are `client_application_traffic_secret_0` and
+`server_application_traffic_secret_0` — rolled forward by however many §7.2
+KeyUpdates arrived in the same chunk, which is none in the usual case.
+
+This is the `feed`-level form of `processHandshakeBuffer_keySchedule`: the
+transport plumbing between the two (record framing, decryption and dispatch)
+moves bytes and touches no key state, and is now threaded through. As
+everywhere, the statement is parametric in the HKDF the HACL\* bindings
+implement, so it constrains the derivation structure and assumes nothing about
+what the primitive computes.
+
+Scope: `hph` excludes a feed that itself accepts the ServerHello, because such a
+feed *replaces* the handshake secret the conclusion is stated against —
+`acceptServerHello_keySchedule` is the law for that step. A feed that carries
+the ServerHello and the encrypted flight in one chunk is therefore not covered
+by this statement; linking the two into one whole-handshake law is left open. -/
+theorem feed_keySchedule {H : Spec.Hkdf} (hi : Implements H) {state : State}
+    {chunk : ByteArray} {out : Output} (h : feed state chunk = .ok out)
+    (hph : state.phase ≠ .waitingServerHello) :
+    out.state.handshakeSecret? = state.handshakeSecret? ∨
+      EstablishedEpochs H state out.state := by
+  unfold feed at h
+  split at h
+  · rename_i output hfeed
+    cases h
+    unfold feedWithFailure at hfeed
+    split at hfeed
+    · cases hfeed
+    · split at hfeed
+      · cases hfeed
+      · have hw := processRecords_established hi hfeed hph
+        exact hw
+  · cases h
 
 end Client
 end Tls

@@ -1759,5 +1759,132 @@ theorem SpecExtends.nonce_nodup {H : Spec.Hkdf} (hinj : Spec.ExpandLabelInjectiv
   obtain ⟨secrets, nonces, hrun, hl⟩ := h.run hafter hvalid
   exact ⟨secrets, nonces, hrun, hrun.nodup (hl.nodup hinj)⟩
 
+/-! ## Rolling an epoch forward
+
+Once an epoch is installed, the only thing the engines do to it is protect or
+open records under it — which changes the sequence number and nothing else — or
+replace it by its RFC 8446 §7.2 successor at a KeyUpdate. `Rolled` is that
+relation, and it is what lets a law about the epochs a transition *installs*
+survive the transitions that follow it in the same `feed`. -/
+
+/-- `keys` protects records under traffic secret `secret` per RFC 8446 §7.3.
+The same as `DerivedFrom` except that the record sequence number may already
+have advanced, which is what a `DerivedFrom` epoch becomes after it has
+protected or opened a record. -/
+def TrafficKeys.ProtectsWith (H : Spec.Hkdf) (keys : TrafficKeys)
+    (secret : ByteArray) : Prop :=
+  keys.secret = secret ∧
+    keys.key = Spec.trafficKey H secret aeadKeyLength ∧
+    keys.iv = Spec.trafficIv H secret aeadIvLength
+
+theorem TrafficKeys.DerivedFrom.protectsWith {H : Spec.Hkdf} {keys : TrafficKeys}
+    {secret : ByteArray} (h : keys.DerivedFrom H secret) : keys.ProtectsWith H secret :=
+  ⟨h.1, h.2.1, h.2.2.1⟩
+
+theorem TrafficKeys.ProtectsWith.secret_eq {H : Spec.Hkdf} {keys : TrafficKeys}
+    {secret : ByteArray} (h : keys.ProtectsWith H secret) : keys.secret = secret := h.1
+
+/-- **`open` advances the sequence number exactly once** and preserves the
+secret, key and IV — the read-side mirror of `seal_keys`. -/
+theorem open_keys {keys next : TrafficKeys} {record : RawRecord}
+    {plaintext : Plaintext} (h : «open» keys record = .ok (next, plaintext)) :
+    next = { keys with seq := keys.seq + 1 } := by
+  unfold «open» at h
+  split at h
+  · cases h
+  · split at h
+    · cases h
+    · split at h
+      · cases h
+      · split at h
+        · cases h
+        · split at h
+          · cases h
+          · split at h
+            · cases h
+            · rename_i nextKeys hadv
+              split at h
+              · cases h
+              · split at h
+                · cases h
+                · split at h
+                  · cases h
+                  · split at h
+                    · cases h
+                    · split at h
+                      · cases h
+                      · split at h
+                        · cases h
+                        · split at h
+                          · cases h
+                          · simp only [Except.ok.injEq, Prod.mk.injEq] at h
+                            rw [← h.1]
+                            exact (advance_ok_iff.mp hadv).2
+
+theorem trafficIter_add (H : Spec.Hkdf) (secret : ByteArray) (m n : Nat) :
+    Spec.trafficIter H (Spec.trafficIter H secret m) n =
+      Spec.trafficIter H secret (m + n) := by
+  induction n with
+  | zero => rfl
+  | succ k ih =>
+      show Spec.nextTrafficSecret H _ = Spec.nextTrafficSecret H _
+      rw [ih, show m.add k = m + k from rfl]
+
+/-- The traffic state moved from an epoch to that epoch rolled forward by some
+number of §7.2 KeyUpdates — possibly none, and possibly with records protected
+or opened along the way. -/
+def Rolled (H : Spec.Hkdf) (before after : Option TrafficKeys) : Prop :=
+  ∀ (k : TrafficKeys) (secret : ByteArray), before = some k →
+    k.ProtectsWith H secret →
+    ∃ (k' : TrafficKeys) (n : Nat), after = some k' ∧
+      k'.ProtectsWith H (Spec.trafficIter H secret n)
+
+theorem Rolled.apply {H : Spec.Hkdf} {before after : Option TrafficKeys}
+    (h : Rolled H before after) {k : TrafficKeys} {secret : ByteArray}
+    (hk : before = some k) (hp : k.ProtectsWith H secret) :
+    ∃ (k' : TrafficKeys) (n : Nat), after = some k' ∧
+      k'.ProtectsWith H (Spec.trafficIter H secret n) := h k secret hk hp
+
+theorem Rolled.refl (a : Option TrafficKeys) {H : Spec.Hkdf} : Rolled H a a :=
+  fun k _ hk hp => ⟨k, 0, hk, hp⟩
+
+theorem Rolled.of_eq {H : Spec.Hkdf} {before after : Option TrafficKeys}
+    (h : after = before) : Rolled H before after := by
+  rw [h]; exact Rolled.refl _
+
+theorem Rolled.trans {H : Spec.Hkdf} {a b c : Option TrafficKeys}
+    (h1 : Rolled H a b) (h2 : Rolled H b c) : Rolled H a c := by
+  intro k secret hk hp
+  obtain ⟨k', n, hk', hp'⟩ := h1 k secret hk hp
+  obtain ⟨k'', m, hk'', hp''⟩ := h2 k' _ hk' hp'
+  exact ⟨k'', n + m, hk'', by rw [← trafficIter_add]; exact hp''⟩
+
+theorem Rolled.of_seal {H : Spec.Hkdf} {keys next : TrafficKeys}
+    {contentType : ContentType} {fragment wire : ByteArray} {paddingLength : Nat}
+    (h : «seal» keys contentType fragment paddingLength = .ok (next, wire)) :
+    Rolled H (some keys) (some next) := by
+  intro k secret hk hp
+  cases hk
+  exact ⟨next, 0, rfl, by rw [seal_keys h]; exact hp⟩
+
+theorem Rolled.of_open {H : Spec.Hkdf} {keys next : TrafficKeys}
+    {record : RawRecord} {plaintext : Plaintext}
+    (h : «open» keys record = .ok (next, plaintext)) :
+    Rolled H (some keys) (some next) := by
+  intro k secret hk hp
+  cases hk
+  exact ⟨next, 0, rfl, by rw [open_keys h]; exact hp⟩
+
+/-- A KeyUpdate rolls the epoch forward by exactly one §7.2 step. -/
+theorem Rolled.of_update {H : Spec.Hkdf} (hi : TLS13.KeySchedule.Implements H)
+    {keys keys' : TrafficKeys} (h : keys.update = .ok keys') :
+    Rolled H (some keys) (some keys') := by
+  intro k secret hk hp
+  cases hk
+  refine ⟨keys', 1, rfl, ?_⟩
+  have hd := (TrafficKeys.update_spec hi h).protectsWith
+  rw [hp.secret_eq] at hd
+  exact hd
+
 end Record
 end Tls
