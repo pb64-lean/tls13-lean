@@ -1196,6 +1196,33 @@ in wire order. -/
 @[expose] def knownKeyShares (l : List (UInt16 × ByteArray)) : Array ClientKeyShare :=
   knownKeySharesLoop l #[]
 
+/-- The supported_versions extension a client sends: a `uint8`-prefixed vector
+of version identifiers, in preference order. -/
+def clientSupportedVersionsExtension (versions : List UInt16) : Extension :=
+  { extensionType := supportedVersionsExtension,
+    data := ByteArray.empty.push (UInt8.ofNat (uint16ListBytes versions).size) ++
+      uint16ListBytes versions }
+
+/-- The supported_groups extension a client sends. -/
+def clientSupportedGroupsExtension (groups : List UInt16) : Extension :=
+  { extensionType := supportedGroupsExtension,
+    data := appendUInt16 ByteArray.empty
+        (UInt16.ofNat (uint16ListBytes groups).size) ++ uint16ListBytes groups }
+
+/-- The key_share extension a client sends. -/
+def clientKeyShareExtension (shares : List (UInt16 × ByteArray)) : Extension :=
+  { extensionType := keyShareExtension,
+    data := appendUInt16 ByteArray.empty
+        (UInt16.ofNat (keyShareEntriesBytes shares).size) ++
+      keyShareEntriesBytes shares }
+
+/-- The signature_algorithms extension a client sends. -/
+def clientSignatureAlgorithmsExtension (algorithms : List UInt16) : Extension :=
+  { extensionType := signatureAlgorithmsExtension,
+    data := appendUInt16 ByteArray.empty
+        (UInt16.ofNat (uint16ListBytes algorithms).size) ++
+      uint16ListBytes algorithms }
+
 /-- Whether `subset` occurs as a subsequence of `superset`. Explicit structural
 recursion (not the nested `while` scan it replaces) so the ClientHello laws
 below can evaluate it. -/
@@ -1431,9 +1458,11 @@ private def parseOptionalExtension {α : Type} (extensions : Array Extension)
 /-- Parse a ClientHello for the server flow. Extracts the fields the server needs
 to select a key-exchange group, verify TLS 1.3 support, and negotiate ALPN/SNI.
 (Written as a pure `if`/`match` chain so the ClientHello laws below can evaluate
-it.) `parseClientHello_clientHelloBody_opaque` proves that it returns the
-cipher-suite list and the whole extension list of a `clientHelloBody` verbatim
-when the extensions are ones this implementation does not interpret. -/
+it.) `parseClientHello_clientHelloBody` proves it inverts `clientHelloBody`:
+cipher suites, versions, supported groups, key-share groups, signature schemes
+and the whole extension list come back verbatim and in order, whatever the
+values are (`parseClientHello_clientHelloBody_opaque` is the special case of a
+ClientHello whose extensions are all uninterpreted). -/
 def parseClientHello (msg : Message) : Except String ClientHello :=
   if msg.msgType == clientHelloType then
     match ({ bytes := msg.body } : Reader).readUInt16 with
@@ -4006,6 +4035,349 @@ theorem parseKeyShareEntries_keyShareEntriesBytes (l : List (UInt16 × ByteArray
     (fun _ _ => by simp) hdistinct]
   rfl
 
+
+/-! ### ClientHello with the extensions this implementation interprets -/
+
+private theorem readVector8_body {X : ByteArray} (hsz : X.size < 2 ^ 8) :
+    Reader.readVector8
+        (Reader.mk (ByteArray.empty.push (UInt8.ofNat X.size) ++ X) 0) =
+      .ok (X, Reader.mk (ByteArray.empty.push (UInt8.ofNat X.size) ++ X)
+        (0 + 1 + X.size)) :=
+  readVector8_at' (W := ByteArray.empty.push (UInt8.ofNat X.size) ++ X)
+    (P := ByteArray.empty) (X := X) (S := ByteArray.empty)
+    (by rw [ByteArray.append_empty, ByteArray.empty_append]) rfl hsz
+
+private theorem readVector16_body' {X : ByteArray} (hsz : X.size < 2 ^ 16) :
+    Reader.readVector16
+        (Reader.mk (appendUInt16 ByteArray.empty (UInt16.ofNat X.size) ++ X) 0) =
+      .ok (X, Reader.mk (appendUInt16 ByteArray.empty (UInt16.ofNat X.size) ++ X)
+        (0 + 2 + X.size)) :=
+  readVector16_at' (W := appendUInt16 ByteArray.empty (UInt16.ofNat X.size) ++ X)
+    (P := ByteArray.empty) (X := X) (S := ByteArray.empty)
+    (by rw [ByteArray.append_empty, ByteArray.empty_append]) rfl hsz
+
+private theorem uint16ListBytes_ne_empty {l : List UInt16} (h : l ≠ []) :
+    ¬((uint16ListBytes l).isEmpty = true) := by
+  cases l with
+  | nil => exact absurd rfl h
+  | cons a t =>
+    simp only [ByteArray.isEmpty, size_uint16ListBytes]
+    simp
+
+/-- The client supported_versions extension body parses back to the offered
+version identifiers, whatever they are. -/
+private theorem parseClientVersions_body {versions : List UInt16}
+    (hsz : (uint16ListBytes versions).size < 2 ^ 8) (hne : versions ≠ []) :
+    parseClientVersions (clientSupportedVersionsExtension versions).data =
+      .ok versions.toArray := by
+  show parseClientVersions (ByteArray.empty.push
+      (UInt8.ofNat (uint16ListBytes versions).size) ++ uint16ListBytes versions)
+    = _
+  unfold parseClientVersions
+  simp only [readVector8_body hsz,
+    requireEnd_eval (b := ByteArray.empty.push
+        (UInt8.ofNat (uint16ListBytes versions).size) ++ uint16ListBytes versions)
+      (off := 0 + 1 + (uint16ListBytes versions).size)
+      (context := "ClientHello supported_versions")
+      (by rw [ByteArray.size_append]; rfl)]
+  rw [if_neg (uint16ListBytes_ne_empty hne), parseUInt16List_uint16ListBytes]
+
+/-- The client supported_groups extension body parses back to the offered group
+identifiers, whatever they are, plus the ones this implementation knows. -/
+private theorem parseClientGroups_body {groups : List UInt16}
+    (hsz : (uint16ListBytes groups).size < 2 ^ 16) (hne : groups ≠ []) :
+    parseClientGroups (clientSupportedGroupsExtension groups).data =
+      .ok (groups.toArray, knownGroups groups) := by
+  show parseClientGroups (appendUInt16 ByteArray.empty
+      (UInt16.ofNat (uint16ListBytes groups).size) ++ uint16ListBytes groups) = _
+  unfold parseClientGroups parseSupportedGroups
+  simp only [readVector16_body' hsz,
+    requireEnd_eval (b := appendUInt16 ByteArray.empty
+        (UInt16.ofNat (uint16ListBytes groups).size) ++ uint16ListBytes groups)
+      (off := 0 + 2 + (uint16ListBytes groups).size)
+      (context := "ClientHello supported_groups")
+      (by rw [ByteArray.size_append]; rfl),
+    parseUInt16List_uint16ListBytes]
+  rw [if_neg (by
+    cases groups with
+    | nil => exact absurd rfl hne
+    | cons a t => simp)]
+
+/-- The client key_share extension body parses back to every offered group
+identifier, GREASE included, plus the shares this implementation can use. -/
+private theorem parseClientKeyShare_body {shares : List (UInt16 × ByteArray)}
+    (hsz : (keyShareEntriesBytes shares).size < 2 ^ 16)
+    (hesz : ∀ e ∈ shares, e.2.size < 2 ^ 16)
+    (hene : ∀ e ∈ shares, e.2.isEmpty = false)
+    (hdistinct : shares.Pairwise (fun a b => (a.1 == b.1) = false)) :
+    parseClientKeyShare (clientKeyShareExtension shares).data =
+      .ok ((shares.map Prod.fst).toArray, knownKeyShares shares) := by
+  show parseClientKeyShare (appendUInt16 ByteArray.empty
+      (UInt16.ofNat (keyShareEntriesBytes shares).size) ++
+    keyShareEntriesBytes shares) = _
+  unfold parseClientKeyShare
+  simp only [readVector16_body' hsz,
+    requireEnd_eval (b := appendUInt16 ByteArray.empty
+        (UInt16.ofNat (keyShareEntriesBytes shares).size) ++
+      keyShareEntriesBytes shares)
+      (off := 0 + 2 + (keyShareEntriesBytes shares).size)
+      (context := "ClientHello key_share")
+      (by rw [ByteArray.size_append]; rfl),
+    parseKeyShareEntries_keyShareEntriesBytes shares hesz hene hdistinct]
+
+/-- The client signature_algorithms extension body parses back to the offered
+identifiers, whatever they are. -/
+private theorem parseClientSignatureAlgorithms_body {algorithms : List UInt16}
+    (hsz : (uint16ListBytes algorithms).size < 2 ^ 16) (hne : algorithms ≠ []) :
+    parseClientSignatureAlgorithms
+        (clientSignatureAlgorithmsExtension algorithms).data =
+      .ok algorithms.toArray := by
+  show parseClientSignatureAlgorithms (appendUInt16 ByteArray.empty
+      (UInt16.ofNat (uint16ListBytes algorithms).size) ++
+    uint16ListBytes algorithms) = _
+  unfold parseClientSignatureAlgorithms
+  simp only [readVector16_body' hsz,
+    requireEnd_eval (b := appendUInt16 ByteArray.empty
+        (UInt16.ofNat (uint16ListBytes algorithms).size) ++
+      uint16ListBytes algorithms)
+      (off := 0 + 2 + (uint16ListBytes algorithms).size)
+      (context := "ClientHello signature_algorithms")
+      (by rw [ByteArray.size_append]; rfl)]
+  rw [if_neg (uint16ListBytes_ne_empty hne), parseUInt16List_uint16ListBytes]
+
+private theorem findExtension?_append {u tail : List Extension} {t : UInt16}
+    (hu : ∀ e ∈ u, (e.extensionType == t) = false) :
+    findExtension? (u ++ tail).toArray t =
+      tail.find? (fun e => e.extensionType == t) := by
+  unfold findExtension?
+  rw [List.find?_toArray, List.find?_append,
+    List.find?_eq_none.mpr (fun x hx => by rw [hu x hx]; exact Bool.false_ne_true)]
+  rfl
+
+
+
+/-- **ClientHello preservation (GREASE tolerance)**: a ClientHello carrying any
+number of extensions this implementation does not interpret, followed by the
+four it does (`supported_versions`, `supported_groups`, `key_share`,
+`signature_algorithms`), parses with *every* offered list returned verbatim: the
+cipher suites, the version identifiers, the supported-group identifiers, the
+key-share group identifiers and the signature-scheme identifiers all come back
+in wire order with nothing dropped, whatever the values are, and the whole
+extension list — unknown entries included — is retained as sent. Only the
+derived views (`supportedGroups`, `keyShares`) narrow to what this
+implementation knows. This is what a GREASE-sending client requires of a
+server. -/
+theorem parseClientHello_clientHelloBody {msg : Message}
+    {random legacySessionId : ByteArray} {cipherSuites : List UInt16}
+    {other : List Extension} {versions groups algorithms : List UInt16}
+    {shares : List (UInt16 × ByteArray)} {extensions : List Extension}
+    (hexts : extensions = other ++
+      [clientSupportedVersionsExtension versions,
+        clientSupportedGroupsExtension groups,
+        clientKeyShareExtension shares,
+        clientSignatureAlgorithmsExtension algorithms])
+    (hty : msg.msgType = clientHelloType)
+    (hbody : msg.body =
+      clientHelloBody random legacySessionId cipherSuites extensions)
+    (hR : random.size = 32) (hsid : legacySessionId.size < 2 ^ 8)
+    (hsid32 : legacySessionId.size ≤ 32)
+    (hcs : (uint16ListBytes cipherSuites).size < 2 ^ 16)
+    (hcsne : cipherSuites ≠ [])
+    (hE : (extensionsBytes extensions).size < 2 ^ 16)
+    (hesz : ∀ e ∈ extensions, e.data.size < 2 ^ 16)
+    (hedist : extensions.Pairwise
+      (fun a b => (a.extensionType == b.extensionType) = false))
+    (hother : ∀ e ∈ other,
+      (e.extensionType == preSharedKeyExtension) = false ∧
+      (e.extensionType == supportedVersionsExtension) = false ∧
+      (e.extensionType == supportedGroupsExtension) = false ∧
+      (e.extensionType == keyShareExtension) = false ∧
+      (e.extensionType == signatureAlgorithmsExtension) = false ∧
+      (e.extensionType == serverNameExtension) = false ∧
+      (e.extensionType == alpnExtension) = false)
+    (hv8 : (uint16ListBytes versions).size < 2 ^ 8) (hvne : versions ≠ [])
+    (hg16 : (uint16ListBytes groups).size < 2 ^ 16) (hgne : groups ≠ [])
+    (hk16 : (keyShareEntriesBytes shares).size < 2 ^ 16)
+    (hksz : ∀ e ∈ shares, e.2.size < 2 ^ 16)
+    (hkne : ∀ e ∈ shares, e.2.isEmpty = false)
+    (hkdist : shares.Pairwise (fun a b => (a.1 == b.1) = false))
+    (ha16 : (uint16ListBytes algorithms).size < 2 ^ 16) (hane : algorithms ≠ [])
+    (horder :
+      isOrderedSubset (shares.map Prod.fst).toArray groups.toArray = true) :
+    parseClientHello msg = .ok
+      { random := random, legacySessionId := legacySessionId,
+        cipherSuites := cipherSuites.toArray,
+        supportedVersionIds := versions.toArray,
+        supportedGroupIds := groups.toArray,
+        supportedGroups := knownGroups groups,
+        keyShareGroupIds := (shares.map Prod.fst).toArray,
+        keyShares := knownKeyShares shares,
+        signatureAlgorithms := algorithms.toArray,
+        serverName := none, alpnProtocols := #[],
+        extensions := extensions.toArray,
+        offersTls13 := versions.toArray.contains tls13Version,
+        encoded := msg.encoded } := by
+  have s2 : (appendUInt16 ByteArray.empty legacyTls12Version).size = 2 := rfl
+  have s1 : ∀ b : UInt8, (ByteArray.empty.push b).size = 1 := fun _ => rfl
+  have se : ∀ n : Nat, (appendUInt16 ByteArray.empty (UInt16.ofNat n)).size = 2 :=
+    fun _ => rfl
+  have r1 : Reader.readUInt16 (Reader.mk msg.body 0) =
+      .ok (legacyTls12Version, Reader.mk msg.body (0 + 2)) :=
+    readUInt16_at' (W := msg.body) (off := 0) (P := ByteArray.empty)
+      (by rw [hbody]; unfold clientHelloBody
+          simp only [ByteArray.append_assoc, ByteArray.empty_append]; rfl) rfl
+  have r2 : Reader.take (Reader.mk msg.body (0 + 2)) 32 =
+      .ok (random, Reader.mk msg.body (0 + 2 + 32)) :=
+    take_at' (W := msg.body) (off := 0 + 2) (n := 32)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version) (X := random)
+      (by rw [hbody]; unfold clientHelloBody
+          simp only [ByteArray.append_assoc]; rfl) rfl hR
+  have r3 : Reader.readVector8 (Reader.mk msg.body (0 + 2 + 32)) =
+      .ok (legacySessionId,
+        Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionId.size)) :=
+    readVector8_at' (W := msg.body) (off := 0 + 2 + 32)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version ++ random)
+      (X := legacySessionId)
+      (by rw [hbody]; unfold clientHelloBody
+          simp only [ByteArray.append_assoc]; rfl)
+      (by rw [ByteArray.size_append, s2, hR]) hsid
+  have r4 : Reader.readVector16
+      (Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionId.size)) =
+      .ok (uint16ListBytes cipherSuites, Reader.mk msg.body
+        (0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+          (uint16ListBytes cipherSuites).size)) :=
+    readVector16_at' (W := msg.body)
+      (off := 0 + 2 + 32 + 1 + legacySessionId.size)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version ++ random ++
+        (ByteArray.empty.push (UInt8.ofNat legacySessionId.size) ++
+          legacySessionId))
+      (X := uint16ListBytes cipherSuites)
+      (by rw [hbody]; unfold clientHelloBody
+          simp only [ByteArray.append_assoc]; rfl)
+      (by rw [ByteArray.size_append, ByteArray.size_append,
+        ByteArray.size_append, s2, hR, s1]; omega) hcs
+  have r5 : Reader.readVector8 (Reader.mk msg.body
+      (0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+        (uint16ListBytes cipherSuites).size)) =
+      .ok (ByteArray.empty.push 0, Reader.mk msg.body
+        (0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+          (uint16ListBytes cipherSuites).size + 1 + 1)) :=
+    readVector8_at' (W := msg.body)
+      (off := 0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+        (uint16ListBytes cipherSuites).size)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version ++ random ++
+        (ByteArray.empty.push (UInt8.ofNat legacySessionId.size) ++
+          legacySessionId) ++
+        (appendUInt16 ByteArray.empty
+            (UInt16.ofNat (uint16ListBytes cipherSuites).size) ++
+          uint16ListBytes cipherSuites))
+      (X := ByteArray.empty.push 0)
+      (by rw [hbody]; unfold clientHelloBody
+          simp only [ByteArray.append_assoc]; rfl)
+      (by rw [ByteArray.size_append, ByteArray.size_append,
+        ByteArray.size_append, ByteArray.size_append, ByteArray.size_append,
+        s2, hR, s1, se]; omega) (by decide)
+  have r6 : Reader.readVector16 (Reader.mk msg.body
+      (0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+        (uint16ListBytes cipherSuites).size + 1 + 1)) =
+      .ok (extensionsBytes extensions, Reader.mk msg.body
+        (0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+          (uint16ListBytes cipherSuites).size + 1 + 1 + 2 +
+          (extensionsBytes extensions).size)) :=
+    readVector16_at' (W := msg.body)
+      (off := 0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+        (uint16ListBytes cipherSuites).size + 1 + 1)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version ++ random ++
+        (ByteArray.empty.push (UInt8.ofNat legacySessionId.size) ++
+          legacySessionId) ++
+        (appendUInt16 ByteArray.empty
+            (UInt16.ofNat (uint16ListBytes cipherSuites).size) ++
+          uint16ListBytes cipherSuites) ++
+        (ByteArray.empty.push 1 ++ ByteArray.empty.push 0))
+      (X := extensionsBytes extensions) (S := ByteArray.empty)
+      (by rw [hbody]; unfold clientHelloBody
+          simp only [ByteArray.append_assoc, ByteArray.append_empty])
+      (by simp only [ByteArray.size_append, s2, hR, s1, se]; omega) hE
+  have hbsize : msg.body.size = 0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+      (uint16ListBytes cipherSuites).size + 1 + 1 + 2 +
+      (extensionsBytes extensions).size := by
+    rw [hbody]
+    unfold clientHelloBody
+    simp only [ByteArray.size_append, s2, hR, s1, se]
+    omega
+  have hAtEnd : ¬((Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+      (uint16ListBytes cipherSuites).size + 1 + 1)).atEnd = true) := by
+    show ¬(0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+      (uint16ListBytes cipherSuites).size + 1 + 1 == msg.body.size) = true
+    rw [beq_iff_eq, hbsize]
+    omega
+  have hend : 0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+      (uint16ListBytes cipherSuites).size + 1 + 1 + 2 +
+      (extensionsBytes extensions).size = msg.body.size := hbsize.symm
+  have hcsEmpty : ¬(cipherSuites.toArray.isEmpty = true) := by
+    cases cipherSuites with
+    | nil => exact absurd rfl hcsne
+    | cons a t => simp
+  have hfindL : ∀ t : UInt16, (∀ e ∈ other, (e.extensionType == t) = false) →
+      findExtension? extensions.toArray t =
+        [clientSupportedVersionsExtension versions,
+          clientSupportedGroupsExtension groups,
+          clientKeyShareExtension shares,
+          clientSignatureAlgorithmsExtension algorithms].find?
+            (fun e => e.extensionType == t) := by
+    intro t h
+    rw [hexts]
+    exact findExtension?_append h
+  have hPsk : findExtension? extensions.toArray preSharedKeyExtension = none := by
+    rw [hfindL _ (fun e he => (hother e he).1)]
+    rfl
+  have hSV : findExtension? extensions.toArray supportedVersionsExtension =
+      some (clientSupportedVersionsExtension versions) := by
+    rw [hfindL _ (fun e he => (hother e he).2.1)]
+    rfl
+  have hSG : findExtension? extensions.toArray supportedGroupsExtension =
+      some (clientSupportedGroupsExtension groups) := by
+    rw [hfindL _ (fun e he => (hother e he).2.2.1)]
+    rfl
+  have hKS : findExtension? extensions.toArray keyShareExtension =
+      some (clientKeyShareExtension shares) := by
+    rw [hfindL _ (fun e he => (hother e he).2.2.2.1)]
+    rfl
+  have hSA : findExtension? extensions.toArray signatureAlgorithmsExtension =
+      some (clientSignatureAlgorithmsExtension algorithms) := by
+    rw [hfindL _ (fun e he => (hother e he).2.2.2.2.1)]
+    rfl
+  have hSN : findExtension? extensions.toArray serverNameExtension = none := by
+    rw [hfindL _ (fun e he => (hother e he).2.2.2.2.2.1)]
+    rfl
+  have hAL : findExtension? extensions.toArray alpnExtension = none := by
+    rw [hfindL _ (fun e he => (hother e he).2.2.2.2.2.2)]
+    rfl
+  unfold parseClientHello
+  rw [hty, if_pos (show (clientHelloType == clientHelloType) = true from rfl)]
+  simp only [r1]
+  rw [if_pos (beq_self_eq_true legacyTls12Version)]
+  simp only [r2, r3]
+  rw [if_pos hsid32]
+  simp only [r4, parseUInt16List_uint16ListBytes cipherSuites]
+  rw [if_neg hcsEmpty]
+  simp only [r5]
+  rw [if_pos (show ((ByteArray.empty.push 0).size == 1 &&
+    (ByteArray.empty.push 0).get! 0 == 0) = true from rfl)]
+  unfold parseClientExtensionBlock
+  rw [if_neg hAtEnd]
+  simp only [r6, requireEnd_eval (context := "ClientHello") hend,
+    parseExtensions_extensionsBytes extensions hesz hedist,
+    checkClientPsk_none hPsk,
+    parseOptionalExtension_some hSV, parseClientVersions_body hv8 hvne,
+    parseOptionalExtension_some hSG, parseClientGroups_body hg16 hgne,
+    parseOptionalExtension_some hKS,
+    parseClientKeyShare_body hk16 hksz hkne hkdist,
+    parseOptionalExtension_some hSA,
+    parseClientSignatureAlgorithms_body ha16 hane,
+    parseOptionalExtension_none hSN, parseOptionalExtension_none hAL,
+    hSG, Option.isSome_some, Bool.true_and, horder, Bool.not_true]
+  rw [if_neg Bool.false_ne_true]
 
 /-! ### ServerHello and HelloRetryRequest body inversion
 

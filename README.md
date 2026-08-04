@@ -72,9 +72,13 @@ Four Bazel packages:
   only on the reassembled byte stream and never accepts a partial frame,
   the ServerHello/HelloRetryRequest/EncryptedExtensions/Certificate/
   CertificateVerify/Finished/NewSessionTicket/KeyUpdate bodies invert
-  semantically, extension lists and `uint16` vectors roundtrip for arbitrary
-  (including unknown and GREASE) types and values, and HelloRetryRequest is
-  discriminated from ServerHello by the RFC 8446 sentinel random.
+  semantically, extension lists, `uint16` vectors and client key-share lists
+  roundtrip for arbitrary (including unknown and GREASE) types and values, and
+  HelloRetryRequest is discriminated from ServerHello by the RFC 8446 sentinel
+  random. `parseClientHello_clientHelloBody` lifts that to a whole ClientHello:
+  the cipher suites, offered versions, supported groups, key-share groups,
+  signature schemes and the entire extension list — unknown and GREASE entries
+  included — are returned in wire order with nothing dropped or reordered.
 - **`Test/`** — nine hermetic test binaries, a one-shot loopback server
   harness, and a scripted (manual-tag) interoperability gate that drives the
   harness with real OpenSSL, curl, and Go `crypto/tls` clients.
