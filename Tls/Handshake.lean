@@ -1,8 +1,5 @@
 module
 
-import Std.Tactic.BVDecide
-public meta import Std.Tactic.BVDecide.Reflect
-
 public section
 
 namespace Tls
@@ -1869,10 +1866,40 @@ private theorem readUInt24_eval {b : ByteArray} {off : Nat}
     extract_get! (by omega) (by omega)]
   rfl
 
+/-! ### Byte (de)composition
+
+Big-endian recomposition, proved *arithmetically*:
+`Nat.shiftLeft_add_eq_or_of_lt` rewrites a disjoint `|||` as `+` (see
+`or_add_lt`), and `omega` finishes. Doing it this way rather than with
+`bv_decide` keeps the LRAT certificate checker out of the trusted computing
+base — nothing in this repository depends on a generated axiom. -/
+
+/-- Disjoint `|||` is `+`: the low `i` bits of the left operand are clear. -/
+private theorem or_add_lt {a b i : Nat} (hb : b < 2 ^ i) :
+    a * 2 ^ i ||| b = a * 2 ^ i + b := by
+  rw [show a * 2 ^ i = a <<< i from (Nat.shiftLeft_eq a i).symm,
+    ← Nat.shiftLeft_add_eq_or_of_lt hb]
+
 private theorem uint32_recompose (v : UInt32) :
     ((v >>> 24).toUInt8.toUInt32 <<< 24 ||| (v >>> 16).toUInt8.toUInt32 <<< 16 |||
       (v >>> 8).toUInt8.toUInt32 <<< 8 ||| v.toUInt8.toUInt32) = v := by
-  bv_decide
+  apply UInt32.toNat_inj.mp
+  have hv := v.toNat_lt
+  simp only [UInt32.toNat_or, UInt32.toNat_shiftLeft, UInt8.toNat_toUInt32,
+    UInt32.toNat_toUInt8, UInt32.toNat_shiftRight,
+    show UInt32.toNat 24 % 32 = 24 from rfl,
+    show UInt32.toNat 16 % 32 = 16 from rfl,
+    show UInt32.toNat 8 % 32 = 8 from rfl,
+    Nat.shiftLeft_eq, Nat.shiftRight_eq_div_pow]
+  rw [show v.toNat / 2 ^ 24 % 2 ^ 8 * 2 ^ 24 % 2 ^ 32 = v.toNat / 2 ^ 24 * 2 ^ 24 from by
+      omega,
+    show v.toNat / 2 ^ 16 % 2 ^ 8 * 2 ^ 16 % 2 ^ 32 =
+      v.toNat / 2 ^ 16 % 2 ^ 8 * 2 ^ 16 from by omega,
+    show v.toNat / 2 ^ 8 % 2 ^ 8 * 2 ^ 8 % 2 ^ 32 =
+      v.toNat / 2 ^ 8 % 2 ^ 8 * 2 ^ 8 from by omega,
+    Nat.or_assoc, Nat.or_assoc, or_add_lt (i := 8), or_add_lt (i := 16),
+    or_add_lt (i := 24)]
+  all_goals omega
 
 private theorem readUInt32_eval {b : ByteArray} {off : Nat}
     (h : off + 4 ≤ b.size) :
@@ -2284,7 +2311,16 @@ theorem encodeKeyUpdate_parse {request : KeyUpdateRequest} {msg : Message}
 
 private theorem uint16_recompose (v : UInt16) :
     ((v >>> 8).toUInt8.toUInt16 <<< 8 ||| v.toUInt8.toUInt16) = v := by
-  bv_decide
+  apply UInt16.toNat_inj.mp
+  have hv := v.toNat_lt
+  simp only [UInt16.toNat_or, UInt16.toNat_shiftLeft, UInt8.toNat_toUInt16,
+    UInt16.toNat_toUInt8, UInt16.toNat_shiftRight,
+    show UInt16.toNat 8 % 16 = 8 from rfl, Nat.shiftLeft_eq,
+    Nat.shiftRight_eq_div_pow]
+  rw [show v.toNat / 2 ^ 8 % 2 ^ 8 * 2 ^ 8 % 2 ^ 16 = v.toNat / 2 ^ 8 * 2 ^ 8 from by
+      omega,
+    or_add_lt (i := 8)]
+  all_goals omega
 
 private theorem encodeLength16_ok {n : Nat} {out : ByteArray}
     (h : encodeLength16 n = .ok out) :
@@ -2881,11 +2917,28 @@ reproduces the bytes it came from. -/
 
 private theorem uint16_hi (b0 b1 : UInt8) :
     ((b0.toUInt16 <<< 8 ||| b1.toUInt16) >>> 8).toUInt8 = b0 := by
-  bv_decide
+  apply UInt8.toNat_inj.mp
+  have h0 := b0.toNat_lt
+  have h1 := b1.toNat_lt
+  simp only [UInt16.toNat_toUInt8, UInt16.toNat_shiftRight, UInt16.toNat_or,
+    UInt16.toNat_shiftLeft, UInt8.toNat_toUInt16,
+    show UInt16.toNat 8 % 16 = 8 from rfl, Nat.shiftLeft_eq,
+    Nat.shiftRight_eq_div_pow]
+  rw [show b0.toNat * 2 ^ 8 % 2 ^ 16 = b0.toNat * 2 ^ 8 from by omega,
+    or_add_lt (i := 8)]
+  all_goals omega
 
 private theorem uint16_lo (b0 b1 : UInt8) :
     (b0.toUInt16 <<< 8 ||| b1.toUInt16).toUInt8 = b1 := by
-  bv_decide
+  apply UInt8.toNat_inj.mp
+  have h0 := b0.toNat_lt
+  have h1 := b1.toNat_lt
+  simp only [UInt16.toNat_toUInt8, UInt16.toNat_or, UInt16.toNat_shiftLeft,
+    UInt8.toNat_toUInt16, show UInt16.toNat 8 % 16 = 8 from rfl,
+    Nat.shiftLeft_eq]
+  rw [show b0.toNat * 2 ^ 8 % 2 ^ 16 = b0.toNat * 2 ^ 8 from by omega,
+    or_add_lt (i := 8)]
+  all_goals omega
 
 private theorem getElem_appendUInt16_zero (v : UInt16)
     (h : 0 < (appendUInt16 ByteArray.empty v).size) :
