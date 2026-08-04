@@ -162,12 +162,16 @@ Four Bazel packages:
   moves to the successor traffic secret and restarts its sequence number
   (`acceptKeyUpdate_epoch`), and accepting the ServerHello extends the
   transcript by exactly the message consumed (`acceptServerHello_transcript`).
-  The laws about `private` engine helpers are themselves `private`; the public
-  ones are the entry points (`start`, `feed`, `feedWithFailure`,
-  `sealApplication`, `closeNotify`, `sealFatalAlert`, `step`, `run`).
+  The engine transitions those laws are stated about — `acceptClientFinished`,
+  `sendHelloRetryRequest`, `acceptKeyUpdate`, `completeServerHandshake` — are
+  public but not `@[expose]`d: nameable, so the laws are public statements the
+  assurance audit can cite, but not unfoldable outside their own modules.
+  Laws about the remaining `private` helpers stay `private`.
 - **`Test/`** — nine hermetic test binaries, a one-shot loopback server
   harness, and a scripted (manual-tag) interoperability gate that drives the
-  harness with real OpenSSL, curl, and Go `crypto/tls` clients.
+  harness with real OpenSSL, curl, and Go `crypto/tls` clients. Each of the
+  three library packages also carries a `lean_assurance_test` that audits the
+  compiled proofs themselves; see [Proof assurance](#proof-assurance).
 
 ## Protocol scope
 
@@ -287,9 +291,60 @@ no `Repr` instance, handshake secrets and scalars are dropped from state on
 completion, and Finished verification is constant-time — but there is no
 zeroization of Lean-side key material.
 
+### The `bv_decide` LRAT certificates
+
+One more item belongs on that list, and it sits *inside* the proofs rather than
+beside them. Seven byte-(de)composition identities — `hi_lo_recompose`,
+`recompose_hi`, `sequenceBytes_inj` and `nonceOf_inj` in `Tls.Record.Laws`,
+`uint16_recompose`, `uint32_recompose` and `uint16_hi` in `Tls.Handshake` — are
+discharged by `bv_decide`, which runs CaDiCaL on the reflected `BitVec` goal and
+checks the resulting LRAT refutation with a *natively compiled* checker rather
+than in the kernel. Lean records that shortcut honestly: each call site gets its
+own axiom, `<lemma>._native.bv_decide.ax_1_5`, whose statement is
+`Std.Tactic.BVDecide.Reflect.verifyBVExpr <that goal> <that certificate> = true`.
+
+So the trust item is narrow and specific — the compiled LRAT checker and the
+compiler that built it, applied to seven fixed certificates — but it is real,
+and it **does** reach the headline theorems. `Tls.Record.WriteRun.nodup` and both
+engines' `run_nonce_nodup` depend on `nonceOf_inj`'s certificate; record
+conservation (`Decoder.feed_conservation`) and seal/open
+(`decodeStep_seal_open`) on `recompose_hi`'s and `hi_lo_recompose`'s;
+ClientHello canonicity (`parseClientHello_canonical`,
+`parseClientHello_body_injective`) and the retry check
+(`checkRetryClientHello_body_eq`) on `uint16_hi`'s. Everything else listed as a
+principal theorem below — the whole X.509/DER tier, `open_seal`, the handshake
+message roundtrips, and every state-machine transition law — closes over nothing
+but `propext`, `Classical.choice` and `Quot.sound`. The audit prints the exact
+axiom set of each theorem, so this is checked rather than asserted; eliminating
+the certificates by proving the seven identities from core's `BitVec` `getLsbD`
+lemmas is open follow-up work.
+
+## Proof assurance
+
+The claims above are not left to prose. Three `lean_assurance_test` targets
+(from `rules_lean`) re-derive them from the compiled `Environment` while the
+test binary is built, so a violation is a red target, not a stale README:
+
+| Target | What it certifies |
+| --- | --- |
+| `//HaclStar:haclstar_assurance` | The trusted C boundary: the 16 `@[extern] opaque` bindings are accounted for and no proof hole exists in the FFI package |
+| `//TLS13:tls13_assurance` | 10 principal theorems — DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies` |
+| `//Tls:tls_assurance` | 37 principal theorems — nonce non-reuse (`WriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, nonce and sequence injectivity), record conservation and seal/open inversion, ClientHello canonicity and body injectivity, and the state-machine transition and invariant laws |
+
+Each target also scans every constant of the whole first-party closure
+(`HaclStar`, `TLS13`, `Tls` — 26 modules, ~4650 constants): nothing may reach
+`sorryAx`, no axiom may be declared outside the allowed set, and **no
+`@[extern]` constant may live outside the `HaclStar` modules**. That last check
+is what makes the FFI-boundary claim in the previous section mechanical: native
+code appearing anywhere else in the closure fails the build. The allowed-axiom
+set is the standard three plus the seven `bv_decide` certificates named above,
+listed one by one — so a *new* `bv_decide` call site fails the audit until it is
+reviewed and added.
+
 ## Tests
 
-`bazel test //...` runs nine hermetic, offline suites:
+`bazel test //...` runs nine hermetic, offline suites plus the three assurance
+audits above:
 
 | Target | Coverage |
 | --- | --- |

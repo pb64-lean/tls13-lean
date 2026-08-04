@@ -134,7 +134,12 @@ private def intermediateCAsBelow (path : Array Certificate) : Nat := Id.run do
     | none => pure ()
   return count
 
-private def checkIssuer
+/-- Vet one issuer/child link of a candidate path: the child's signature must
+verify under the issuer's public key over the child's retained
+`TBSCertificate.encoded` bytes, and the issuer must be a CA permitted to sign
+at this depth. Public (but not `@[expose]`d) so `checkIssuer_verifies` can be
+stated; path construction is `validate`'s business, not the caller's. -/
+def checkIssuer
     (path : Array Certificate) (issuer child : Certificate) :
     Except Failure Unit := do
   let childSerial := child.tbsCertificate.serialNumber
@@ -342,10 +347,10 @@ private theorem ite_ok_cases {ε β : Type} {c : Prop} [Decidable c]
 
 /-- Successful issuer vetting requires the cryptographic signature to have
 verified over exactly the retained `TBSCertificate.encoded` bytes of the
-child certificate. (`private` only because the module system does not allow a
-public statement about the private `checkIssuer`; it is still kernel-checked
-on every build.) -/
-private theorem checkIssuer_verifies {path : Array Certificate}
+child certificate. Together with `Certificate.decode_tbs_encoded` — which says
+those retained bytes are the exact DER substring the decoder consumed — this is
+the link that rules out signing one certificate and presenting another. -/
+theorem checkIssuer_verifies {path : Array Certificate}
     {issuer child : Certificate}
     (h : checkIssuer path issuer child = .ok ()) :
     Signature.verifyX509 child.signatureAlgorithm

@@ -632,7 +632,7 @@ private def completeClientHello (state : State) (hello : Handshake.ClientHello)
 
 /-- Emit one RFC 8446 HelloRetryRequest and replace CH1 in the transcript with
 its synthetic message_hash. No handshake keys exist at this point. -/
-private def sendHelloRetryRequest (state : State) (message : Handshake.Message)
+def sendHelloRetryRequest (state : State) (message : Handshake.Message)
     (hello : Handshake.ClientHello) (group : Handshake.NamedGroup) :
     Except Error (State × ByteArray) := do
   let retry ← liftHandshake
@@ -682,7 +682,7 @@ private def acceptClientHello (state : State) (message : Handshake.Message) :
   | phase =>
       throw (.internalState s!"acceptClientHello called while waiting for {phase.render}")
 
-private def acceptClientFinished (state : State) (message : Handshake.Message) :
+def acceptClientFinished (state : State) (message : Handshake.Message) :
     Except Error State := do
   let finished ← liftHandshake (Handshake.parseFinished message)
   let some expected := state.expectedClientFinished?
@@ -734,7 +734,7 @@ private def sendKeyUpdateResponse (state : State) : Except Error (State × ByteA
   let updatedKeys ← liftRecord advancedKeys.update
   pure ({ state with writeKeys? := some updatedKeys }, wireBytes)
 
-private def acceptKeyUpdate (state : State) (message : Handshake.Message) :
+def acceptKeyUpdate (state : State) (message : Handshake.Message) :
     Except Error (State × ByteArray) := do
   let update ← liftHandshake (Handshake.parseKeyUpdate message)
   let readKeys ← requireReadKeys state

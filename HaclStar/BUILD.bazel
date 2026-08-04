@@ -1,6 +1,6 @@
 package(default_visibility = ["//visibility:public"])
 
-load("@rules_lean//lean:defs.bzl", "lean_library")
+load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_library")
 load("//:lean_runtime_headers.bzl", "lean_runtime_headers")
 
 lean_runtime_headers(
@@ -39,4 +39,17 @@ lean_library(
         "Signature.lean",
     ],
     deps = [":hacl_shim"],
+)
+
+# The trusted C boundary, audited. These modules are the *only* place in the
+# repo where Lean constants are backed by native code, and this target is what
+# says so mechanically: every `@[extern] opaque` here is accepted, and the
+# sibling audits (//TLS13:tls13_assurance, //Tls:tls_assurance) scan the same
+# HaclStar modules with the same allowance, so an `@[extern]` appearing
+# anywhere else in the closure is a build failure. No principal theorems: there
+# is nothing to prove about an opaque FFI import — the point is the boundary.
+lean_assurance_test(
+    name = "haclstar_assurance",
+    allowed_extern_modules = ["HaclStar"],
+    deps = [":haclstar"],
 )

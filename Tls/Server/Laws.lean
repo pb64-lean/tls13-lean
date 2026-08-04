@@ -810,7 +810,7 @@ private theorem acceptClientHello_wellFormed {state next : State}
 /-- **The server becomes connected only by verifying the client Finished**
 against the value it computed when it built its own flight. This is the only
 transition into `Phase.connected`. -/
-private theorem acceptClientFinished_verified {state next : State}
+theorem acceptClientFinished_verified {state next : State}
     {message : Handshake.Message}
     (h : acceptClientFinished state message = .ok next) :
     ∃ finished expected,
@@ -1056,7 +1056,7 @@ theorem feedWithFailure_closed {state : State} {chunk : ByteArray}
 /-- **HelloRetryRequest applies the RFC 8446 §4.4.1 synthetic transcript**: the
 first ClientHello is replaced by `message_hash(CH1)` before the
 HelloRetryRequest is appended. -/
-private theorem sendHelloRetryRequest_messageHash {state next : State}
+theorem sendHelloRetryRequest_messageHash {state next : State}
     {message : Handshake.Message} {hello : Handshake.ClientHello}
     {group : Handshake.NamedGroup} {wire : ByteArray}
     (h : sendHelloRetryRequest state message hello group = .ok (next, wire)) :
@@ -1082,7 +1082,7 @@ private theorem sendHelloRetryRequest_messageHash {state next : State}
 /-- **A KeyUpdate really changes the epoch**: the peer's new read traffic secret
 is the RFC 8446 §7.2 successor of the old one, and its record sequence number
 restarts at zero. -/
-private theorem acceptKeyUpdate_epoch {state next : State}
+theorem acceptKeyUpdate_epoch {state next : State}
     {message : Handshake.Message} {wire : ByteArray}
     (h : acceptKeyUpdate state message = .ok (next, wire)) :
     ∃ keys keys', state.readKeys? = some keys ∧ next.readKeys? = some keys' ∧

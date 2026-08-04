@@ -453,7 +453,7 @@ private def feedPlaintextHandshake (state : State) (fragment : ByteArray) :
 private def appendTranscript (state : State) (message : Handshake.Message) : State :=
   { state with transcript := state.transcript ++ message.encoded }
 
-private def completeServerHandshake (state : State) (message : Handshake.Message) :
+def completeServerHandshake (state : State) (message : Handshake.Message) :
     Except Error (State × ByteArray) := do
   let finished ← liftHandshake (Handshake.parseFinished message)
   let serverTrafficSecret ← requireServerHandshakeTrafficSecret state
@@ -531,7 +531,7 @@ private def sendKeyUpdateResponse (state : State) : Except Error (State × ByteA
   let updatedKeys ← liftRecord advancedKeys.update
   pure ({ state with writeKeys? := some updatedKeys }, wireBytes)
 
-private def acceptKeyUpdate (state : State) (message : Handshake.Message) :
+def acceptKeyUpdate (state : State) (message : Handshake.Message) :
     Except Error (State × ByteArray) := do
   let update ← liftHandshake (Handshake.parseKeyUpdate message)
   let readKeys ← requireReadKeys state

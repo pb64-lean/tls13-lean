@@ -1,6 +1,6 @@
 package(default_visibility = ["//visibility:public"])
 
-load("@rules_lean//lean:defs.bzl", "lean_library")
+load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_library")
 
 # Reusable sans-I/O TLS 1.3 protocol core (record layer, handshake codecs, and
 # client + server state machines) over the verified HACL* crypto and X.509 in
@@ -20,4 +20,90 @@ lean_library(
         "//HaclStar:haclstar",
         "//TLS13:tls13",
     ],
+)
+
+# `bv_decide` discharges the byte (de)composition identities in `Tls.Record.Laws`
+# and `Tls.Handshake` by running CaDiCaL and checking the resulting LRAT
+# certificate with a *natively compiled* checker. Lean records that step as one
+# generated axiom per call site — `<lemma>._native.bv_decide.ax_1_5`, private,
+# hence the `_private.<module>.0.` mangling — asserting that the certificate
+# verifies the reflected BitVec expression. That is a genuine trust-boundary
+# item (see the README's trusted computing base section), so it is allowed here
+# by exact name rather than by pattern: any *new* `bv_decide` call site fails
+# this audit until it is reviewed and listed.
+BV_DECIDE_LRAT_AXIOMS = [
+    "_private.Tls.Record.Laws.0.Tls.Record.hi_lo_recompose._native.bv_decide.ax_1_5",
+    "_private.Tls.Record.Laws.0.Tls.Record.recompose_hi._native.bv_decide.ax_1_5",
+    "_private.Tls.Record.Laws.0.Tls.Record.sequenceBytes_inj._native.bv_decide.ax_1_5",
+    "_private.Tls.Record.Laws.0.Tls.Record.nonceOf_inj._native.bv_decide.ax_1_5",
+    "_private.Tls.Handshake.0.Tls.Handshake.uint16_recompose._native.bv_decide.ax_1_5",
+    "_private.Tls.Handshake.0.Tls.Handshake.uint32_recompose._native.bv_decide.ax_1_5",
+    "_private.Tls.Handshake.0.Tls.Handshake.uint16_hi._native.bv_decide.ax_1_5",
+]
+
+# Compile-time audit of the protocol core: the headline theorems must exist, be
+# theorems, and close over nothing beyond the standard three axioms plus the
+# LRAT certificates above; no constant anywhere in the scanned closure may reach
+# `sorryAx`; and no `@[extern]` may appear outside the HaclStar FFI package.
+# `module_prefixes` covers the whole first-party closure (Tls, TLS13, HaclStar)
+# so that last check is a statement about the repository, not just this library.
+lean_assurance_test(
+    name = "tls_assurance",
+    allowed_axioms = [
+        "propext",
+        "Classical.choice",
+        "Quot.sound",
+    ] + BV_DECIDE_LRAT_AXIOMS,
+    allowed_extern_modules = ["HaclStar"],
+    module_prefixes = [
+        "HaclStar",
+        "TLS13",
+        "Tls",
+    ],
+    principal_theorems = [
+        # Nonce non-reuse: no (traffic secret, nonce) pair is ever repeated by
+        # the write side of a run, for either engine.
+        "Tls.Record.WriteRun.nodup",
+        "Tls.Client.run_nonce_nodup",
+        "Tls.Client.feed_nonce_nodup",
+        "Tls.Server.run_nonce_nodup",
+        "Tls.Server.feed_nonce_nodup",
+        "Tls.Record.nonceOf_inj",
+        "Tls.Record.TrafficKeys.nonce_inj",
+        "Tls.Record.sequenceBytes_inj",
+        # Record layer: framing conserves bytes, and open inverts seal.
+        "Tls.Record.decodeStep_conservation",
+        "Tls.Record.decodeBuffered_conservation",
+        "Tls.Record.Decoder.feed_conservation",
+        "Tls.Record.Decoder.feed_residual",
+        "Tls.Record.Decoder.feed_append",
+        "Tls.Record.open_seal",
+        "Tls.Record.decodeStep_seal_open",
+        "Tls.Record.seal_nonce",
+        # Handshake codec: a parsed ClientHello re-encodes to its own bytes, and
+        # the body determines the message.
+        "Tls.Handshake.parseClientHello_canonical",
+        "Tls.Handshake.parseClientHello_canonical_of_offersTls13",
+        "Tls.Handshake.parseClientHello_body_injective",
+        "Tls.Handshake.parseExtensions_injective",
+        "Tls.Handshake.decode_encoded",
+        "Tls.Handshake.decode_frame",
+        "Tls.Handshake.takeMessage?_conservation",
+        # State machines: the transitions that define what "connected" means.
+        "Tls.Client.completeServerHandshake_verified",
+        "Tls.Client.acceptKeyUpdate_epoch",
+        "Tls.Client.sealApplication_connected",
+        "Tls.Client.closeNotify_connected",
+        "Tls.Client.feedWithFailure_closed",
+        "Tls.Client.run_wellFormed",
+        "Tls.Server.acceptClientFinished_verified",
+        "Tls.Server.sendHelloRetryRequest_messageHash",
+        "Tls.Server.acceptKeyUpdate_epoch",
+        "Tls.Server.checkRetryClientHello_body_eq",
+        "Tls.Server.sealApplication_connected",
+        "Tls.Server.closeNotify_connected",
+        "Tls.Server.feedWithFailure_closed",
+        "Tls.Server.run_wellFormed",
+    ],
+    deps = [":tls"],
 )

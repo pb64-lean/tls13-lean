@@ -1043,7 +1043,7 @@ theorem feedWithFailure_closed {state : State} {chunk : ByteArray}
 against the transcript through the server's last handshake message, under the
 server handshake traffic secret. This is the only transition into
 `Phase.connected`. -/
-private theorem completeServerHandshake_verified {state next : State}
+theorem completeServerHandshake_verified {state next : State}
     {message : Handshake.Message} {wire : ByteArray}
     (h : completeServerHandshake state message = .ok (next, wire)) :
     ∃ finished secret,
@@ -1065,7 +1065,7 @@ private theorem completeServerHandshake_verified {state next : State}
 /-- **A KeyUpdate really changes the epoch**: the peer's new read traffic secret
 is the RFC 8446 §7.2 successor of the old one, and its record sequence number
 restarts at zero. -/
-private theorem acceptKeyUpdate_epoch {state next : State}
+theorem acceptKeyUpdate_epoch {state next : State}
     {message : Handshake.Message} {wire : ByteArray}
     (h : acceptKeyUpdate state message = .ok (next, wire)) :
     ∃ keys keys', state.readKeys? = some keys ∧ next.readKeys? = some keys' ∧
