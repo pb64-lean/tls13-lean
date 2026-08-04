@@ -31,7 +31,14 @@ Four Bazel packages:
   strict-DER and PEM decoding, full certificate parsing, chain building and
   validation, hostname verification, RSA (PKCS#1 v1.5 and PSS) signature
   verification in pure Lean, and RFC 5929 `tls-server-end-point` channel
-  binding.
+  binding. `TLS13.X509.DER` ends with kernel-checked laws about the decoder
+  as implemented: exact-slice retention (a parsed TLV's `encoded` field is
+  byte-identical to the input slice it consumed), the re-decode identity,
+  encoding uniqueness, trailing-data rejection, and canonical
+  length/identifier form lemmas. `Certificate.decode_tbs_encoded` and
+  `Chain.checkIssuer_verifies` carry retention to the trust boundary: the
+  bytes handed to certificate signature verification are exactly the
+  TBSCertificate slice parsed out of the presented DER.
 - **`Tls/`** — the sans-I/O protocol core: ChaCha20-Poly1305 record layer
   with KeyUpdate, handshake codecs for both roles (including
   HelloRetryRequest, ALPN, SNI), and the client (`Tls.Client`) and server
@@ -237,5 +244,12 @@ build because it compiles and links the HACL\* C shim.
     framing conservation, fragmentation independence, roundtrips,
     nonce/sequence lemmas, seal/open protection laws with the open∘seal
     identity stated parametrically over the opaque AEAD FFI, and
-    handshake-message extraction conservation); key schedule, handshake
-    parsers, and state-machine invariants remain
+    handshake-message extraction conservation), as are the X.509 DER laws
+    (`TLS13.X509.DER`: exact-slice retention — a parsed TLV's `encoded`
+    field is byte-identical to the consumed input slice — plus the
+    re-decode identity, encoding uniqueness, trailing-data rejection, and
+    canonical length/identifier form lemmas) and their signed-bytes
+    corollary (`Certificate.decode_tbs_encoded`, `checkIssuer_verifies`:
+    the bytes the chain validator hands to signature verification are
+    exactly the TBS slice parsed out of the certificate); key schedule,
+    handshake parsers, and state-machine invariants remain
