@@ -1350,6 +1350,11 @@ private theorem extract_get! {a : ByteArray} {s e k : Nat} (hk : s + k < e)
   rw [get!_eq_getElem (by omega), ByteArray.getElem_extract,
     get!_eq_getElem (by omega)]
 
+/-- `ByteArray` has no `LawfulBEq` instance, but its `BEq` is `Array`'s. -/
+private theorem beq_self (b : ByteArray) : (b == b) = true := by
+  show (b.data == b.data) = true
+  exact beq_self_eq_true b.data
+
 /-! ### `Except` peeling helpers -/
 
 private theorem bind_ok_ex {α β : Type} {x : Except String α}
@@ -2125,6 +2130,58 @@ private theorem readVector24_at {P X S : ByteArray} (hsz : X.size < 2 ^ 24) :
       rw [ByteArray.size_append]; rfl,
     take_at rfl]
 
+/-! Offset-explicit forms: a field read at a stated offset of a buffer that
+decomposes as `prefix ‖ field ‖ suffix`. These are what a message-body walk
+rewrites with, keeping the body itself opaque. -/
+
+private theorem take_at' {W P X S : ByteArray} {off n : Nat}
+    (hW : W = P ++ (X ++ S)) (hoff : off = P.size) (hn : X.size = n) :
+    Reader.take (Reader.mk W off) n = .ok (X, Reader.mk W (off + n)) := by
+  subst hW; subst hn; subst hoff
+  exact take_at rfl
+
+private theorem readUInt8_at' {W P S : ByteArray} {off : Nat} {b : UInt8}
+    (hW : W = P ++ (ByteArray.empty.push b ++ S)) (hoff : off = P.size) :
+    Reader.readUInt8 (Reader.mk W off) = .ok (b, Reader.mk W (off + 1)) := by
+  subst hW; subst hoff
+  exact readUInt8_at
+
+private theorem readUInt16_at' {W P S : ByteArray} {off : Nat} {v : UInt16}
+    (hW : W = P ++ (appendUInt16 ByteArray.empty v ++ S)) (hoff : off = P.size) :
+    Reader.readUInt16 (Reader.mk W off) = .ok (v, Reader.mk W (off + 2)) := by
+  subst hW; subst hoff
+  exact readUInt16_at
+
+private theorem readUInt24_at' {W P S : ByteArray} {off n : Nat}
+    (hW : W = P ++ (length24Bytes n ++ S)) (hoff : off = P.size) (h : n < 2 ^ 24) :
+    Reader.readUInt24 (Reader.mk W off) = .ok (n, Reader.mk W (off + 3)) := by
+  subst hW; subst hoff
+  exact readUInt24_at h
+
+private theorem readVector8_at' {W P X S : ByteArray} {off : Nat}
+    (hW : W = P ++ (ByteArray.empty.push (UInt8.ofNat X.size) ++ (X ++ S)))
+    (hoff : off = P.size) (hsz : X.size < 2 ^ 8) :
+    Reader.readVector8 (Reader.mk W off) =
+      .ok (X, Reader.mk W (off + 1 + X.size)) := by
+  subst hW; subst hoff
+  exact readVector8_at hsz
+
+private theorem readVector16_at' {W P X S : ByteArray} {off : Nat}
+    (hW : W = P ++ (appendUInt16 ByteArray.empty (UInt16.ofNat X.size) ++ (X ++ S)))
+    (hoff : off = P.size) (hsz : X.size < 2 ^ 16) :
+    Reader.readVector16 (Reader.mk W off) =
+      .ok (X, Reader.mk W (off + 2 + X.size)) := by
+  subst hW; subst hoff
+  exact readVector16_at hsz
+
+private theorem readVector24_at' {W P X S : ByteArray} {off : Nat}
+    (hW : W = P ++ (length24Bytes X.size ++ (X ++ S))) (hoff : off = P.size)
+    (hsz : X.size < 2 ^ 24) :
+    Reader.readVector24 (Reader.mk W off) =
+      .ok (X, Reader.mk W (off + 3 + X.size)) := by
+  subst hW; subst hoff
+  exact readVector24_at hsz
+
 private theorem size_extensionBytes (e : Extension) :
     (extensionBytes e).size = 4 + e.data.size := by
   unfold extensionBytes
@@ -2410,6 +2467,148 @@ theorem encodeEncryptedExtensions_parse_some {protocol : String} {msg : Message}
     (by rw [hmsg]) (by rw [hmsg, hbytes]; exact hVeq) (by rw [hbytes]; exact hszlt)
     (by intro e he; rw [List.mem_singleton] at he; subst he; exact hDsz)
     (List.pairwise_singleton ..)
+
+/-! ### HelloRetryRequest discrimination
+
+An HRR is a ServerHello whose random field is the fixed RFC 8446 sentinel.
+These laws pin that down on both sides: the sentinel is where the
+discriminator looks, and each parser rejects the other message. -/
+
+/-- A six-segment body has its second segment right after the first. -/
+private theorem append_head6 (a b x1 x2 x3 x4 : ByteArray) :
+    ∃ T, a ++ b ++ x1 ++ x2 ++ x3 ++ x4 = a ++ (b ++ T) :=
+  ⟨x1 ++ x2 ++ x3 ++ x4, by simp only [ByteArray.append_assoc]⟩
+
+/-- The random field of an encoded ServerHello-shaped body is at offset 2. -/
+private theorem serverHelloRandom {R T : ByteArray} (hR : R.size = 32) :
+    (appendUInt16 ByteArray.empty legacyTls12Version ++ (R ++ T)).extract 2 34
+      = R := by
+  have h := extract_mid (appendUInt16 ByteArray.empty legacyTls12Version) R T
+  rw [show (appendUInt16 ByteArray.empty legacyTls12Version).size = 2 from rfl,
+    hR] at h
+  exact h
+
+/-- A HelloRetryRequest body starts with `legacy_version ‖ sentinel random`. -/
+private theorem encodeHelloRetryRequest_body {legacySessionIdEcho : ByteArray}
+    {group : NamedGroup} {cipherSuite : UInt16} {msg : Message}
+    (h : encodeHelloRetryRequest legacySessionIdEcho group cipherSuite = .ok msg) :
+    msg.msgType = serverHelloType ∧
+    ∃ T, msg.body = appendUInt16 ByteArray.empty legacyTls12Version ++
+      (helloRetryRequestRandom ++ T) := by
+  unfold encodeHelloRetryRequest at h
+  obtain ⟨hc, h⟩ | ⟨hc, h⟩ := ite_ok_cases h
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+  obtain ⟨_, _, h⟩ := bind_ok_ex h
+  obtain ⟨_, _, h⟩ := bind_ok_ex h
+  obtain ⟨_, _, h⟩ := bind_ok_ex h
+  obtain ⟨_, _, h⟩ := bind_ok_ex h
+  obtain ⟨_, _, h⟩ := bind_ok_ex h
+  obtain ⟨hlt, hmsg⟩ := frame_spec h
+  refine ⟨by rw [hmsg], ?_⟩
+  simp only [hmsg]
+  exact append_head6 ..
+
+/-- A ServerHello body starts with `legacy_version ‖ random`. -/
+private theorem encodeServerHello_body {random legacySessionIdEcho : ByteArray}
+    {group : NamedGroup} {keyExchange : ByteArray} {cipherSuite : UInt16}
+    {msg : Message}
+    (h : encodeServerHello random legacySessionIdEcho group keyExchange
+      cipherSuite = .ok msg) :
+    msg.msgType = serverHelloType ∧ random.size = 32 ∧
+    ∃ T, msg.body = appendUInt16 ByteArray.empty legacyTls12Version ++
+      (random ++ T) := by
+  unfold encodeServerHello at h
+  obtain ⟨hc, h⟩ | ⟨hc, h⟩ := ite_ok_cases h
+  · obtain ⟨hc2, h⟩ | ⟨hc2, h⟩ := ite_ok_cases h
+    · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+      cases hu
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨hlt, hmsg⟩ := frame_spec h
+    refine ⟨by rw [hmsg], by simpa using hc, ?_⟩
+    simp only [hmsg]
+    exact append_head6 ..
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+
+/-- **HRR discrimination**: an encoded HelloRetryRequest is recognised by the
+sentinel random. -/
+theorem encodeHelloRetryRequest_isHelloRetryRequest {legacySessionIdEcho : ByteArray}
+    {group : NamedGroup} {cipherSuite : UInt16} {msg : Message}
+    (h : encodeHelloRetryRequest legacySessionIdEcho group cipherSuite = .ok msg) :
+    isHelloRetryRequest msg = true := by
+  obtain ⟨hty, T, hbody⟩ := encodeHelloRetryRequest_body h
+  have hsize : 34 ≤ msg.body.size := by
+    rw [hbody, ByteArray.size_append, ByteArray.size_append,
+      show (appendUInt16 ByteArray.empty legacyTls12Version).size = 2 from rfl,
+      show helloRetryRequestRandom.size = 32 from rfl]
+    omega
+  unfold isHelloRetryRequest
+  rw [hty, hbody, serverHelloRandom rfl,
+    show (serverHelloType == serverHelloType) = true from rfl,
+    beq_self helloRetryRequestRandom]
+  rw [hbody] at hsize
+  simp only [Bool.true_and, Bool.and_true, decide_eq_true_eq]
+  omega
+
+/-- **HRR discrimination**: an encoded ServerHello whose random is not the
+sentinel is not mistaken for a HelloRetryRequest. -/
+theorem encodeServerHello_not_isHelloRetryRequest {random legacySessionIdEcho : ByteArray}
+    {group : NamedGroup} {keyExchange : ByteArray} {cipherSuite : UInt16}
+    {msg : Message}
+    (h : encodeServerHello random legacySessionIdEcho group keyExchange
+      cipherSuite = .ok msg)
+    (hrand : (random == helloRetryRequestRandom) = false) :
+    isHelloRetryRequest msg = false := by
+  obtain ⟨hty, hR, T, hbody⟩ := encodeServerHello_body h
+  unfold isHelloRetryRequest
+  rw [hty, hbody, serverHelloRandom hR, hrand]
+  simp
+
+/-- **HRR discrimination**: the ServerHello parser refuses a HelloRetryRequest
+rather than mis-parsing it. -/
+theorem encodeHelloRetryRequest_parseServerHello {legacySessionIdEcho : ByteArray}
+    {group : NamedGroup} {cipherSuite : UInt16} {msg : Message}
+    (h : encodeHelloRetryRequest legacySessionIdEcho group cipherSuite = .ok msg) :
+    parseServerHello msg = .error "expected ServerHello, got HelloRetryRequest" := by
+  obtain ⟨hty, T, hbody⟩ := encodeHelloRetryRequest_body h
+  unfold parseServerHello
+  rw [hty, if_pos (show (serverHelloType == serverHelloType) = true from rfl)]
+  simp only [readUInt16_at' (W := msg.body) (off := 0) (v := legacyTls12Version)
+    (P := ByteArray.empty) (S := helloRetryRequestRandom ++ T)
+    (by rw [hbody, ByteArray.empty_append]) rfl]
+  rw [if_pos (beq_self_eq_true legacyTls12Version)]
+  simp only [take_at' (W := msg.body) (off := 0 + 2) (n := 32)
+    (P := appendUInt16 ByteArray.empty legacyTls12Version)
+    (X := helloRetryRequestRandom) (S := T) hbody rfl rfl]
+  rw [if_pos (beq_self helloRetryRequestRandom)]
+
+/-- **HRR discrimination**: the HelloRetryRequest parser refuses a ServerHello
+whose random is not the sentinel. -/
+theorem encodeServerHello_parseHelloRetryRequest {random legacySessionIdEcho : ByteArray}
+    {group : NamedGroup} {keyExchange : ByteArray} {cipherSuite : UInt16}
+    {msg : Message}
+    (h : encodeServerHello random legacySessionIdEcho group keyExchange
+      cipherSuite = .ok msg)
+    (hrand : (random == helloRetryRequestRandom) = false) :
+    parseHelloRetryRequest msg =
+      .error "ServerHello random is not the HelloRetryRequest sentinel" := by
+  obtain ⟨hty, hR, T, hbody⟩ := encodeServerHello_body h
+  unfold parseHelloRetryRequest
+  rw [hty, if_pos (show (serverHelloType == serverHelloType) = true from rfl)]
+  simp only [readUInt16_at' (W := msg.body) (off := 0) (v := legacyTls12Version)
+    (P := ByteArray.empty) (S := random ++ T)
+    (by rw [hbody, ByteArray.empty_append]) rfl]
+  rw [if_pos (beq_self_eq_true legacyTls12Version)]
+  simp only [take_at' (W := msg.body) (off := 0 + 2) (n := 32)
+    (P := appendUInt16 ByteArray.empty legacyTls12Version)
+    (X := random) (S := T) hbody rfl hR]
+  rw [if_neg (by rw [hrand]; exact Bool.false_ne_true)]
 
 end Handshake
 end Tls
