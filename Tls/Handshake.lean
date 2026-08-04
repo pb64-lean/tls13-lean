@@ -1101,12 +1101,16 @@ def uint16ListBytes : List UInt16 → ByteArray
 /-- Keep the group identifiers this implementation knows, in wire order.
 Explicit recursion (not a `for` loop) so the ClientHello laws below can
 evaluate it. -/
-private def knownGroupsLoop : List UInt16 → Array NamedGroup → Array NamedGroup
+@[expose] def knownGroupsLoop : List UInt16 → Array NamedGroup → Array NamedGroup
   | [], known => known
   | id :: rest, known =>
       match NamedGroup.ofUInt16? id with
       | some group => knownGroupsLoop rest (known.push group)
       | none => knownGroupsLoop rest known
+
+/-- The supported groups this implementation knows, in wire order. -/
+@[expose] def knownGroups (ids : List UInt16) : Array NamedGroup :=
+  knownGroupsLoop ids #[]
 
 private def parseSupportedGroups (bytes : ByteArray) :
     Except String (Array UInt16 × Array NamedGroup) :=
@@ -1116,7 +1120,7 @@ private def parseSupportedGroups (bytes : ByteArray) :
     if ids.isEmpty then
       .error "supported_groups list must not be empty"
     else
-      .ok (ids, knownGroupsLoop ids.toList #[])
+      .ok (ids, knownGroups ids.toList)
 
 /-- Record a client key share when its group is one this implementation
 offers. Unknown (including GREASE) groups are skipped here, but their
@@ -1292,120 +1296,239 @@ private def parseAlpnProtocolList (bytes : ByteArray) :
   else
     parseAlpnProtocolListLoop { bytes } #[]
 
-/-- Parse a ClientHello for the server flow. Extracts the fields the server needs
-to select a key-exchange group, verify TLS 1.3 support, and negotiate ALPN/SNI. -/
-def parseClientHello (msg : Message) : Except String ClientHello := do
-  unless msg.msgType == clientHelloType do
-    throw s!"expected ClientHello ({clientHelloType}), got handshake type {msg.msgType}"
-  let r : Reader := { bytes := msg.body }
-  let (legacyVersion, r) ← r.readUInt16
-  unless legacyVersion == legacyTls12Version do
-    throw s!"ClientHello legacy_version must be 0x0303, got {legacyVersion}"
-  let (random, r) ← r.take 32
-  let (sessionId, r) ← r.readVector8
-  unless sessionId.size ≤ 32 do
-    throw s!"ClientHello legacy session id exceeds 32 bytes ({sessionId.size})"
-  let (cipherSuitesBytes, r) ← r.readVector16
-  let cipherSuites ← parseUInt16List cipherSuitesBytes
-  if cipherSuites.isEmpty then
-    throw "ClientHello cipher_suites must not be empty"
-  let (compression, r) ← r.readVector8
-  unless compression.size == 1 && compression.get! 0 == 0 do
-    throw "ClientHello legacy_compression_methods must contain exactly null compression"
-  let extensions ←
-    if r.atEnd then
-      -- The extension block was optional in pre-extension ClientHellos. Such
-      -- a message cannot negotiate TLS 1.3, but is structurally decodable.
-      pure #[]
+/-- The wire image of a ClientHello body: `legacy_version ‖ random ‖
+legacy_session_id ‖ cipher_suites ‖ legacy_compression_methods ‖ extensions`,
+with the single null compression method RFC 8446 requires. -/
+def clientHelloBody (random legacySessionId : ByteArray)
+    (cipherSuites : List UInt16) (extensions : List Extension) : ByteArray :=
+  appendUInt16 ByteArray.empty legacyTls12Version ++ random ++
+      (ByteArray.empty.push (UInt8.ofNat legacySessionId.size) ++ legacySessionId) ++
+      (appendUInt16 ByteArray.empty
+          (UInt16.ofNat (uint16ListBytes cipherSuites).size) ++
+        uint16ListBytes cipherSuites) ++
+      (ByteArray.empty.push 1 ++ ByteArray.empty.push 0) ++
+    (appendUInt16 ByteArray.empty
+        (UInt16.ofNat (extensionsBytes extensions).size) ++
+      extensionsBytes extensions)
+
+/-- The ClientHello extension block, absent in pre-extension ClientHellos.
+Split out (like the extension-body parsers below) so `parseClientHello` stays a
+flat `if`/`match` chain. -/
+private def parseClientExtensionBlock (r : Reader) :
+    Except String (Array Extension) :=
+  if r.atEnd then
+    -- The extension block was optional in pre-extension ClientHellos. Such
+    -- a message cannot negotiate TLS 1.3, but is structurally decodable.
+    .ok #[]
+  else
+    match r.readVector16 with
+    | .error e => .error e
+    | .ok (extensionBytes, r) =>
+      match r.requireEnd "ClientHello" with
+      | .error e => .error e
+      | .ok () => parseExtensions extensionBytes
+
+/-- RFC 8446 requires pre_shared_key to be the last extension and to come with
+psk_key_exchange_modes. -/
+private def checkClientPsk (extensions : Array Extension) : Except String Unit :=
+  match findExtension? extensions preSharedKeyExtension with
+  | none => .ok ()
+  | some _ =>
+    if !extensions.isEmpty &&
+        extensions[extensions.size - 1]!.extensionType == preSharedKeyExtension then
+      match findExtension? extensions pskKeyExchangeModesExtension with
+      | none =>
+          .error "ClientHello offered pre_shared_key without psk_key_exchange_modes"
+      | some modes =>
+        match ({ bytes := modes.data } : Reader).readVector8 with
+        | .error e => .error e
+        | .ok (values, mr) =>
+          match mr.requireEnd "ClientHello psk_key_exchange_modes" with
+          | .error e => .error e
+          | .ok () =>
+            if values.isEmpty then
+              .error "ClientHello psk_key_exchange_modes must not be empty"
+            else
+              .ok ()
     else
-      let (extensionBytes, r) ← r.readVector16
-      r.requireEnd "ClientHello"
-      parseExtensions extensionBytes
+      .error "ClientHello pre_shared_key must be the final extension"
 
-  if let some _ := findExtension? extensions preSharedKeyExtension then
-    unless !extensions.isEmpty &&
-        extensions[extensions.size - 1]!.extensionType == preSharedKeyExtension do
-      throw "ClientHello pre_shared_key must be the final extension"
-    let some modes := findExtension? extensions pskKeyExchangeModesExtension
-      | throw "ClientHello offered pre_shared_key without psk_key_exchange_modes"
-    let mr : Reader := { bytes := modes.data }
-    let (values, mr) ← mr.readVector8
-    mr.requireEnd "ClientHello psk_key_exchange_modes"
-    if values.isEmpty then
-      throw "ClientHello psk_key_exchange_modes must not be empty"
-
-  let supportedVersionIds ←
-    match findExtension? extensions supportedVersionsExtension with
-    | none => pure #[]
-    | some ext =>
-        let vr : Reader := { bytes := ext.data }
-        let (list, vr) ← vr.readVector8
-        vr.requireEnd "ClientHello supported_versions"
-        if list.isEmpty then
-          throw "ClientHello supported_versions list must not be empty"
-        parseUInt16List list
-  let offersTls13 := supportedVersionIds.contains tls13Version
-
-  let (supportedGroupIds, supportedGroups) ←
-    match findExtension? extensions supportedGroupsExtension with
-    | none => pure (#[], #[])
-    | some ext =>
-        let gr : Reader := { bytes := ext.data }
-        let (list, gr) ← gr.readVector16
-        gr.requireEnd "ClientHello supported_groups"
-        parseSupportedGroups list
-
-  let (keyShareGroupIds, keyShares) ←
-    match findExtension? extensions keyShareExtension with
-    | none => pure (#[], #[])
-    | some ext =>
-        let kr : Reader := { bytes := ext.data }
-        let (entries, kr) ← kr.readVector16
-        kr.requireEnd "ClientHello key_share"
-        parseKeyShareEntries entries
-  -- Keep missing-extension policy at the connection layer so it can emit the
-  -- TLS 1.3 `missing_extension` alert. When supported_groups is present, its
-  -- ordering constraint on key_share entries is still a wire-codec invariant.
-  if (findExtension? extensions supportedGroupsExtension).isSome then
-    unless isOrderedSubset keyShareGroupIds supportedGroupIds do
-      throw "ClientHello key_share groups must occur in supported_groups order"
-
-  let signatureAlgorithms ←
-    match findExtension? extensions signatureAlgorithmsExtension with
-    | none => pure #[]
-    | some ext =>
-        let sr : Reader := { bytes := ext.data }
-        let (list, sr) ← sr.readVector16
-        sr.requireEnd "ClientHello signature_algorithms"
-        if list.isEmpty then
-          throw "ClientHello signature_algorithms list must not be empty"
+/-- The supported_versions extension body a client sends: a `uint8`-prefixed
+vector of version identifiers, kept verbatim. -/
+private def parseClientVersions (data : ByteArray) : Except String (Array UInt16) :=
+  match ({ bytes := data } : Reader).readVector8 with
+  | .error e => .error e
+  | .ok (list, vr) =>
+    match vr.requireEnd "ClientHello supported_versions" with
+    | .error e => .error e
+    | .ok () =>
+      if list.isEmpty then
+        .error "ClientHello supported_versions list must not be empty"
+      else
         parseUInt16List list
 
-  let serverName ←
-    match findExtension? extensions serverNameExtension with
-    | none => pure none
-    | some ext =>
-        let sr : Reader := { bytes := ext.data }
-        let (list, sr) ← sr.readVector16
-        sr.requireEnd "ClientHello server_name"
-        parseServerNameList list
+/-- The supported_groups extension body. -/
+private def parseClientGroups (data : ByteArray) :
+    Except String (Array UInt16 × Array NamedGroup) :=
+  match ({ bytes := data } : Reader).readVector16 with
+  | .error e => .error e
+  | .ok (list, gr) =>
+    match gr.requireEnd "ClientHello supported_groups" with
+    | .error e => .error e
+    | .ok () => parseSupportedGroups list
 
-  let alpnProtocols ←
-    match findExtension? extensions alpnExtension with
-    | none => pure #[]
-    | some ext =>
-        let ar : Reader := { bytes := ext.data }
-        let (list, ar) ← ar.readVector16
-        ar.requireEnd "ClientHello ALPN"
-        parseAlpnProtocolList list
+/-- The client key_share extension body. -/
+private def parseClientKeyShare (data : ByteArray) :
+    Except String (Array UInt16 × Array ClientKeyShare) :=
+  match ({ bytes := data } : Reader).readVector16 with
+  | .error e => .error e
+  | .ok (entries, kr) =>
+    match kr.requireEnd "ClientHello key_share" with
+    | .error e => .error e
+    | .ok () => parseKeyShareEntries entries
 
-  pure {
-    random, legacySessionId := sessionId, cipherSuites,
-    supportedVersionIds, supportedGroupIds, supportedGroups,
-    keyShareGroupIds, keyShares,
-    signatureAlgorithms, serverName, alpnProtocols, extensions, offersTls13,
-    encoded := msg.encoded
-  }
+/-- The signature_algorithms extension body. -/
+private def parseClientSignatureAlgorithms (data : ByteArray) :
+    Except String (Array UInt16) :=
+  match ({ bytes := data } : Reader).readVector16 with
+  | .error e => .error e
+  | .ok (list, sr) =>
+    match sr.requireEnd "ClientHello signature_algorithms" with
+    | .error e => .error e
+    | .ok () =>
+      if list.isEmpty then
+        .error "ClientHello signature_algorithms list must not be empty"
+      else
+        parseUInt16List list
+
+/-- The server_name extension body. -/
+private def parseClientServerName (data : ByteArray) :
+    Except String (Option String) :=
+  match ({ bytes := data } : Reader).readVector16 with
+  | .error e => .error e
+  | .ok (list, sr) =>
+    match sr.requireEnd "ClientHello server_name" with
+    | .error e => .error e
+    | .ok () => parseServerNameList list
+
+/-- The ALPN extension body. -/
+private def parseClientAlpn (data : ByteArray) : Except String (Array String) :=
+  match ({ bytes := data } : Reader).readVector16 with
+  | .error e => .error e
+  | .ok (list, ar) =>
+    match ar.requireEnd "ClientHello ALPN" with
+    | .error e => .error e
+    | .ok () => parseAlpnProtocolList list
+
+/-- Look up an optional extension and parse its body, defaulting when absent. -/
+private def parseOptionalExtension {α : Type} (extensions : Array Extension)
+    (extensionType : UInt16) (dflt : α) (parse : ByteArray → Except String α) :
+    Except String α :=
+  match findExtension? extensions extensionType with
+  | none => .ok dflt
+  | some ext => parse ext.data
+
+/-- Parse a ClientHello for the server flow. Extracts the fields the server needs
+to select a key-exchange group, verify TLS 1.3 support, and negotiate ALPN/SNI.
+(Written as a pure `if`/`match` chain so the ClientHello laws below can evaluate
+it.) `parseClientHello_clientHelloBody_opaque` proves that it returns the
+cipher-suite list and the whole extension list of a `clientHelloBody` verbatim
+when the extensions are ones this implementation does not interpret. -/
+def parseClientHello (msg : Message) : Except String ClientHello :=
+  if msg.msgType == clientHelloType then
+    match ({ bytes := msg.body } : Reader).readUInt16 with
+    | .error e => .error e
+    | .ok (legacyVersion, r) =>
+      if legacyVersion == legacyTls12Version then
+        match r.take 32 with
+        | .error e => .error e
+        | .ok (random, r) =>
+          match r.readVector8 with
+          | .error e => .error e
+          | .ok (sessionId, r) =>
+            if sessionId.size ≤ 32 then
+              match r.readVector16 with
+              | .error e => .error e
+              | .ok (cipherSuitesBytes, r) =>
+                match parseUInt16List cipherSuitesBytes with
+                | .error e => .error e
+                | .ok cipherSuites =>
+                  if cipherSuites.isEmpty then
+                    .error "ClientHello cipher_suites must not be empty"
+                  else
+                    match r.readVector8 with
+                    | .error e => .error e
+                    | .ok (compression, r) =>
+                      if compression.size == 1 && compression.get! 0 == 0 then
+                        match parseClientExtensionBlock r with
+                        | .error e => .error e
+                        | .ok extensions =>
+                          match checkClientPsk extensions with
+                          | .error e => .error e
+                          | .ok () =>
+                            match parseOptionalExtension extensions
+                                supportedVersionsExtension #[]
+                                parseClientVersions with
+                            | .error e => .error e
+                            | .ok supportedVersionIds =>
+                              match parseOptionalExtension extensions
+                                  supportedGroupsExtension (#[], #[])
+                                  parseClientGroups with
+                              | .error e => .error e
+                              | .ok (supportedGroupIds, supportedGroups) =>
+                                match parseOptionalExtension extensions
+                                    keyShareExtension (#[], #[])
+                                    parseClientKeyShare with
+                                | .error e => .error e
+                                | .ok (keyShareGroupIds, keyShares) =>
+                                  -- Keep missing-extension policy at the
+                                  -- connection layer so it can emit the TLS 1.3
+                                  -- `missing_extension` alert. When
+                                  -- supported_groups is present, its ordering
+                                  -- constraint on key_share entries is still a
+                                  -- wire-codec invariant.
+                                  if (findExtension? extensions
+                                        supportedGroupsExtension).isSome &&
+                                      !isOrderedSubset keyShareGroupIds
+                                        supportedGroupIds then
+                                    .error "ClientHello key_share groups must occur in supported_groups order"
+                                  else
+                                    match parseOptionalExtension extensions
+                                        signatureAlgorithmsExtension #[]
+                                        parseClientSignatureAlgorithms with
+                                    | .error e => .error e
+                                    | .ok signatureAlgorithms =>
+                                      match parseOptionalExtension extensions
+                                          serverNameExtension none
+                                          parseClientServerName with
+                                      | .error e => .error e
+                                      | .ok serverName =>
+                                        match parseOptionalExtension extensions
+                                            alpnExtension #[]
+                                            parseClientAlpn with
+                                        | .error e => .error e
+                                        | .ok alpnProtocols =>
+                                          .ok {
+                                            random,
+                                            legacySessionId := sessionId,
+                                            cipherSuites,
+                                            supportedVersionIds,
+                                            supportedGroupIds, supportedGroups,
+                                            keyShareGroupIds, keyShares,
+                                            signatureAlgorithms, serverName,
+                                            alpnProtocols, extensions,
+                                            offersTls13 :=
+                                              supportedVersionIds.contains
+                                                tls13Version,
+                                            encoded := msg.encoded }
+                      else
+                        .error "ClientHello legacy_compression_methods must contain exactly null compression"
+            else
+              .error s!"ClientHello legacy session id exceeds 32 bytes ({sessionId.size})"
+      else
+        .error s!"ClientHello legacy_version must be 0x0303, got {legacyVersion}"
+  else
+    .error s!"expected ClientHello ({clientHelloType}), got handshake type {msg.msgType}"
 
 /-- Build a ServerHello selecting TLS 1.3, a caller-selected cipher suite, and
 one key-share group. `legacySessionIdEcho` must echo the ClientHello's
@@ -3521,6 +3644,213 @@ theorem parseUInt16List_uint16ListBytes (l : List UInt16) :
     rfl]
   rw [parseUInt16ListLoop_uint16ListBytes l ByteArray.empty #[]]
   rfl
+
+/-! ### ClientHello -/
+
+private theorem except_bind_ok {α β : Type} (a : α) (f : α → Except String β) :
+    (Except.ok a >>= f) = f a := rfl
+
+private theorem except_pure_bind {α β : Type} (a : α) (f : α → Except String β) :
+    ((pure a : Except String α) >>= f) = f a := rfl
+
+private theorem parseOptionalExtension_none {α : Type}
+    {extensions : Array Extension} {t : UInt16} {dflt : α}
+    {parse : ByteArray → Except String α}
+    (h : findExtension? extensions t = none) :
+    parseOptionalExtension extensions t dflt parse = .ok dflt := by
+  unfold parseOptionalExtension
+  rw [h]
+
+private theorem parseOptionalExtension_some {α : Type}
+    {extensions : Array Extension} {t : UInt16} {dflt : α}
+    {parse : ByteArray → Except String α} {ext : Extension}
+    (h : findExtension? extensions t = some ext) :
+    parseOptionalExtension extensions t dflt parse = parse ext.data := by
+  unfold parseOptionalExtension
+  rw [h]
+
+private theorem checkClientPsk_none {extensions : Array Extension}
+    (h : findExtension? extensions preSharedKeyExtension = none) :
+    checkClientPsk extensions = .ok () := by
+  unfold checkClientPsk
+  rw [h]
+
+private theorem findExtension?_eq_none {l : List Extension} {t : UInt16}
+    (h : ∀ e ∈ l, (e.extensionType == t) = false) :
+    findExtension? l.toArray t = none := by
+  unfold findExtension?
+  rw [List.find?_toArray, List.find?_eq_none]
+  intro x hx
+  rw [h x hx]
+  exact Bool.false_ne_true
+
+/-- **ClientHello preservation (GREASE tolerance)**: a ClientHello whose
+extensions this implementation does not interpret parses with its cipher-suite
+list and its *whole* extension list returned verbatim — in wire order, nothing
+dropped or reordered, whatever the extension types and cipher-suite values are.
+That is exactly what a GREASE-sending client requires of a server. -/
+theorem parseClientHello_clientHelloBody_opaque {msg : Message}
+    {random legacySessionId : ByteArray} {cipherSuites : List UInt16}
+    {l : List Extension}
+    (hty : msg.msgType = clientHelloType)
+    (hbody : msg.body = clientHelloBody random legacySessionId cipherSuites l)
+    (hR : random.size = 32) (hsid : legacySessionId.size < 2 ^ 8)
+    (hsid32 : legacySessionId.size ≤ 32)
+    (hcs : (uint16ListBytes cipherSuites).size < 2 ^ 16)
+    (hcsne : cipherSuites ≠ [])
+    (hE : (extensionsBytes l).size < 2 ^ 16)
+    (hesz : ∀ e ∈ l, e.data.size < 2 ^ 16)
+    (hedist : l.Pairwise (fun a b => (a.extensionType == b.extensionType) = false))
+    (hopaque : ∀ e ∈ l,
+      (e.extensionType == preSharedKeyExtension) = false ∧
+      (e.extensionType == supportedVersionsExtension) = false ∧
+      (e.extensionType == supportedGroupsExtension) = false ∧
+      (e.extensionType == keyShareExtension) = false ∧
+      (e.extensionType == signatureAlgorithmsExtension) = false ∧
+      (e.extensionType == serverNameExtension) = false ∧
+      (e.extensionType == alpnExtension) = false) :
+    parseClientHello msg = .ok
+      { random := random, legacySessionId := legacySessionId,
+        cipherSuites := cipherSuites.toArray,
+        supportedVersionIds := #[], supportedGroupIds := #[],
+        supportedGroups := #[], keyShareGroupIds := #[], keyShares := #[],
+        signatureAlgorithms := #[], serverName := none, alpnProtocols := #[],
+        extensions := l.toArray, offersTls13 := false,
+        encoded := msg.encoded } := by
+  have s2 : (appendUInt16 ByteArray.empty legacyTls12Version).size = 2 := rfl
+  have s1 : ∀ b : UInt8, (ByteArray.empty.push b).size = 1 := fun _ => rfl
+  have se : ∀ n : Nat, (appendUInt16 ByteArray.empty (UInt16.ofNat n)).size = 2 :=
+    fun _ => rfl
+  have r1 : Reader.readUInt16 (Reader.mk msg.body 0) =
+      .ok (legacyTls12Version, Reader.mk msg.body (0 + 2)) :=
+    readUInt16_at' (W := msg.body) (off := 0) (P := ByteArray.empty)
+      (by rw [hbody]; unfold clientHelloBody
+          simp only [ByteArray.append_assoc, ByteArray.empty_append]; rfl) rfl
+  have r2 : Reader.take (Reader.mk msg.body (0 + 2)) 32 =
+      .ok (random, Reader.mk msg.body (0 + 2 + 32)) :=
+    take_at' (W := msg.body) (off := 0 + 2) (n := 32)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version) (X := random)
+      (by rw [hbody]; unfold clientHelloBody
+          simp only [ByteArray.append_assoc]; rfl) rfl hR
+  have r3 : Reader.readVector8 (Reader.mk msg.body (0 + 2 + 32)) =
+      .ok (legacySessionId,
+        Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionId.size)) :=
+    readVector8_at' (W := msg.body) (off := 0 + 2 + 32)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version ++ random)
+      (X := legacySessionId)
+      (by rw [hbody]; unfold clientHelloBody
+          simp only [ByteArray.append_assoc]; rfl)
+      (by rw [ByteArray.size_append, s2, hR]) hsid
+  have r4 : Reader.readVector16
+      (Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionId.size)) =
+      .ok (uint16ListBytes cipherSuites, Reader.mk msg.body
+        (0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+          (uint16ListBytes cipherSuites).size)) :=
+    readVector16_at' (W := msg.body)
+      (off := 0 + 2 + 32 + 1 + legacySessionId.size)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version ++ random ++
+        (ByteArray.empty.push (UInt8.ofNat legacySessionId.size) ++
+          legacySessionId))
+      (X := uint16ListBytes cipherSuites)
+      (by rw [hbody]; unfold clientHelloBody
+          simp only [ByteArray.append_assoc]; rfl)
+      (by rw [ByteArray.size_append, ByteArray.size_append,
+        ByteArray.size_append, s2, hR, s1]; omega) hcs
+  have r5 : Reader.readVector8 (Reader.mk msg.body
+      (0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+        (uint16ListBytes cipherSuites).size)) =
+      .ok (ByteArray.empty.push 0, Reader.mk msg.body
+        (0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+          (uint16ListBytes cipherSuites).size + 1 + 1)) :=
+    readVector8_at' (W := msg.body)
+      (off := 0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+        (uint16ListBytes cipherSuites).size)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version ++ random ++
+        (ByteArray.empty.push (UInt8.ofNat legacySessionId.size) ++
+          legacySessionId) ++
+        (appendUInt16 ByteArray.empty
+            (UInt16.ofNat (uint16ListBytes cipherSuites).size) ++
+          uint16ListBytes cipherSuites))
+      (X := ByteArray.empty.push 0)
+      (by rw [hbody]; unfold clientHelloBody
+          simp only [ByteArray.append_assoc]; rfl)
+      (by rw [ByteArray.size_append, ByteArray.size_append,
+        ByteArray.size_append, ByteArray.size_append, ByteArray.size_append,
+        s2, hR, s1, se]; omega) (by decide)
+  have r6 : Reader.readVector16 (Reader.mk msg.body
+      (0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+        (uint16ListBytes cipherSuites).size + 1 + 1)) =
+      .ok (extensionsBytes l, Reader.mk msg.body
+        (0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+          (uint16ListBytes cipherSuites).size + 1 + 1 + 2 +
+          (extensionsBytes l).size)) :=
+    readVector16_at' (W := msg.body)
+      (off := 0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+        (uint16ListBytes cipherSuites).size + 1 + 1)
+      (P := appendUInt16 ByteArray.empty legacyTls12Version ++ random ++
+        (ByteArray.empty.push (UInt8.ofNat legacySessionId.size) ++
+          legacySessionId) ++
+        (appendUInt16 ByteArray.empty
+            (UInt16.ofNat (uint16ListBytes cipherSuites).size) ++
+          uint16ListBytes cipherSuites) ++
+        (ByteArray.empty.push 1 ++ ByteArray.empty.push 0))
+      (X := extensionsBytes l) (S := ByteArray.empty)
+      (by rw [hbody]; unfold clientHelloBody
+          simp only [ByteArray.append_assoc, ByteArray.append_empty])
+      (by simp only [ByteArray.size_append, s2, hR, s1, se]; omega) hE
+  have hbsize : msg.body.size = 0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+      (uint16ListBytes cipherSuites).size + 1 + 1 + 2 + (extensionsBytes l).size := by
+    rw [hbody]
+    unfold clientHelloBody
+    simp only [ByteArray.size_append, s2, hR, s1, se]
+    omega
+  have hAtEnd : ¬((Reader.mk msg.body (0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+      (uint16ListBytes cipherSuites).size + 1 + 1)).atEnd = true) := by
+    show ¬(0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+      (uint16ListBytes cipherSuites).size + 1 + 1 == msg.body.size) = true
+    rw [beq_iff_eq, hbsize]
+    omega
+  have hend : 0 + 2 + 32 + 1 + legacySessionId.size + 2 +
+      (uint16ListBytes cipherSuites).size + 1 + 1 + 2 + (extensionsBytes l).size
+      = msg.body.size := hbsize.symm
+  have hcsEmpty : ¬(cipherSuites.toArray.isEmpty = true) := by
+    cases cipherSuites with
+    | nil => exact absurd rfl hcsne
+    | cons a t => simp
+  have hf : ∀ t : UInt16, (∀ e ∈ l, (e.extensionType == t) = false) →
+      findExtension? l.toArray t = none := fun _ h => findExtension?_eq_none h
+  unfold parseClientHello
+  rw [hty, if_pos (show (clientHelloType == clientHelloType) = true from rfl)]
+  simp only [r1]
+  rw [if_pos (beq_self_eq_true legacyTls12Version)]
+  simp only [r2, r3]
+  rw [if_pos hsid32]
+  simp only [r4, parseUInt16List_uint16ListBytes cipherSuites]
+  rw [if_neg hcsEmpty]
+  simp only [r5]
+  rw [if_pos (show ((ByteArray.empty.push 0).size == 1 &&
+    (ByteArray.empty.push 0).get! 0 == 0) = true from rfl)]
+  unfold parseClientExtensionBlock
+  rw [if_neg hAtEnd]
+  simp only [r6, requireEnd_eval (context := "ClientHello") hend,
+    parseExtensions_extensionsBytes l hesz hedist,
+    checkClientPsk_none (hf preSharedKeyExtension (fun e he => (hopaque e he).1)),
+    parseOptionalExtension_none
+      (hf supportedVersionsExtension (fun e he => (hopaque e he).2.1)),
+    parseOptionalExtension_none
+      (hf supportedGroupsExtension (fun e he => (hopaque e he).2.2.1)),
+    parseOptionalExtension_none
+      (hf keyShareExtension (fun e he => (hopaque e he).2.2.2.1)),
+    parseOptionalExtension_none
+      (hf signatureAlgorithmsExtension (fun e he => (hopaque e he).2.2.2.2.1)),
+    parseOptionalExtension_none
+      (hf serverNameExtension (fun e he => (hopaque e he).2.2.2.2.2.1)),
+    parseOptionalExtension_none
+      (hf alpnExtension (fun e he => (hopaque e he).2.2.2.2.2.2)),
+    hf supportedGroupsExtension (fun e he => (hopaque e he).2.2.1),
+    Option.isSome_none, Bool.false_and]
+  rw [if_neg Bool.false_ne_true,
+    show ((#[] : Array UInt16).contains tls13Version) = false from by simp]
 
 /-! ### Client key shares
 
