@@ -131,7 +131,15 @@ def main : IO Unit := do
   | some _ => throw (IO.userError "chachapoly: tampered ciphertext authenticated!")
   | none => pure ()
 
-  -- TLS 1.3 key schedule — RFC 8448 (no PSK, empty transcript)
+  -- TLS 1.3 key schedule — RFC 8448 (no PSK, empty transcript).
+  --
+  -- These vectors are the *empirical* anchor of the key schedule; the
+  -- structural one is the RFC 8446 §7.1 refinement in
+  -- `TLS13.KeySchedule.Refinement` (labels, contexts, parents, lengths). The
+  -- two are complementary: a proof cannot say the opaque HKDF bindings compute
+  -- the right bytes, and a vector cannot say the derivation tree has the right
+  -- shape. If they ever disagree, the vector wins and the specification is
+  -- wrong.
   let early := TLS13.KeySchedule.earlySecret
   check "tls13-early-secret" early
     "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"
@@ -139,6 +147,13 @@ def main : IO Unit := do
   check "tls13-derived-secret"
     (TLS13.KeySchedule.deriveSecret early "derived" emptyHash)
     "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba"
+  -- The HkdfLabel wire structure of that very `Derive-Secret`, hand-encoded
+  -- from RFC 8446 §7.1: uint16 length 32, then `"tls13 derived"` (13 bytes) and
+  -- an empty context, each with a one-byte length prefix. This cross-checks
+  -- `TLS13.KeySchedule.hkdfLabel_bytes`, which proves the same layout.
+  check "tls13-hkdf-label"
+    (TLS13.KeySchedule.hkdfLabel 32 "derived".toUTF8 ByteArray.empty)
+    "00200d746c733133206465726976656400"
 
   -- Ed25519 signing — RFC 8032 §7.1, TEST 1 (empty message).
   let edSecret := h "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"

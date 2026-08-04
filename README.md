@@ -27,10 +27,11 @@ machine-checked, and it matters which is which:
   re-encodes to exactly the bytes it came from — HelloRetryRequest
   discrimination, no partial frame ever accepted), the **state machines**
   (nonce non-reuse across a whole connection, plus handshake state
-  invariants and transition laws), and the DER decoder (exact-slice
-  retention carried through to the bytes certificate signatures are
-  verified over). These are proofs about the executable definitions, not a
-  parallel model.
+  invariants and transition laws), the **key schedule** (structural
+  refinement against RFC 8446 §7.1's derivation tree — see below), and the
+  DER decoder (exact-slice retention carried through to the bytes
+  certificate signatures are verified over). These are proofs about the
+  executable definitions, not a parallel model.
 
 **Nonce non-reuse, stated exactly.** `Tls.Client.Laws.run_nonce_nodup` and
 `Tls.Server.Laws.run_nonce_nodup` say: for any successful run of the engine
@@ -54,11 +55,60 @@ leading from the connection's initial write state to its final one, in which no
   returns the state with that number advanced without wrapping, and for a fixed
   IV the nonce determines the sequence number.
 
-What is **not** claimed: no refinement theorem against RFC 8446, no
-security proof of the handshake or state machines, no correctness proof of the
-key schedule against the RFC's derivation graph (only the KAT in
-`hacl_kat_test`), no timing analysis of Lean control code, and nothing about
-the C shims beyond their length preconditions.
+**Key-schedule refinement, stated exactly.** `TLS13/KeySchedule/Spec.lean` is a
+declarative transcription of RFC 8446 §7.1: the `HkdfLabel` wire structure,
+`HKDF-Expand-Label`, `Derive-Secret`, and the *whole derivation diagram encoded
+as data* — for every named secret (`ext binder`, `res binder`, `c e traffic`,
+`e exp master`, `c hs traffic`, `s hs traffic`, `c ap traffic`, `s ap traffic`,
+`exp master`, `res master`), which secret it hangs off, under which label, over
+which message sequence. `Derived.tree_rfc8446` and `Label.text_rfc8446` are that
+diagram, machine-checked. `TLS13/KeySchedule/Refinement.lean` and the engines'
+laws then prove the implementation computes it. Read the fine print:
+
+- It is **structural**, not cryptographic. HKDF-Extract and HKDF-Expand are
+  opaque `@[extern]` HACL\* bindings, so no theorem here can say the schedule
+  produces the right *bytes*. Every refinement theorem is stated for an
+  arbitrary `Spec.Hkdf` the bindings implement (`Implements`), exactly as
+  `open_seal` is stated for any AEAD satisfying its round trip. What is proved
+  is that the implementation applies the primitive in the RFC's shape: the
+  RFC's labels, the RFC's contexts, the RFC's parent secrets, the RFC's output
+  lengths, in the RFC's order. That is precisely the class real TLS
+  key-schedule bugs fall into — a mistyped label, the wrong transcript at a
+  `Derive-Secret`, the handshake secret used where the master secret belongs, a
+  derivation step omitted.
+- One theorem *is* unconditionally about bytes: `hkdfLabel_bytes`. The
+  `HkdfLabel` serialization is pure Lean, so its wire image is pinned outright
+  — two big-endian length bytes, the length of `"tls13 " + Label`, the six
+  ASCII bytes of `"tls13 "` spelled out, the label, the one-byte context
+  length, the context.
+- The linkage reaches the engines. `Tls.Client.acceptServerHello_keySchedule`
+  says the client's handshake epochs are `c hs traffic` / `s hs traffic` of the
+  Handshake Secret over ClientHello…ServerHello (the same transcript
+  `acceptServerHello_transcript` identifies), and
+  `completeServerHandshake_keySchedule` says that at the moment the client
+  becomes `connected` its write epoch is `c ap traffic` and its read epoch
+  `s ap traffic`, each `Derive-Secret` of the **Master** Secret over
+  ClientHello…server Finished, with their §7.3 key/IV/sequence state.
+  `Tls.Server.completeClientHello_keySchedule` is the server's mirror, and also
+  pins the client Finished it will demand to §4.4.4's `finished_key` of the
+  client handshake traffic secret.
+- The **empirical** anchor is separate and complementary: `hacl_kat_test` checks
+  the schedule against RFC 8448's published values (`33ad0a1c…`, `6f2615a1…`)
+  and the `HkdfLabel` layout against a hand-written encoding. A proof cannot say
+  the opaque primitive computes the right bytes; a vector cannot say the tree
+  has the right shape. **If a theorem and a known-answer test ever disagree, the
+  test wins and the specification is what is wrong.**
+- Not covered: the PSK/early-data branches (`ext binder`, `res binder`,
+  `c e traffic`, `e exp master`) and the exporter/resumption outputs
+  (`exp master`, `res master`) are in the specification but this implementation
+  does not compute them, so there is nothing to refine — see
+  [Protocol scope](#protocol-scope).
+
+What is **not** claimed: no security proof of the handshake or state machines,
+no cryptographic correctness of HKDF, the AEAD, the hashes, or the signature
+primitives (they are opaque FFI bindings, trusted from HACL\*), no timing
+analysis of Lean control code, and nothing about the C shims beyond their length
+preconditions.
 
 ## Layout
 
@@ -68,7 +118,17 @@ Four Bazel packages:
   HKDF-SHA256, X25519, P-256 ECDH, ChaCha20-Poly1305 AEAD, and Ed25519 +
   ECDSA-P256 signatures (verify and sign). 16 `@[extern] opaque`
   declarations over two small C shims.
-- **`TLS13/`** — the RFC 8446 §7.1 key schedule plus the X.509 stack:
+- **`TLS13/`** — the RFC 8446 §7.1 key schedule, its specification, and the
+  X.509 stack. `TLS13.KeySchedule` is the executable schedule
+  (`HKDF-Expand-Label`, `Derive-Secret`, Early/Handshake/Master);
+  `TLS13.KeySchedule.Spec` is §7.1 transcribed declaratively over an abstract
+  HKDF interface, with the derivation diagram encoded as data (`Derived.parent`
+  / `Derived.label` / `Derived.context`, certified against the RFC by
+  `Derived.tree_rfc8446` and `Label.text_rfc8446`); and
+  `TLS13.KeySchedule.Refinement` proves the implementation computes the
+  specification for *any* HKDF the HACL\* bindings implement — `hkdfLabel`
+  byte for byte, then `expandLabel`, `deriveSecret`, and each secret of the
+  extract chain and of the `Derive-Secret` tree. Alongside it, the X.509 stack:
   strict-DER and PEM decoding, full certificate parsing, chain building and
   validation, hostname verification, RSA (PKCS#1 v1.5 and PSS) signature
   verification in pure Lean, and RFC 5929 `tls-server-end-point` channel
@@ -361,11 +421,11 @@ test binary is built, so a violation is a red target, not a stale README:
 | Target | What it certifies |
 | --- | --- |
 | `//HaclStar:haclstar_assurance` | The trusted C boundary: the 16 `@[extern] opaque` bindings are accounted for and no proof hole exists in the FFI package |
-| `//TLS13:tls13_assurance` | 10 principal theorems — DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies` |
-| `//Tls:tls_assurance` | 47 principal theorems — nonce non-reuse (`WriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, nonce and sequence injectivity), record conservation and seal/open inversion, ClientHello canonicity and body injectivity, and the state-machine transition and invariant laws (including both directions of the connected-only application-data rule and the client's no-read-epoch-before-ServerHello clause) |
+| `//TLS13:tls13_assurance` | 22 principal theorems — the RFC 8446 §7.1 derivation tree as data (`Derived.tree_rfc8446`, `Label.text_rfc8446`), the `HkdfLabel` wire image byte for byte, and the refinement of `expandLabel`/`deriveSecret`/Early/Handshake/Master/`Derive-Secret`; plus DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies` |
+| `//Tls:tls_assurance` | 58 principal theorems — nonce non-reuse (`WriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, nonce and sequence injectivity), record conservation and seal/open inversion, ClientHello canonicity and body injectivity, the §7.3/§7.2/§4.4.4 record-layer and Finished derivations and the engines' §7.1 epoch installations, and the state-machine transition and invariant laws (including both directions of the connected-only application-data rule and the client's no-read-epoch-before-ServerHello clause) |
 
 Each target also scans every constant of the whole first-party closure
-(`HaclStar`, `TLS13`, `Tls` — 26 modules, ~4750 constants): nothing may reach
+(`HaclStar`, `TLS13`, `Tls` — 28 modules, ~5080 constants): nothing may reach
 `sorryAx`, no axiom may be declared outside the allowed set, and **no
 `@[extern]` constant may live outside the `HaclStar` modules**. That last check
 is what makes the FFI-boundary claim in the previous section mechanical: native
@@ -381,7 +441,7 @@ audits above:
 
 | Target | Coverage |
 | --- | --- |
-| `hacl_kat_test` | Known-answer vectors for every binding: SHA-2 (FIPS 180), HMAC (RFC 4231), HKDF (RFC 5869), X25519 (RFC 7748), P-256 ECDH (RFC 5903), ChaCha20-Poly1305 (RFC 8439) + tamper detection, Ed25519 (RFC 8032), ECDSA roundtrip, and the key schedule against RFC 8448 |
+| `hacl_kat_test` | Known-answer vectors for every binding: SHA-2 (FIPS 180), HMAC (RFC 4231), HKDF (RFC 5869), X25519 (RFC 7748), P-256 ECDH (RFC 5903), ChaCha20-Poly1305 (RFC 8439) + tamper detection, Ed25519 (RFC 8032), ECDSA roundtrip, and the key schedule against RFC 8448 plus a hand-encoded `HkdfLabel` — the empirical counterpart to the §7.1 refinement proofs |
 | `tls_handshake_test` | Wire codecs against a GREASE-laden, fragmented, reordered ClientHello; record reassembly across TCP boundaries; missing-extension and duplicate-extension alerts; the full HelloRetryRequest flow |
 | `tls_server_interop_test` | Authenticated handshake between this repo's client and server engines (no sockets): negotiation, three-record server flight, application data both ways, 50-certificate fragmentation |
 | `x509_der_test`, `x509_certificate_test`, `x509_chain_test`, `x509_signature_test`, `x509_hostname_test`, `x509_channel_binding_test` | DER/PEM strictness corpus; OpenSSL-generated RSA/P-256/Ed25519 fixtures; chain validation success and eleven failure classes; RSA/ECDSA/PSS signature vectors and boundary rejections; hostname and channel-binding rules |
@@ -464,7 +524,13 @@ build because it compiles and links the HACL\* C shim.
     preserved by every operation; and the transition laws — peer `Finished`
     verified before a connection is established, application data protected
     only when established, closed connections terminal, the HelloRetryRequest
-    synthetic `message_hash` transcript, KeyUpdate epoch change). What remains:
-    a key-schedule correctness proof against RFC 8446 §7.1 (only known-answer
-    tested today), a refinement theorem against the RFC, and any security
-    argument
+    synthetic `message_hash` transcript, KeyUpdate epoch change) and the
+    key-schedule refinement against RFC 8446 §7.1 (`TLS13.KeySchedule.Spec`
+    transcribes the derivation tree as data; `TLS13.KeySchedule.Refinement`
+    and the engines' laws prove the implementation computes it, parametrically
+    over the opaque HKDF). What remains: the §7.1 branches this implementation
+    does not compute (PSK binders, early data, exporter and resumption master
+    secrets) have a specification but no refinement, since there is no code to
+    refine; and there is still no security argument — no proof about
+    confidentiality, authentication, or the handshake as a cryptographic
+    protocol
