@@ -25,17 +25,40 @@ machine-checked, and it matters which is which:
   roundtrips with explicit residual, body inversion, GREASE-tolerant
   extension preservation, ClientHello canonicity — a parsed ClientHello
   re-encodes to exactly the bytes it came from — HelloRetryRequest
-  discrimination, no partial frame ever accepted), and the DER decoder
-  (exact-slice retention carried
-  through to the bytes certificate signatures are verified over). These are
-  proofs about the executable definitions, not a parallel model.
+  discrimination, no partial frame ever accepted), the **state machines**
+  (nonce non-reuse across a whole connection, plus handshake state
+  invariants and transition laws), and the DER decoder (exact-slice
+  retention carried through to the bytes certificate signatures are
+  verified over). These are proofs about the executable definitions, not a
+  parallel model.
+
+**Nonce non-reuse, stated exactly.** `Tls.Client.Laws.run_nonce_nodup` and
+`Tls.Server.Laws.run_nonce_nodup` say: for any successful run of the engine
+there is an explicit `Tls.Record.Laws.WriteRun` — the list of records the run
+protected, each tagged with the traffic secret of the epoch that protected it —
+leading from the connection's initial write state to its final one, in which no
+(secret, nonce) pair repeats. Read the fine print:
+
+- It is about *this engine's own emissions along one chain of states*. A caller
+  who clones a `State` and drives two connections from the same keys is outside
+  its reach — Lean values are duplicable, and no theorem about a pure function
+  can forbid copying one. Single-threading the state is the caller's obligation.
+- It covers the **write** direction only. Nonce reuse is a sender property; the
+  read-side nonces are the peer's.
+- Sequence numbers restart at zero on every KeyUpdate, so the trace is *scoped
+  by traffic-secret epoch* and the theorem's one hypothesis is that the epochs'
+  secrets are distinct (`secrets.Nodup`). TLS derives each with
+  HKDF-Expand-Label, an opaque HACL\* binding here, so that step is assumed —
+  the same boundary as the AEAD round trip in `open_seal`. Within one epoch
+  nothing is assumed: `seal` uses the nonce of the current sequence number and
+  returns the state with that number advanced without wrapping, and for a fixed
+  IV the nonce determines the sequence number.
 
 What is **not** claimed: no refinement theorem against RFC 8446, no
-security proof of the handshake or state machines, no timing analysis of
-Lean control code, and nothing about the C shims beyond their length
-preconditions. The state-machine invariants (transcript consistency,
-key-schedule correctness, nonce non-reuse across a connection's lifetime)
-are a direction, not yet a result.
+security proof of the handshake or state machines, no correctness proof of the
+key schedule against the RFC's derivation graph (only the KAT in
+`hacl_kat_test`), no timing analysis of Lean control code, and nothing about
+the C shims beyond their length preconditions.
 
 ## Layout
 
@@ -64,9 +87,14 @@ Four Bazel packages:
   theorems about the record layer as implemented: byte conservation,
   fragmentation independence, encode/decode roundtrips,
   sequence-number/nonce lemmas, and record-protection laws — `seal`
-  advances the sequence number exactly once preserving key/IV/secret, and
+  advances the sequence number exactly once preserving key/IV/secret (and
+  never wraps it: `seal_seq_succ`), and
   (parametrically over the opaque HACL\* AEAD binding) `open` inverts
-  `seal`, wire bytes and all. The handshake layer mirrors framing
+  `seal`, wire bytes and all. It also defines `WriteRun`, the explicit trace
+  of the `seal` calls a state machine performs — every step pinned to a real
+  successful `seal` of the state the previous one returned — and proves
+  `WriteRun.nodup`, the nonce non-reuse theorem the engines' laws instantiate.
+  The handshake layer mirrors framing
   conservation: a decoded message's retained `encoded` bytes plus the
   remainder reproduce the input buffer exactly. `Tls.Handshake` also ends in
   kernel-checked wire-codec laws: every message encoder roundtrips through
@@ -104,7 +132,39 @@ Four Bazel packages:
   exactly the body it came from, so comparing the parsed fields of a retry
   ClientHello against the original is as strong as comparing the bytes
   (`parseClientHello_body_injective`) — which is what the HelloRetryRequest
-  flow needs.
+  flow needs, and now what it *runs*: the server keeps the first ClientHello as
+  parsed and compares the second with one named check,
+  `Tls.Server.checkRetryClientHello`, whose
+  `Tls.Server.Laws.checkRetryClientHello_body_eq` derives byte equality of the
+  two message bodies from the canonicity law.
+
+  `Tls.Client.Laws` and `Tls.Server.Laws` carry that discipline into the state
+  machines. Every write path of both engines is proved to advance the write
+  traffic state along `Tls.Record.Laws.Extends` — records are protected with the
+  keys the engine's own state carries and the advanced state is stored straight
+  back — which composes into the nonce non-reuse theorem quoted above
+  (`run_nonce_nodup`, and `feed_nonce_nodup` for a single feed, which for a
+  server covers the whole encrypted handshake flight). Alongside it,
+  `State.WellFormed` is a structural invariant of an established connection —
+  the client has both application epochs and has dropped the handshake secrets
+  and transcript; the server has the client application epoch installed and has
+  consumed the expected client Finished — established by `start` and preserved
+  by `feed`, `feedWithFailure`, `sealApplication`, `closeNotify`,
+  `sealFatalAlert`, and whole `run`s (`run_wellFormed`). The transition laws
+  cover the rest of the state-machine list: a connection becomes established
+  only by verifying the peer `Finished` (`completeServerHandshake_verified`,
+  `acceptClientFinished_verified`), application data is protected only by an
+  established and open connection (`sealApplication_connected`), a closed
+  connection is terminal (`feedWithFailure_closed`; every other failure is an
+  `Except` error carrying no successor state, so failure is terminal by
+  construction), HelloRetryRequest installs the RFC 8446 synthetic
+  `message_hash` transcript (`sendHelloRetryRequest_messageHash`), a KeyUpdate
+  moves to the successor traffic secret and restarts its sequence number
+  (`acceptKeyUpdate_epoch`), and accepting the ServerHello extends the
+  transcript by exactly the message consumed (`acceptServerHello_transcript`).
+  The laws about `private` engine helpers are themselves `private`; the public
+  ones are the entry points (`start`, `feed`, `feedWithFailure`,
+  `sealApplication`, `closeNotify`, `sealFatalAlert`, `step`, `run`).
 - **`Test/`** — nine hermetic test binaries, a one-shot loopback server
   harness, and a scripted (manual-tag) interoperability gate that drives the
   harness with real OpenSSL, curl, and Go `crypto/tls` clients.
@@ -309,5 +369,14 @@ build because it compiles and links the HACL\* C shim.
     wire-codec laws (`Tls.Handshake`: framing roundtrips with residual,
     reassembly independence, per-message parse inversion, GREASE-tolerant
     extension and `uint16`-vector roundtrips, HelloRetryRequest
-    discrimination); key schedule, the ClientHello/ServerHello body
-    parsers, and state-machine invariants remain
+    discrimination) and the state-machine layer (`Tls.Client.Laws`,
+    `Tls.Server.Laws`: nonce non-reuse across a whole run of either engine,
+    scoped by traffic-secret epoch and assuming only that the epochs' secrets
+    differ; the `State.WellFormed` invariant established by `start` and
+    preserved by every operation; and the transition laws — peer `Finished`
+    verified before a connection is established, application data protected
+    only when established, closed connections terminal, the HelloRetryRequest
+    synthetic `message_hash` transcript, KeyUpdate epoch change). What remains:
+    a key-schedule correctness proof against RFC 8446 §7.1 (only known-answer
+    tested today), a refinement theorem against the RFC, and any security
+    argument
