@@ -68,8 +68,10 @@ laws then prove the implementation computes it. Read the fine print:
 - It is **structural**, not cryptographic. HKDF-Extract and HKDF-Expand are
   opaque `@[extern]` HACL\* bindings, so no theorem here can say the schedule
   produces the right *bytes*. Every refinement theorem is stated for an
-  arbitrary `Spec.Hkdf` the bindings implement (`Implements`), exactly as
-  `open_seal` is stated for any AEAD satisfying its round trip. What is proved
+  arbitrary `Spec.Hkdf` the bindings implement (`Implements`), and its proof
+  uses no property of `extract`/`expand` beyond those defining equations — so
+  each one holds *whatever the primitive computes*, the same posture as
+  `open_seal`'s hypothesis about the AEAD. What is proved
   is that the implementation applies the primitive in the RFC's shape: the
   RFC's labels, the RFC's contexts, the RFC's parent secrets, the RFC's output
   lengths, in the RFC's order. That is precisely the class real TLS
