@@ -202,64 +202,100 @@ private def isAttemptLimit : Failure → Bool
   | .maximumIssuerAttemptsExceeded _ => true
   | _ => false
 
-private partial def buildPath
+mutual
+
+/-- Depth-first search for a trust anchor. Termination is lexicographic: the
+remaining depth budget shrinks on every recursive descent, and the candidate
+list shrinks within one level. -/
+private def buildPath
     (now : Int) (maximumDepth maximumIssuerAttempts : Nat)
     (leaf current : Certificate)
     (presented : Array Certificate) (trustStore : TrustStore)
     (path : Array Certificate) (attemptsRemaining : Nat) :
-    SearchResult := Id.run do
-  if path.size ≥ maximumDepth then
-    return searchFailed (.maximumDepthExceeded maximumDepth) attemptsRemaining
-  if containsCertificate path current then
-    return searchFailed (.loop current.tbsCertificate.serialNumber)
-      attemptsRemaining
-  let path := path.push current
-  match checkCertificate now current with
-  | .error failure => return searchFailed failure attemptsRemaining
-  | .ok () => pure ()
-  match findAnchor? trustStore current with
-  | some anchor =>
-    return {
-      result := .ok { leaf, anchor, path }
-      attemptsRemaining
-    }
-  | none =>
-    let candidates := issuerCandidates presented trustStore path current
-    if candidates.isEmpty then
-      if current.tbsCertificate.subject.encoded !=
-          current.tbsCertificate.issuer.encoded &&
-          hasRepeatedIssuer presented trustStore path current then
-        return searchFailed (.loop current.tbsCertificate.serialNumber)
-          attemptsRemaining
-      return searchFailed (.unknownIssuer current.tbsCertificate.serialNumber)
+    SearchResult :=
+  if _hdepth : path.size ≥ maximumDepth then
+    searchFailed (.maximumDepthExceeded maximumDepth) attemptsRemaining
+  else if containsCertificate path current then
+    searchFailed (.loop current.tbsCertificate.serialNumber) attemptsRemaining
+  else
+    match checkCertificate now current with
+    | .error failure => searchFailed failure attemptsRemaining
+    | .ok () =>
+      match findAnchor? trustStore current with
+      | some anchor =>
+        { result := .ok { leaf, anchor, path := path.push current }
+          attemptsRemaining }
+      | none =>
+        let candidates :=
+          issuerCandidates presented trustStore (path.push current) current
+        if candidates.isEmpty then
+          if current.tbsCertificate.subject.encoded !=
+              current.tbsCertificate.issuer.encoded &&
+              hasRepeatedIssuer presented trustStore (path.push current)
+                current then
+            searchFailed (.loop current.tbsCertificate.serialNumber)
+              attemptsRemaining
+          else
+            searchFailed (.unknownIssuer current.tbsCertificate.serialNumber)
+              attemptsRemaining
+        else
+          tryIssuers now maximumDepth maximumIssuerAttempts leaf current
+            presented trustStore (path.push current) candidates.toList
+            none attemptsRemaining
+  termination_by (maximumDepth - path.size, 0)
+  decreasing_by
+    apply Prod.Lex.left
+    simp only [Array.size_push]
+    omega
+
+/-- One level of the issuer search: try each candidate in order, tracking the
+first non-limit failure and the shared attempts budget, exactly like the
+former in-place loop. -/
+private def tryIssuers
+    (now : Int) (maximumDepth maximumIssuerAttempts : Nat)
+    (leaf current : Certificate)
+    (presented : Array Certificate) (trustStore : TrustStore)
+    (path : Array Certificate) (candidates : List Certificate)
+    (firstFailure : Option Failure) (attemptsRemaining : Nat) :
+    SearchResult :=
+  match candidates with
+  | [] =>
+      searchFailed
+        (firstFailure.getD
+          (.unknownIssuer current.tbsCertificate.serialNumber))
         attemptsRemaining
-    let mut firstFailure : Option Failure := none
-    let mut attemptsRemaining := attemptsRemaining
-    for issuer in candidates do
+  | issuer :: restCandidates =>
       if attemptsRemaining == 0 then
-        return searchFailed
-          (.maximumIssuerAttemptsExceeded maximumIssuerAttempts) 0
-      attemptsRemaining := attemptsRemaining - 1
-      match checkIssuer path issuer current with
-      | .error failure =>
-        if firstFailure.isNone then
-          firstFailure := some failure
-      | .ok () =>
-        let branch :=
-          buildPath now maximumDepth maximumIssuerAttempts
-            leaf issuer presented trustStore path attemptsRemaining
-        attemptsRemaining := branch.attemptsRemaining
-        match branch.result with
-        | .ok verified =>
-          return { result := .ok verified, attemptsRemaining }
+        searchFailed (.maximumIssuerAttemptsExceeded maximumIssuerAttempts) 0
+      else
+        match checkIssuer path issuer current with
         | .error failure =>
-          if isAttemptLimit failure then
-            return branch
-          if firstFailure.isNone then
-            firstFailure := some failure
-    return searchFailed
-      (firstFailure.getD (.unknownIssuer current.tbsCertificate.serialNumber))
-      attemptsRemaining
+            tryIssuers now maximumDepth maximumIssuerAttempts leaf current
+              presented trustStore path restCandidates
+              (if firstFailure.isNone then some failure else firstFailure)
+              (attemptsRemaining - 1)
+        | .ok () =>
+            let branch :=
+              buildPath now maximumDepth maximumIssuerAttempts
+                leaf issuer presented trustStore path (attemptsRemaining - 1)
+            match branch.result with
+            | .ok _ => branch
+            | .error failure =>
+                if isAttemptLimit failure then
+                  branch
+                else
+                  tryIssuers now maximumDepth maximumIssuerAttempts leaf
+                    current presented trustStore path restCandidates
+                    (if firstFailure.isNone then some failure
+                      else firstFailure)
+                    branch.attemptsRemaining
+  termination_by (maximumDepth - path.size, candidates.length + 1)
+  decreasing_by
+    all_goals apply Prod.Lex.right
+    all_goals simp only [List.length_cons]
+    all_goals omega
+
+end
 
 /-- Build and validate a path from `leaf` to an exact trust-store anchor.
 
