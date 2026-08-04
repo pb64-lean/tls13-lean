@@ -5,8 +5,6 @@ public import Tls.Record
 -- names the HACL* functions.
 public import HaclStar.Aead
 import all Tls.Record
-import Std.Tactic.BVDecide
-public meta import Std.Tactic.BVDecide.Reflect
 
 public section
 
@@ -93,17 +91,62 @@ theorem RawRecord.size_encode (record : RawRecord) :
     record.encode.size = headerLength + record.fragment.size := by
   simp [RawRecord.encode, ByteArray.size_append, RawRecord.size_header]
 
+/-! ### Byte (de)composition
+
+These are the only bit-level identities the record layer needs. They are
+proved *arithmetically* — `Nat.shiftLeft_add_eq_or_of_lt` turns a big-endian
+recomposition into `a * 2 ^ i + b`, which `omega` finishes — rather than by
+`bv_decide`, so no LRAT certificate enters the trusted computing base. -/
+
+/-- Disjoint `|||` is `+`: the low `i` bits of the left operand are clear. -/
+private theorem or_add_lt {a b i : Nat} (hb : b < 2 ^ i) :
+    a * 2 ^ i ||| b = a * 2 ^ i + b := by
+  rw [show a * 2 ^ i = a <<< i from (Nat.shiftLeft_eq a i).symm,
+    ← Nat.shiftLeft_add_eq_or_of_lt hb]
+
 private theorem hi_lo_recompose (v : UInt16) :
     ((v >>> 8).toUInt8.toUInt16 <<< 8 ||| v.toUInt8.toUInt16) = v := by
-  bv_decide
+  apply UInt16.toNat_inj.mp
+  have hv := v.toNat_lt
+  simp only [UInt16.toNat_or, UInt16.toNat_shiftLeft, UInt8.toNat_toUInt16,
+    UInt16.toNat_toUInt8, UInt16.toNat_shiftRight,
+    show UInt16.toNat 8 % 16 = 8 from rfl, Nat.shiftLeft_eq,
+    Nat.shiftRight_eq_div_pow]
+  rw [show v.toNat / 2 ^ 8 % 2 ^ 8 * 2 ^ 8 % 2 ^ 16 = v.toNat / 2 ^ 8 * 2 ^ 8 from by
+      omega,
+    or_add_lt (i := 8)]
+  all_goals omega
 
 private theorem recompose_hi (x y : UInt8) :
     ((x.toUInt16 <<< 8 ||| y.toUInt16) >>> 8).toUInt8 = x := by
-  bv_decide
+  apply UInt8.toNat_inj.mp
+  have hx := x.toNat_lt
+  have hy := y.toNat_lt
+  simp only [UInt16.toNat_toUInt8, UInt16.toNat_shiftRight, UInt16.toNat_or,
+    UInt16.toNat_shiftLeft, UInt8.toNat_toUInt16,
+    show UInt16.toNat 8 % 16 = 8 from rfl, Nat.shiftLeft_eq,
+    Nat.shiftRight_eq_div_pow]
+  rw [show x.toNat * 2 ^ 8 % 2 ^ 16 = x.toNat * 2 ^ 8 from by omega,
+    or_add_lt (i := 8)]
+  all_goals omega
 
 private theorem recompose_lo (x y : UInt8) :
     (x.toUInt16 <<< 8 ||| y.toUInt16).toUInt8 = y := by
-  bv_decide
+  apply UInt8.toNat_inj.mp
+  have hx := x.toNat_lt
+  have hy := y.toNat_lt
+  simp only [UInt16.toNat_toUInt8, UInt16.toNat_or, UInt16.toNat_shiftLeft,
+    UInt8.toNat_toUInt16, show UInt16.toNat 8 % 16 = 8 from rfl,
+    Nat.shiftLeft_eq]
+  rw [show x.toNat * 2 ^ 8 % 2 ^ 16 = x.toNat * 2 ^ 8 from by omega,
+    or_add_lt (i := 8)]
+  all_goals omega
+
+/-- XOR with a fixed byte is injective. -/
+private theorem xor_cancel_left {a b c : UInt8} (h : a ^^^ b = a ^^^ c) : b = c := by
+  have hc := congrArg (a ^^^ ·) h
+  simp only [← UInt8.xor_assoc, UInt8.xor_self, UInt8.zero_xor] at hc
+  exact hc
 
 /-- Reading byte 0 of an encoded header (with anything appended) returns the
 content-type byte. -/
@@ -628,7 +671,19 @@ theorem sequenceBytes_inj (s t : UInt64)
   unfold sequenceBytes at h
   simp only [ByteArray.mk.injEq, Array.mk.injEq, List.cons.injEq, and_true] at h
   obtain ⟨-, -, -, -, h56, h48, h40, h32, h24, h16, h8, h0⟩ := h
-  bv_decide
+  apply UInt64.toNat_inj.mp
+  have hs := s.toNat_lt
+  have ht := t.toNat_lt
+  simp only [← UInt8.toNat_inj, UInt64.toNat_toUInt8, UInt64.toNat_shiftRight,
+    show UInt64.toNat 56 % 64 = 56 from rfl,
+    show UInt64.toNat 48 % 64 = 48 from rfl,
+    show UInt64.toNat 40 % 64 = 40 from rfl,
+    show UInt64.toNat 32 % 64 = 32 from rfl,
+    show UInt64.toNat 24 % 64 = 24 from rfl,
+    show UInt64.toNat 16 % 64 = 16 from rfl,
+    show UInt64.toNat 8 % 64 = 8 from rfl,
+    Nat.shiftRight_eq_div_pow] at h56 h48 h40 h32 h24 h16 h8 h0
+  omega
 
 theorem size_xorBytes (count : Nat) (a b : ByteArray) :
     (xorBytes count a b).size = count := by
@@ -716,7 +771,11 @@ theorem nonceOf_inj {iv : ByteArray} {s t : UInt64}
       from fun _ => rfl,
     show ∀ s : UInt64, (sequenceBytes s).get! 11 = s.toUInt8
       from fun _ => rfl] at h56 h48 h40 h32 h24 h16 h8 h0
-  bv_decide
+  refine sequenceBytes_inj s t ?_
+  unfold sequenceBytes
+  rw [xor_cancel_left h56, xor_cancel_left h48, xor_cancel_left h40,
+    xor_cancel_left h32, xor_cancel_left h24, xor_cancel_left h16,
+    xor_cancel_left h8, xor_cancel_left h0]
 
 /-- For a fixed IV, distinct sequence numbers give distinct nonces. -/
 theorem TrafficKeys.nonce_inj {k1 k2 : TrafficKeys} {n : ByteArray}
