@@ -4772,37 +4772,55 @@ private theorem parseClientSignatureAlgorithms_body {algorithms : List UInt16}
       (by rw [ByteArray.size_append]; rfl)]
   rw [if_neg (uint16ListBytes_ne_empty hne), parseUInt16List_uint16ListBytes]
 
-private theorem findExtension?_append {u tail : List Extension} {t : UInt16}
-    (hu : ∀ e ∈ u, (e.extensionType == t) = false) :
-    findExtension? (u ++ tail).toArray t =
-      tail.find? (fun e => e.extensionType == t) := by
+/-- First-match lookup finds a member as soon as no two members of the list
+share an extension type — RFC 8446 forbids duplicate extensions, so a parsed
+ClientHello always satisfies this (`parseExtensions` rejects duplicates). -/
+private theorem find?_of_mem_of_pairwise : ∀ {l : List Extension} {e : Extension},
+    l.Pairwise (fun a b => (a.extensionType == b.extensionType) = false) →
+    e ∈ l → l.find? (fun ext => ext.extensionType == e.extensionType) = some e := by
+  intro l
+  induction l with
+  | nil => intro e _ hmem; cases hmem
+  | cons a t ih =>
+    intro e hdist hmem
+    rw [List.pairwise_cons] at hdist
+    rcases List.mem_cons.mp hmem with rfl | hmem'
+    · exact List.find?_cons_of_pos (beq_self_eq_true _)
+    · rw [List.find?_cons_of_neg (by rw [hdist.1 e hmem']; exact Bool.false_ne_true)]
+      exact ih hdist.2 hmem'
+
+/-- Lookup by type finds exactly the extension of that type a duplicate-free
+list carries, wherever in the list it sits. -/
+private theorem findExtension?_of_mem {l : List Extension} {e : Extension}
+    (hdist : l.Pairwise (fun a b => (a.extensionType == b.extensionType) = false))
+    (hmem : e ∈ l) : findExtension? l.toArray e.extensionType = some e := by
   unfold findExtension?
-  rw [List.find?_toArray, List.find?_append,
-    List.find?_eq_none.mpr (fun x hx => by rw [hu x hx]; exact Bool.false_ne_true)]
-  rfl
+  rw [List.find?_toArray]
+  exact find?_of_mem_of_pairwise hdist hmem
 
 
 
-/-- **ClientHello preservation (GREASE tolerance)**: a ClientHello carrying any
-number of extensions this implementation does not interpret, followed by the
-four it does (`supported_versions`, `supported_groups`, `key_share`,
-`signature_algorithms`), parses with *every* offered list returned verbatim: the
-cipher suites, the version identifiers, the supported-group identifiers, the
-key-share group identifiers and the signature-scheme identifiers all come back
-in wire order with nothing dropped, whatever the values are, and the whole
-extension list — unknown entries included — is retained as sent. Only the
-derived views (`supportedGroups`, `keyShares`) narrow to what this
-implementation knows. This is what a GREASE-sending client requires of a
-server. -/
-theorem parseClientHello_clientHelloBody {msg : Message}
+/-- **ClientHello preservation (GREASE tolerance)**: a ClientHello whose
+extension list carries the four extensions this implementation interprets
+(`supported_versions`, `supported_groups`, `key_share`,
+`signature_algorithms`) *anywhere in it*, interleaved in any order with any
+number of extensions it does not interpret, parses with *every* offered list
+returned verbatim: the cipher suites, the version identifiers, the
+supported-group identifiers, the key-share group identifiers and the
+signature-scheme identifiers all come back in wire order with nothing dropped,
+whatever the values are, and the whole extension list — unknown entries
+included — is retained as sent. Only the derived views (`supportedGroups`,
+`keyShares`) narrow to what this implementation knows. This is what a
+GREASE-sending client requires of a server.
+
+The only ordering-flavoured hypothesis left is `hedist`: no two extensions may
+share a type. RFC 8446 forbids duplicate extensions, and `parseExtensions`
+rejects them, so every ClientHello this implementation would accept satisfies
+it. -/
+theorem parseClientHello_clientHelloBody_mem {msg : Message}
     {random legacySessionId : ByteArray} {cipherSuites : List UInt16}
-    {other : List Extension} {versions groups algorithms : List UInt16}
+    {versions groups algorithms : List UInt16}
     {shares : List (UInt16 × ByteArray)} {extensions : List Extension}
-    (hexts : extensions = other ++
-      [clientSupportedVersionsExtension versions,
-        clientSupportedGroupsExtension groups,
-        clientKeyShareExtension shares,
-        clientSignatureAlgorithmsExtension algorithms])
     (hty : msg.msgType = clientHelloType)
     (hbody : msg.body =
       clientHelloBody random legacySessionId cipherSuites extensions)
@@ -4814,12 +4832,12 @@ theorem parseClientHello_clientHelloBody {msg : Message}
     (hesz : ∀ e ∈ extensions, e.data.size < 2 ^ 16)
     (hedist : extensions.Pairwise
       (fun a b => (a.extensionType == b.extensionType) = false))
-    (hother : ∀ e ∈ other,
+    (hSVmem : clientSupportedVersionsExtension versions ∈ extensions)
+    (hSGmem : clientSupportedGroupsExtension groups ∈ extensions)
+    (hKSmem : clientKeyShareExtension shares ∈ extensions)
+    (hSAmem : clientSignatureAlgorithmsExtension algorithms ∈ extensions)
+    (hnone : ∀ e ∈ extensions,
       (e.extensionType == preSharedKeyExtension) = false ∧
-      (e.extensionType == supportedVersionsExtension) = false ∧
-      (e.extensionType == supportedGroupsExtension) = false ∧
-      (e.extensionType == keyShareExtension) = false ∧
-      (e.extensionType == signatureAlgorithmsExtension) = false ∧
       (e.extensionType == serverNameExtension) = false ∧
       (e.extensionType == alpnExtension) = false)
     (hv8 : (uint16ListBytes versions).size < 2 ^ 8) (hvne : versions ≠ [])
@@ -4945,41 +4963,24 @@ theorem parseClientHello_clientHelloBody {msg : Message}
     cases cipherSuites with
     | nil => exact absurd rfl hcsne
     | cons a t => simp
-  have hfindL : ∀ t : UInt16, (∀ e ∈ other, (e.extensionType == t) = false) →
-      findExtension? extensions.toArray t =
-        [clientSupportedVersionsExtension versions,
-          clientSupportedGroupsExtension groups,
-          clientKeyShareExtension shares,
-          clientSignatureAlgorithmsExtension algorithms].find?
-            (fun e => e.extensionType == t) := by
-    intro t h
-    rw [hexts]
-    exact findExtension?_append h
-  have hPsk : findExtension? extensions.toArray preSharedKeyExtension = none := by
-    rw [hfindL _ (fun e he => (hother e he).1)]
-    rfl
+  have hPsk : findExtension? extensions.toArray preSharedKeyExtension = none :=
+    findExtension?_eq_none (fun e he => (hnone e he).1)
+  have hSN : findExtension? extensions.toArray serverNameExtension = none :=
+    findExtension?_eq_none (fun e he => (hnone e he).2.1)
+  have hAL : findExtension? extensions.toArray alpnExtension = none :=
+    findExtension?_eq_none (fun e he => (hnone e he).2.2)
   have hSV : findExtension? extensions.toArray supportedVersionsExtension =
-      some (clientSupportedVersionsExtension versions) := by
-    rw [hfindL _ (fun e he => (hother e he).2.1)]
-    rfl
+      some (clientSupportedVersionsExtension versions) :=
+    findExtension?_of_mem hedist hSVmem
   have hSG : findExtension? extensions.toArray supportedGroupsExtension =
-      some (clientSupportedGroupsExtension groups) := by
-    rw [hfindL _ (fun e he => (hother e he).2.2.1)]
-    rfl
+      some (clientSupportedGroupsExtension groups) :=
+    findExtension?_of_mem hedist hSGmem
   have hKS : findExtension? extensions.toArray keyShareExtension =
-      some (clientKeyShareExtension shares) := by
-    rw [hfindL _ (fun e he => (hother e he).2.2.2.1)]
-    rfl
+      some (clientKeyShareExtension shares) :=
+    findExtension?_of_mem hedist hKSmem
   have hSA : findExtension? extensions.toArray signatureAlgorithmsExtension =
-      some (clientSignatureAlgorithmsExtension algorithms) := by
-    rw [hfindL _ (fun e he => (hother e he).2.2.2.2.1)]
-    rfl
-  have hSN : findExtension? extensions.toArray serverNameExtension = none := by
-    rw [hfindL _ (fun e he => (hother e he).2.2.2.2.2.1)]
-    rfl
-  have hAL : findExtension? extensions.toArray alpnExtension = none := by
-    rw [hfindL _ (fun e he => (hother e he).2.2.2.2.2.2)]
-    rfl
+      some (clientSignatureAlgorithmsExtension algorithms) :=
+    findExtension?_of_mem hedist hSAmem
   unfold parseClientHello
   rw [hty, if_pos (show (clientHelloType == clientHelloType) = true from rfl)]
   simp only [r1]
@@ -5005,6 +5006,75 @@ theorem parseClientHello_clientHelloBody {msg : Message}
     parseOptionalExtension_none hSN, parseOptionalExtension_none hAL,
     hSG, Option.isSome_some, Bool.true_and, horder, Bool.not_true]
   rw [if_neg Bool.false_ne_true]
+
+/-- **ClientHello preservation, ordered special case**: the same law when the
+four interpreted extensions come last, after the uninterpreted ones. Kept as
+the shape most encoders emit; `parseClientHello_clientHelloBody_mem` allows any
+interleaving. -/
+theorem parseClientHello_clientHelloBody {msg : Message}
+    {random legacySessionId : ByteArray} {cipherSuites : List UInt16}
+    {other : List Extension} {versions groups algorithms : List UInt16}
+    {shares : List (UInt16 × ByteArray)} {extensions : List Extension}
+    (hexts : extensions = other ++
+      [clientSupportedVersionsExtension versions,
+        clientSupportedGroupsExtension groups,
+        clientKeyShareExtension shares,
+        clientSignatureAlgorithmsExtension algorithms])
+    (hty : msg.msgType = clientHelloType)
+    (hbody : msg.body =
+      clientHelloBody random legacySessionId cipherSuites extensions)
+    (hR : random.size = 32) (hsid : legacySessionId.size < 2 ^ 8)
+    (hsid32 : legacySessionId.size ≤ 32)
+    (hcs : (uint16ListBytes cipherSuites).size < 2 ^ 16)
+    (hcsne : cipherSuites ≠ [])
+    (hE : (extensionsBytes extensions).size < 2 ^ 16)
+    (hesz : ∀ e ∈ extensions, e.data.size < 2 ^ 16)
+    (hedist : extensions.Pairwise
+      (fun a b => (a.extensionType == b.extensionType) = false))
+    (hother : ∀ e ∈ other,
+      (e.extensionType == preSharedKeyExtension) = false ∧
+      (e.extensionType == supportedVersionsExtension) = false ∧
+      (e.extensionType == supportedGroupsExtension) = false ∧
+      (e.extensionType == keyShareExtension) = false ∧
+      (e.extensionType == signatureAlgorithmsExtension) = false ∧
+      (e.extensionType == serverNameExtension) = false ∧
+      (e.extensionType == alpnExtension) = false)
+    (hv8 : (uint16ListBytes versions).size < 2 ^ 8) (hvne : versions ≠ [])
+    (hg16 : (uint16ListBytes groups).size < 2 ^ 16) (hgne : groups ≠ [])
+    (hk16 : (keyShareEntriesBytes shares).size < 2 ^ 16)
+    (hksz : ∀ e ∈ shares, e.2.size < 2 ^ 16)
+    (hkne : ∀ e ∈ shares, e.2.isEmpty = false)
+    (hkdist : shares.Pairwise (fun a b => (a.1 == b.1) = false))
+    (ha16 : (uint16ListBytes algorithms).size < 2 ^ 16) (hane : algorithms ≠ [])
+    (horder :
+      isOrderedSubset (shares.map Prod.fst).toArray groups.toArray = true) :
+    parseClientHello msg = .ok
+      { random := random, legacySessionId := legacySessionId,
+        cipherSuites := cipherSuites.toArray,
+        supportedVersionIds := versions.toArray,
+        supportedGroupIds := groups.toArray,
+        supportedGroups := knownGroups groups,
+        keyShareGroupIds := (shares.map Prod.fst).toArray,
+        keyShares := knownKeyShares shares,
+        signatureAlgorithms := algorithms.toArray,
+        serverName := none, alpnProtocols := #[],
+        extensions := extensions.toArray,
+        offersTls13 := versions.toArray.contains tls13Version,
+        encoded := msg.encoded } :=
+  parseClientHello_clientHelloBody_mem hty hbody hR hsid hsid32 hcs hcsne hE
+    hesz hedist
+    (by rw [hexts]; simp) (by rw [hexts]; simp) (by rw [hexts]; simp)
+    (by rw [hexts]; simp)
+    (by
+      intro e he
+      rw [hexts] at he
+      rcases List.mem_append.mp he with hu | hf
+      · exact ⟨(hother e hu).1, (hother e hu).2.2.2.2.2.1,
+          (hother e hu).2.2.2.2.2.2⟩
+      · simp only [List.mem_cons, List.not_mem_nil, or_false] at hf
+        rcases hf with rfl | rfl | rfl | rfl <;> exact ⟨rfl, rfl, rfl⟩)
+    hv8 hvne hg16 hgne hk16 hksz hkne hkdist ha16 hane horder
+
 
 /-! ### ClientHello canonicity
 
