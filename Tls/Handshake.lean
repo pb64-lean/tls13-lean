@@ -6,7 +6,8 @@ namespace Tls
 namespace Handshake
 
 /-!
-Minimal TLS 1.3 handshake codecs for the PostgreSQL client.
+Minimal TLS 1.3 handshake codecs shared by the client and server state
+machines and by downstream protocol consumers.
 
 This module deliberately stops at the handshake-message boundary.  The record
 layer is responsible for collecting/decrypting handshake bytes and for

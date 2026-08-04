@@ -38,7 +38,7 @@ private def pskExtension (identity : String) (age : UInt32)
   let binders := v8 (repeated 32 binderByte)
   ext Handshake.preSharedKeyExtension (v16 identities ++ v16 binders)
 
--- IANA X25519MLKEM768. It is intentionally unknown to the W1 implementation:
+-- IANA X25519MLKEM768. It is intentionally unknown to this implementation:
 -- the same ClientHello also carries a classical X25519 share.
 private def x25519Mlkem768Group : UInt16 := 0x11ec
 
@@ -416,7 +416,7 @@ def main : IO Unit := do
   check "server changed the group selected by HRR"
     (retryCompleted.state.groupSelected == some .x25519)
 
-  -- PSK is not selected in Wave 1, but a well-formed ignored offer still has
+  -- The server never selects PSK, but a well-formed ignored offer still has
   -- mandatory placement/mode rules and restricted HRR changes.
   let pskModes :=
     ext Handshake.pskKeyExchangeModesExtension

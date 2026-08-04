@@ -182,8 +182,8 @@ structure State where
   retryStableExtensions : Array Handshake.Extension := #[]
   /-- PSK identities paired with their binder hash width. Ages and binder
   bytes may change in CH2; only identities incompatible with the selected
-  SHA-256 suite may be removed, while order is preserved. The server still
-  does not select PSK in Wave 1. -/
+  SHA-256 suite may be removed, while order is preserved. This server never
+  selects PSK. -/
   retryPsks : Option (Array (ByteArray × Nat)) := none
   compatibilityCcsSent : Bool := false
   -- Traffic keys.

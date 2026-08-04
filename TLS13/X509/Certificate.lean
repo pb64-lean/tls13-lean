@@ -130,8 +130,8 @@ structure ParsedExtension (α : Type) where
   encoded : ByteArray
   deriving BEq, Inhabited
 
-/-- An extension not interpreted by M2. M5 can reject an unhandled critical
-extension during path validation. -/
+/-- An extension not interpreted by the certificate parser. Path validation
+can reject an unhandled critical extension. -/
 structure RawExtension where
   oid : OID
   critical : Bool
