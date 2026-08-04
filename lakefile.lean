@@ -25,5 +25,7 @@ lean_lib «HaclStar» where
 lean_lib «TLS13» where
   roots := #[
     `TLS13.KeySchedule,
+    `TLS13.KeySchedule.Refinement,
+    `TLS13.KeySchedule.Spec,
     `TLS13.X509,
   ]

@@ -284,8 +284,9 @@ Implemented and negotiated today:
 
 Explicitly not yet supported (a candid list): PSK and session resumption
 (NewSessionTicket is parsed and discarded; the server never issues tickets),
-0-RTT, client certificates, AES-GCM suites, client-side HelloRetryRequest
-processing, and post-quantum hybrid groups (a hybrid key share in a
+0-RTT, the exporter and resumption master secrets, client certificates,
+AES-GCM suites, client-side HelloRetryRequest processing, and post-quantum
+hybrid groups (a hybrid key share in a
 ClientHello is tolerated and skipped, not negotiated). The server's
 *negotiated* surface stays deliberately narrow (ChaCha20-Poly1305 +
 X25519/P-256 + Ed25519 — algorithms every modern client implements), but
