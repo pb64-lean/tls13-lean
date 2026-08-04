@@ -89,6 +89,7 @@ lean_assurance_test(
         "Tls.Client.run_plaintext_connected",
         "Tls.Client.closeNotify_connected",
         "Tls.Client.feedWithFailure_closed",
+        "Tls.Client.State.WellFormed.noReadKeys",
         "Tls.Client.run_wellFormed",
         "Tls.Server.acceptClientFinished_verified",
         "Tls.Server.sendHelloRetryRequest_messageHash",

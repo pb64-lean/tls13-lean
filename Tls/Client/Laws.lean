@@ -538,50 +538,98 @@ theorem run_write {ops : List Op} : ∀ {state : State} {out : Output},
 
 /-! ## Handshake state invariants -/
 
-/-- Structural invariant of a client connection: **an established connection
-carries both application traffic epochs and has dropped every handshake
-secret and the handshake transcript**. Before the connection is established the
-predicate says nothing, which is exactly right — the handshake states are the
-ones that legitimately hold those secrets.
+/-- Structural invariant of a client connection.
 
-`start_wellFormed` establishes it and `feed`, `feedWithFailure`,
-`sealApplication`, `closeNotify`, `sealFatalAlert` and whole `run`s preserve it.
-The complementary facts about *how* the connection becomes established (the
-server Finished was verified, the transcript grew by exactly the message
+**An established connection carries both application traffic epochs and has
+dropped every handshake secret and the handshake transcript.** Before the
+connection is established that clause says nothing, which is exactly right —
+the handshake states are the ones that legitimately hold those secrets.
+
+**A client that has not yet accepted the ServerHello holds no read epoch.**
+This is the state-only half of the inbound application-data rule: opening any
+protected record needs a read epoch (`requireReadKeys`), so in
+`waitingServerHello` the engine cannot decrypt anything at all, and *a fortiori*
+cannot hand plaintext to the caller. Only `acceptServerHello` installs the first
+read epoch, and it leaves `waitingServerHello` in the same step. The rest of the
+inbound rule is inherently about an *output* rather than a state and stays a
+transition law: `feed_plaintext_connected` / `run_plaintext_connected` below say
+that any feed or run which delivers plaintext delivers it with a `connected`
+state.
+
+`start_wellFormed` establishes both clauses and `feed`, `feedWithFailure`,
+`sealApplication`, `closeNotify`, `sealFatalAlert` and whole `run`s preserve
+them. The complementary facts about *how* the connection becomes established
+(the server Finished was verified, the transcript grew by exactly the message
 consumed) are transition laws below rather than conjuncts here. -/
 def State.WellFormed (state : State) : Prop :=
-  state.phase = .connected →
+  (state.phase = .connected →
     state.writeKeys?.isSome = true ∧ state.readKeys?.isSome = true ∧
       state.handshakeSecret? = none ∧
       state.clientHandshakeTrafficSecret? = none ∧
       state.serverHandshakeTrafficSecret? = none ∧
-      state.transcript = ByteArray.empty
+      state.transcript = ByteArray.empty) ∧
+  (state.phase = .waitingServerHello → state.readKeys? = none)
+
+/-- The established-connection clause, as a projection. -/
+theorem State.WellFormed.connected {state : State} (h : state.WellFormed)
+    (hc : state.phase = .connected) :
+    state.writeKeys?.isSome = true ∧ state.readKeys?.isSome = true ∧
+      state.handshakeSecret? = none ∧
+      state.clientHandshakeTrafficSecret? = none ∧
+      state.serverHandshakeTrafficSecret? = none ∧
+      state.transcript = ByteArray.empty := h.1 hc
+
+/-- **A client waiting for the ServerHello holds no read epoch**, so it can
+decrypt nothing and therefore deliver nothing. -/
+theorem State.WellFormed.noReadKeys {state : State} (h : state.WellFormed)
+    (hp : state.phase = .waitingServerHello) : state.readKeys? = none := h.2 hp
+
+/-- Opening a record needs a read epoch, so a successful `requireReadKeys`
+witnesses that the state holds one. -/
+private theorem requireReadKeys_isSome {state : State}
+    {keys : Record.TrafficKeys} (h : requireReadKeys state = .ok keys) :
+    state.readKeys?.isSome = true := by
+  unfold requireReadKeys at h
+  split at h
+  · rename_i hk; rw [hk]; rfl
+  · cases h
 
 /-- Transfer the invariant across a state update that changes no field it
-mentions, except by installing traffic keys. -/
+mentions, except by installing traffic keys. A *new* read epoch is only ever
+derived from an existing one, so the second disjunct of `hread` carries the
+witness that `s` already had one — which is what keeps the
+`waitingServerHello` clause true of `t`. -/
 private theorem wellFormed_transfer {s t : State} (hinv : s.WellFormed)
     (hphase : t.phase = s.phase)
     (hwrite : t.writeKeys? = s.writeKeys? ∨ ∃ k, t.writeKeys? = some k)
-    (hread : t.readKeys? = s.readKeys? ∨ ∃ k, t.readKeys? = some k)
+    (hread : t.readKeys? = s.readKeys? ∨
+      (∃ k, t.readKeys? = some k) ∧ s.readKeys?.isSome = true)
     (h1 : t.handshakeSecret? = s.handshakeSecret?)
     (h2 : t.clientHandshakeTrafficSecret? = s.clientHandshakeTrafficSecret?)
     (h3 : t.serverHandshakeTrafficSecret? = s.serverHandshakeTrafficSecret?)
     (h4 : t.transcript = s.transcript) : t.WellFormed := by
-  intro hc
-  obtain ⟨a, b, c, d, e, f⟩ := hinv (hphase ▸ hc)
-  refine ⟨?_, ?_, by rw [h1]; exact c, by rw [h2]; exact d,
-    by rw [h3]; exact e, by rw [h4]; exact f⟩
-  · cases hwrite with
-    | inl hw => rw [hw]; exact a
-    | inr hw => obtain ⟨k, hk⟩ := hw; rw [hk]; rfl
+  refine ⟨fun hc => ?_, fun hp => ?_⟩
+  · obtain ⟨a, b, c, d, e, f⟩ := hinv.1 (hphase ▸ hc)
+    refine ⟨?_, ?_, by rw [h1]; exact c, by rw [h2]; exact d,
+      by rw [h3]; exact e, by rw [h4]; exact f⟩
+    · cases hwrite with
+      | inl hw => rw [hw]; exact a
+      | inr hw => obtain ⟨k, hk⟩ := hw; rw [hk]; rfl
+    · cases hread with
+      | inl hr => rw [hr]; exact b
+      | inr hr => obtain ⟨⟨k, hk⟩, -⟩ := hr; rw [hk]; rfl
   · cases hread with
-    | inl hr => rw [hr]; exact b
-    | inr hr => obtain ⟨k, hk⟩ := hr; rw [hk]; rfl
+    | inl hr => rw [hr]; exact hinv.2 (hphase ▸ hp)
+    | inr hr =>
+        obtain ⟨-, hs⟩ := hr
+        rw [hinv.2 (hphase ▸ hp)] at hs
+        exact absurd hs (by decide)
 
-/-- A fresh client connection is waiting for the ServerHello. -/
-theorem start_phase {config : Config} {out : Output}
+/-- A fresh client connection is waiting for the ServerHello and holds no read
+epoch. -/
+private theorem start_phase_readKeys {config : Config} {out : Output}
     (h : start config = .ok out) :
-    out.state.phase = .waitingServerHello := by
+    out.state.phase = .waitingServerHello ∧ out.state.readKeys? = none := by
   unfold start at h
   simp only [pure_bind] at h
   obtain ⟨_, h⟩ := unless_ok h
@@ -598,7 +646,7 @@ theorem start_phase {config : Config} {out : Output}
                     | (obtain ⟨hello, _, h⟩ := except_bind_ok_inv h
                        obtain ⟨wire, _, h⟩ := except_bind_ok_inv h
                        cases h
-                       rfl)
+                       exact ⟨rfl, rfl⟩)
                     | (split at h <;>
                         first
                           | cases h
@@ -606,7 +654,7 @@ theorem start_phase {config : Config} {out : Output}
                              obtain ⟨hello, _, h⟩ := except_bind_ok_inv h
                              obtain ⟨wire, _, h⟩ := except_bind_ok_inv h
                              cases h
-                             rfl))))
+                             exact ⟨rfl, rfl⟩))))
       | (split at h <;>
           first
             | cases h
@@ -616,7 +664,7 @@ theorem start_phase {config : Config} {out : Output}
                    | (obtain ⟨hello, _, h⟩ := except_bind_ok_inv h
                       obtain ⟨wire, _, h⟩ := except_bind_ok_inv h
                       cases h
-                      rfl)
+                      exact ⟨rfl, rfl⟩)
                    | (split at h <;>
                        first
                          | cases h
@@ -624,13 +672,19 @@ theorem start_phase {config : Config} {out : Output}
                             obtain ⟨hello, _, h⟩ := except_bind_ok_inv h
                             obtain ⟨wire, _, h⟩ := except_bind_ok_inv h
                             cases h
-                            rfl))))
+                            exact ⟨rfl, rfl⟩))))
+
+/-- A fresh client connection is waiting for the ServerHello. -/
+theorem start_phase {config : Config} {out : Output}
+    (h : start config = .ok out) :
+    out.state.phase = .waitingServerHello := (start_phase_readKeys h).1
 
 /-- `start` establishes the invariant: the connection is not yet established, so
-it holds vacuously — and in particular no traffic keys exist yet. -/
+the first clause holds vacuously — and in particular no traffic keys exist
+yet, which is the second clause. -/
 theorem start_wellFormed {config : Config} {out : Output}
     (h : start config = .ok out) : out.state.WellFormed := by
-  intro hc
+  refine ⟨fun hc => ?_, fun _ => (start_phase_readKeys h).2⟩
   rw [start_phase h] at hc
   cases hc
 
@@ -701,7 +755,7 @@ private theorem processAlert_wellFormed {state next : State} {fragment : ByteArr
   split at h
   · split at h
     · cases h
-    · exact emitCloseNotify_wellFormed h (fun hc => hinv hc)
+    · exact emitCloseNotify_wellFormed h hinv
   · cases h
 
 private theorem sendKeyUpdateResponse_wellFormed {state next : State}
@@ -723,13 +777,16 @@ private theorem acceptKeyUpdate_wellFormed {state next : State}
     (hinv : state.WellFormed) : next.WellFormed := by
   unfold acceptKeyUpdate at h
   obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, hrk, h⟩ := except_bind_ok_inv h
   obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  have hsome := requireReadKeys_isSome hrk
   split at h
   · cases h
-    exact wellFormed_transfer hinv rfl (.inl rfl) (.inr ⟨_, rfl⟩) rfl rfl rfl rfl
+    exact wellFormed_transfer hinv rfl (.inl rfl) (.inr ⟨⟨_, rfl⟩, hsome⟩)
+      rfl rfl rfl rfl
   · exact sendKeyUpdateResponse_wellFormed h
-      (wellFormed_transfer hinv rfl (.inl rfl) (.inr ⟨_, rfl⟩) rfl rfl rfl rfl)
+      (wellFormed_transfer hinv rfl (.inl rfl) (.inr ⟨⟨_, rfl⟩, hsome⟩)
+        rfl rfl rfl rfl)
 
 private theorem acceptServerHello_wellFormed {state next : State}
     {message : Handshake.Message}
@@ -745,8 +802,7 @@ private theorem acceptServerHello_wellFormed {state next : State}
       · obtain ⟨writeKeys, _, h⟩ := except_bind_ok_inv h
         obtain ⟨readKeys, _, h⟩ := except_bind_ok_inv h
         cases h
-        intro hc
-        cases hc
+        exact ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
       · cases h
     · cases h
   · split at h
@@ -755,8 +811,7 @@ private theorem acceptServerHello_wellFormed {state next : State}
         · obtain ⟨writeKeys, _, h⟩ := except_bind_ok_inv h
           obtain ⟨readKeys, _, h⟩ := except_bind_ok_inv h
           cases h
-          intro hc
-          cases hc
+          exact ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
         · cases h
       · cases h
     · cases h
@@ -782,19 +837,21 @@ private theorem completeServerHandshake_wellFormed {state next : State}
   obtain ⟨handshakeWriteKeys, hk, h⟩ := except_bind_ok_inv h
   obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
   obtain ⟨advancedKeys, finishedWire⟩ := sealed
-  have hgoal : ∀ (st : State), st.writeKeys? = some clientApplicationKeys →
+  have hgoal : ∀ (st : State), st.phase = .connected →
+      st.writeKeys? = some clientApplicationKeys →
       st.readKeys? = some serverApplicationKeys → st.handshakeSecret? = none →
       st.clientHandshakeTrafficSecret? = none →
       st.serverHandshakeTrafficSecret? = none →
       st.transcript = ByteArray.empty → st.WellFormed := by
-    intro st a b c d e f _
-    exact ⟨by rw [a]; rfl, by rw [b]; rfl, c, d, e, f⟩
+    intro st hph a b c d e f
+    exact ⟨fun _ => ⟨by rw [a]; rfl, by rw [b]; rfl, c, d, e, f⟩,
+      fun hp => absurd (hph.symm.trans hp) (by decide)⟩
   split at h
   · cases h
-    exact hgoal _ rfl rfl rfl rfl rfl rfl
+    exact hgoal _ rfl rfl rfl rfl rfl rfl rfl
   · obtain ⟨compatibilityWire, _, h⟩ := except_bind_ok_inv h
     cases h
-    exact hgoal _ rfl rfl rfl rfl rfl rfl
+    exact hgoal _ rfl rfl rfl rfl rfl rfl rfl
 
 private theorem feedPlaintextHandshake_wellFormed {state next : State}
     {fragment : ByteArray}
@@ -808,7 +865,7 @@ private theorem feedPlaintextHandshake_wellFormed {state next : State}
     · exact acceptServerHello_wellFormed h
     · cases h
   · cases h
-    exact fun hc => hinv hc
+    exact hinv
 
 private theorem processHandshakeBuffer_wellFormed {state next : State}
     {wire : ByteArray} (h : processHandshakeBuffer state = .ok (next, wire))
@@ -827,26 +884,26 @@ private theorem processHandshakeBuffer_wellFormed {state next : State}
       obtain ⟨alpn, _, h⟩ := except_bind_ok_inv h
       split at h
       · obtain ⟨_, h⟩ := unless_ok h
-        exact processHandshakeBuffer_wellFormed h (by intro hc; cases hc)
-      · exact processHandshakeBuffer_wellFormed h (by intro hc; cases hc)
+        exact processHandshakeBuffer_wellFormed h ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
+      · exact processHandshakeBuffer_wellFormed h ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
     · obtain ⟨_, h⟩ := unless_ok h
       obtain ⟨_, _, h⟩ := except_bind_ok_inv h
       obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-      exact processHandshakeBuffer_wellFormed h (by intro hc; cases hc)
+      exact processHandshakeBuffer_wellFormed h ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
     · obtain ⟨_, h⟩ := unless_ok h
       obtain ⟨_, _, h⟩ := except_bind_ok_inv h
       split at h
       · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
         obtain ⟨_, h⟩ := unless_ok h
         obtain ⟨_, h⟩ := unless_ok h
-        exact processHandshakeBuffer_wellFormed h (by intro hc; cases hc)
+        exact processHandshakeBuffer_wellFormed h ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
       · cases h
     · obtain ⟨_, h⟩ := unless_ok h
       obtain ⟨_, h⟩ := unless_ok h
       exact completeServerHandshake_wellFormed h
     · split at h
       · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-        exact processHandshakeBuffer_wellFormed h (fun hc => hinv hc)
+        exact processHandshakeBuffer_wellFormed h hinv
       · split at h
         · split at h
           · cases h
@@ -858,7 +915,7 @@ private theorem processHandshakeBuffer_wellFormed {state next : State}
                   state.handshakeBuffered.size := by
                 rw [acceptKeyUpdate_buffered hacc]; exact hsize
               have h2 := processHandshakeBuffer_wellFormed hnext
-                (acceptKeyUpdate_wellFormed hacc (fun hc => hinv hc))
+                (acceptKeyUpdate_wellFormed hacc hinv)
               cases h
               exact h2
         · cases h
@@ -874,11 +931,12 @@ private theorem processProtectedRecord_wellFormed {state next : State}
     (hinv : state.WellFormed) : next.WellFormed := by
   unfold processProtectedRecord at h
   simp only [pure_bind] at h
-  obtain ⟨readKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨readKeys, hrk, h⟩ := except_bind_ok_inv h
   obtain ⟨opened, _, h⟩ := except_bind_ok_inv h
   obtain ⟨nextReadKeys, plaintext⟩ := opened
   have hinv' : ({ state with readKeys? := some nextReadKeys } : State).WellFormed :=
-    wellFormed_transfer hinv rfl (.inl rfl) (.inr ⟨_, rfl⟩) rfl rfl rfl rfl
+    wellFormed_transfer hinv rfl (.inl rfl)
+      (.inr ⟨⟨_, rfl⟩, requireReadKeys_isSome hrk⟩) rfl rfl rfl rfl
   split at h
   · obtain ⟨_, h⟩ := if_throw_ok h
     split at h
@@ -957,7 +1015,7 @@ theorem feedWithFailure_wellFormed {initial : State} {chunk : ByteArray}
   · cases h
   · split at h
     · cases h
-    · exact processRecords_wellFormed h (fun hc => hinv hc)
+    · exact processRecords_wellFormed h hinv
 
 theorem feed_wellFormed {state : State} {chunk : ByteArray} {out : Output}
     (h : feed state chunk = .ok out) (hinv : state.WellFormed) :

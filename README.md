@@ -157,15 +157,20 @@ Four Bazel packages:
   and transcript; the server has the client application epoch installed and has
   consumed the expected client Finished — established by `start` and preserved
   by `feed`, `feedWithFailure`, `sealApplication`, `closeNotify`,
-  `sealFatalAlert`, and whole `run`s (`run_wellFormed`). The server's invariant
-  carries a second, phase-indexed clause (`WellFormed.writeKeys`): from
-  `waitingClientFinished` onwards it always holds a write epoch. It has to be
-  phase-indexed rather than a bare `connected → …` because the server installs
-  its write keys one transition earlier than the client does — in
+  `sealFatalAlert`, and whole `run`s (`run_wellFormed`). Each engine's invariant
+  carries a second, phase-indexed clause. The server's (`WellFormed.writeKeys`):
+  from `waitingClientFinished` onwards it always holds a write epoch. It has to
+  be phase-indexed rather than a bare `connected → …` because the server
+  installs its write keys one transition earlier than the client does — in
   `completeClientHello`, since the flight it emits right there is already
   encrypted — and it is what makes `sealApplication`, `closeNotify`,
-  `sealFatalAlert` and a KeyUpdate response total on an established
-  connection. The transition laws
+  `sealFatalAlert` and a KeyUpdate response total on an established connection.
+  The client's (`WellFormed.noReadKeys`) is the inbound mirror, and the
+  state-only half of the application-data rule below: while the client is still
+  waiting for the ServerHello it holds *no* read epoch, so it cannot decrypt a
+  protected record at all and therefore cannot deliver plaintext — only
+  `acceptServerHello` installs the first read epoch, and it leaves
+  `waitingServerHello` in the same step. The transition laws
   cover the rest of the state-machine list: a connection becomes established
   only by verifying the peer `Finished` (`completeServerHandshake_verified`,
   `acceptClientFinished_verified`), application data is protected only by an
@@ -357,7 +362,7 @@ test binary is built, so a violation is a red target, not a stale README:
 | --- | --- |
 | `//HaclStar:haclstar_assurance` | The trusted C boundary: the 16 `@[extern] opaque` bindings are accounted for and no proof hole exists in the FFI package |
 | `//TLS13:tls13_assurance` | 10 principal theorems — DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies` |
-| `//Tls:tls_assurance` | 46 principal theorems — nonce non-reuse (`WriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, nonce and sequence injectivity), record conservation and seal/open inversion, ClientHello canonicity and body injectivity, and the state-machine transition and invariant laws (including both directions of the connected-only application-data rule) |
+| `//Tls:tls_assurance` | 47 principal theorems — nonce non-reuse (`WriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, nonce and sequence injectivity), record conservation and seal/open inversion, ClientHello canonicity and body injectivity, and the state-machine transition and invariant laws (including both directions of the connected-only application-data rule and the client's no-read-epoch-before-ServerHello clause) |
 
 Each target also scans every constant of the whole first-party closure
 (`HaclStar`, `TLS13`, `Tls` — 26 modules, ~4750 constants): nothing may reach
