@@ -3394,5 +3394,74 @@ theorem parseUInt16List_uint16ListBytes (l : List UInt16) :
   rw [parseUInt16ListLoop_uint16ListBytes l ByteArray.empty #[]]
   rfl
 
+/-! ### End-to-end: encode, take off the wire with residual, parse
+
+Each law below composes the framing roundtrip with the body inversion: the
+encoded message is recovered from a buffer that carries arbitrary trailing
+bytes, those bytes are returned untouched as the residual, and parsing the
+recovered message reproduces the encoded fields. -/
+
+/-- Finished: wire roundtrip with residual, then parse inversion. -/
+theorem encodeFinished_decodeOne_parse {verifyData : ByteArray} {msg : Message}
+    (h : encodeFinished verifyData = .ok msg) (rest : ByteArray) :
+    decodeOne (msg.encoded ++ rest) = .ok (msg, rest) ∧
+      parseFinished msg =
+        .ok { verifyData := verifyData, encoded := msg.encoded } :=
+  ⟨encodeFinished_decodeOne h rest, encodeFinished_parse h⟩
+
+/-- KeyUpdate: wire roundtrip with residual, then parse inversion. -/
+theorem encodeKeyUpdate_decodeOne_parse {request : KeyUpdateRequest}
+    {msg : Message} (h : encodeKeyUpdate request = .ok msg) (rest : ByteArray) :
+    decodeOne (msg.encoded ++ rest) = .ok (msg, rest) ∧
+      parseKeyUpdate msg = .ok { request := request, encoded := msg.encoded } :=
+  ⟨encodeKeyUpdate_decodeOne h rest, encodeKeyUpdate_parse h⟩
+
+/-- CertificateVerify: wire roundtrip with residual, then parse inversion. -/
+theorem encodeCertificateVerify_decodeOne_parse {algorithm : UInt16}
+    {signature : ByteArray} {msg : Message}
+    (h : encodeCertificateVerify algorithm signature = .ok msg)
+    (rest : ByteArray) :
+    decodeOne (msg.encoded ++ rest) = .ok (msg, rest) ∧
+      parseCertificateVerify msg =
+        .ok { algorithm := algorithm, signature := signature,
+              encoded := msg.encoded } :=
+  ⟨encodeCertificateVerify_decodeOne h rest, encodeCertificateVerify_parse h⟩
+
+/-- EncryptedExtensions (no ALPN): wire roundtrip with residual, then parse
+inversion. -/
+theorem encodeEncryptedExtensions_decodeOne_parse_none {msg : Message}
+    (h : encodeEncryptedExtensions none = .ok msg) (rest : ByteArray) :
+    decodeOne (msg.encoded ++ rest) = .ok (msg, rest) ∧
+      parseEncryptedExtensions msg =
+        .ok { extensions := #[], encoded := msg.encoded } :=
+  ⟨encodeEncryptedExtensions_decodeOne h rest,
+    encodeEncryptedExtensions_parse_none h⟩
+
+/-- Certificate: wire roundtrip with residual, then parse inversion. -/
+theorem encodeCertificate_decodeOne_parse {leaf : ByteArray}
+    {rest : List ByteArray} {msg : Message}
+    (h : encodeCertificate (leaf :: rest).toArray = .ok msg)
+    (trailing : ByteArray) :
+    decodeOne (msg.encoded ++ trailing) = .ok (msg, trailing) ∧
+      parseCertificate msg = .ok
+        { requestContext := ByteArray.empty,
+          entries :=
+            ((leaf :: rest).map fun der =>
+              ({ der := der, extensions := #[] } : CertificateEntry)).toArray,
+          leafDer := leaf, encoded := msg.encoded } :=
+  ⟨encodeCertificate_decodeOne h trailing, encodeCertificate_parse h⟩
+
+/-- NewSessionTicket: wire roundtrip with residual, then parse inversion. -/
+theorem encodeNewSessionTicket_decodeOne_parse {ticketLifetime ticketAgeAdd : UInt32}
+    {ticketNonce ticket : ByteArray} {msg : Message}
+    (h : encodeNewSessionTicket ticketLifetime ticketAgeAdd ticketNonce ticket
+      = .ok msg) (rest : ByteArray) :
+    decodeOne (msg.encoded ++ rest) = .ok (msg, rest) ∧
+      parseNewSessionTicket msg = .ok
+        { ticketLifetime := ticketLifetime, ticketAgeAdd := ticketAgeAdd,
+          ticketNonce := ticketNonce, ticket := ticket, extensions := #[],
+          encoded := msg.encoded } :=
+  ⟨encodeNewSessionTicket_decodeOne h rest, encodeNewSessionTicket_parse h⟩
+
 end Handshake
 end Tls
