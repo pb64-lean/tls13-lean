@@ -4956,6 +4956,318 @@ theorem parseClientHello_clientHelloBody {msg : Message}
     hSG, Option.isSome_some, Bool.true_and, horder, Bool.not_true]
   rw [if_neg Bool.false_ne_true]
 
+/-! ### ClientHello canonicity
+
+`parseClientHello_clientHelloBody` runs encode-then-parse. These laws run it
+the other way: the body a parse accepted is *exactly* the wire image of the
+fields it produced, so re-encoding a parsed ClientHello reproduces the bytes it
+came from. That is what the HelloRetryRequest flow needs — the second
+ClientHello must match the first except for the permitted changes, and the
+transcript is hashed over the original bytes (which `decode_encoded` retains).
+-/
+
+private theorem getElem_push_empty (b : UInt8)
+    (h : 0 < (ByteArray.empty.push b).size) :
+    (ByteArray.empty.push b)[0] = b := rfl
+
+/-- A single byte read out of a buffer is that buffer's one-byte slice. -/
+private theorem extract_one {W : ByteArray} {off : Nat} (h : off < W.size) :
+    W.extract off (off + 1) = ByteArray.empty.push (W.get! off) := by
+  apply ByteArray.ext_getElem
+  · rw [ByteArray.size_extract, Nat.min_eq_left (by omega)]
+    show off + 1 - off = 1
+    omega
+  · intro i hi hi'
+    rw [ByteArray.size_extract, Nat.min_eq_left (by omega)] at hi
+    have hi0 : i = 0 := by omega
+    subst hi0
+    rw [ByteArray.getElem_extract, getElem_push_empty,
+      get!_eq_getElem (show off < W.size by omega)]
+    simp
+
+/-- A one-byte buffer is the push of its only byte. -/
+private theorem eq_push_of_size_one {X : ByteArray} (hsz : X.size = 1) :
+    X = ByteArray.empty.push (X.get! 0) := by
+  apply ByteArray.ext_getElem
+  · rw [hsz]
+    rfl
+  · intro i hi hi'
+    rw [hsz] at hi
+    have hi0 : i = 0 := by omega
+    subst hi0
+    rw [getElem_push_empty, get!_eq_getElem (by omega)]
+
+/-- Splitting a slice at an interior point. -/
+private theorem extract_split {W : ByteArray} {i j k : Nat} (hij : i ≤ j)
+    (hjk : j ≤ k) : W.extract i k = W.extract i j ++ W.extract j k := by
+  rw [ByteArray.extract_append_extract, Nat.min_eq_left hij,
+    Nat.max_eq_right hjk]
+
+/-- A successful `take` returns exactly the slice at the cursor. -/
+private theorem take_extract {W : ByteArray} {off n : Nat} {X : ByteArray}
+    {r' : Reader} (h : Reader.take (Reader.mk W off) n = .ok (X, r')) :
+    X = W.extract off (off + n) ∧ r' = Reader.mk W (off + n) ∧
+      off + n ≤ W.size := by
+  unfold Reader.take at h
+  split at h
+  · cases h
+  · rename_i hle
+    have hle' : ¬(off + n > W.size) := hle
+    simp only [Except.ok.injEq, Prod.mk.injEq] at h
+    exact ⟨h.1.symm, h.2.symm, by omega⟩
+
+/-- A successful `readUInt16` means the two bytes at the cursor are the
+big-endian encoding of the value it returned. -/
+private theorem readUInt16_extract {W : ByteArray} {off : Nat} {v : UInt16}
+    {r' : Reader} (h : Reader.readUInt16 (Reader.mk W off) = .ok (v, r')) :
+    W.extract off (off + 2) = appendUInt16 ByteArray.empty v ∧
+      r' = Reader.mk W (off + 2) ∧ off + 2 ≤ W.size := by
+  obtain ⟨hb, ho, hle⟩ := readUInt16_ok h
+  have hle' : off + 2 ≤ W.size := by
+    have h1 : r'.offset = off + 2 := ho
+    have h2 : r'.offset ≤ W.size := hle
+    omega
+  rw [readUInt16_eval (b := W) (off := off) hle'] at h
+  simp only [Except.ok.injEq, Prod.mk.injEq] at h
+  obtain ⟨rfl, rfl⟩ := h
+  exact ⟨extract_two rfl hle', rfl, hle'⟩
+
+/-- A successful `readVector8` means the cursor held a one-byte length followed
+by exactly the bytes it returned. -/
+private theorem readVector8_extract {W : ByteArray} {off : Nat} {X : ByteArray}
+    {r' : Reader} (h : Reader.readVector8 (Reader.mk W off) = .ok (X, r')) :
+    W.extract off (off + 1 + X.size) =
+        ByteArray.empty.push (UInt8.ofNat X.size) ++ X ∧
+      r' = Reader.mk W (off + 1 + X.size) ∧ off + 1 + X.size ≤ W.size ∧
+      X.size < 2 ^ 8 := by
+  unfold Reader.readVector8 at h
+  split at h
+  · cases h
+  · rename_i len r₁ h8
+    obtain ⟨hb1, ho1, hle1⟩ := readUInt8_ok h8
+    have hlt : off < W.size := by
+      have h1 : r₁.offset = off + 1 := ho1
+      have h2 : r₁.offset ≤ W.size := hle1
+      omega
+    rw [readUInt8_eval (b := W) (off := off) hlt] at h8
+    simp only [Except.ok.injEq, Prod.mk.injEq] at h8
+    obtain ⟨rfl, rfl⟩ := h8
+    obtain ⟨hX, hr', hb⟩ := take_extract h
+    have hXsize : X.size = (W.get! off).toNat := by
+      rw [hX, ByteArray.size_extract]
+      omega
+    refine ⟨?_, by rw [hXsize]; exact hr', by omega, by
+      rw [hXsize]; exact UInt8.toNat_lt _⟩
+    rw [hXsize, UInt8.ofNat_toNat, ← extract_one hlt, hX,
+      ByteArray.extract_append_extract, Nat.min_eq_left (by omega),
+      Nat.max_eq_right (by omega)]
+
+/-- A successful `readVector16` means the cursor held a two-byte length
+followed by exactly the bytes it returned. -/
+private theorem readVector16_extract {W : ByteArray} {off : Nat} {X : ByteArray}
+    {r' : Reader} (h : Reader.readVector16 (Reader.mk W off) = .ok (X, r')) :
+    W.extract off (off + 2 + X.size) =
+        appendUInt16 ByteArray.empty (UInt16.ofNat X.size) ++ X ∧
+      r' = Reader.mk W (off + 2 + X.size) ∧ off + 2 + X.size ≤ W.size ∧
+      X.size < 2 ^ 16 := by
+  unfold Reader.readVector16 at h
+  split at h
+  · cases h
+  · rename_i len r₁ h16
+    obtain ⟨hb1, ho1, hle1⟩ := readUInt16_ok h16
+    have hlt : off + 2 ≤ W.size := by
+      have h1 : r₁.offset = off + 2 := ho1
+      have h2 : r₁.offset ≤ W.size := hle1
+      omega
+    rw [readUInt16_eval (b := W) (off := off) hlt] at h16
+    simp only [Except.ok.injEq, Prod.mk.injEq] at h16
+    obtain ⟨rfl, rfl⟩ := h16
+    obtain ⟨hX, hr', hb⟩ := take_extract h
+    have hXsize : X.size =
+        ((W.get! off).toUInt16 <<< 8 ||| (W.get! (off + 1)).toUInt16).toNat := by
+      rw [hX, ByteArray.size_extract]
+      omega
+    refine ⟨?_, by rw [hXsize]; exact hr', by omega, by
+      rw [hXsize]; exact UInt16.toNat_lt _⟩
+    rw [hXsize, UInt16.ofNat_toNat, ← extract_two (e := off + 2) rfl (by omega),
+      hX, ByteArray.extract_append_extract, Nat.min_eq_left (by omega),
+      Nat.max_eq_right (by omega)]
+
+/-- `requireEnd` succeeds only at the end of the buffer. -/
+private theorem requireEnd_end {W : ByteArray} {off : Nat} {context : String}
+    (h : Reader.requireEnd (Reader.mk W off) context = .ok ()) : off = W.size := by
+  unfold Reader.requireEnd at h
+  split at h
+  · rename_i hend
+    have hend' : (off == W.size) = true := hend
+    exact beq_iff_eq.mp hend'
+  · cases h
+
+/-- The two halves of ClientHello canonicity, proved by one walk over the
+parser: a ClientHello with no extensions at all cannot have offered TLS 1.3,
+and one that carried an extension block re-encodes to the body it was parsed
+from. -/
+private theorem parseClientHello_spec {msg : Message} {ch : ClientHello}
+    (h : parseClientHello msg = .ok ch) :
+    (ch.extensions.isEmpty = true → ch.offersTls13 = false) ∧
+    (ch.extensions.isEmpty = false →
+      msg.body = clientHelloBody ch.random ch.legacySessionId
+        ch.cipherSuites.toList ch.extensions.toList) := by
+  unfold parseClientHello at h
+  repeat' first | split at h | cases h
+  rename_i hty _ legacyVersion r1 h1 hlv _ random r2 h2 _ sessionId r3 h3 hsid
+    _ csBytes r4 h4 _ cipherSuites h5 hcsne _ compression r5 h6 hcomp
+    _ extensions h7 _ hpsk _ versionIds h8 _ groupIds groups h9
+    _ ksIds shares h10 horder _ algorithms h11 _ serverName h12
+    _ alpn h13
+  dsimp only
+  refine ⟨fun hempty => ?_, fun hnonempty => ?_⟩
+  · have hemp : extensions = #[] := by simpa using hempty
+    subst hemp
+    rw [parseOptionalExtension_none (t := supportedVersionsExtension)
+      (dflt := #[]) (parse := parseClientVersions) rfl] at h8
+    cases h8
+    simp
+  · have hlv' : legacyVersion = legacyTls12Version := by
+      simpa using hlv
+    subst hlv'
+    have hc1 : compression.size = 1 := by
+      have h' := (Bool.and_eq_true _ _).mp hcomp
+      simpa using h'.1
+    have hc0 : compression.get! 0 = 0 := by
+      have h' := (Bool.and_eq_true _ _).mp hcomp
+      simpa using h'.2
+    have hcompeq : compression = ByteArray.empty.push 0 := by
+      rw [eq_push_of_size_one hc1, hc0]
+    have hcs : csBytes = uint16ListBytes cipherSuites.toList :=
+      parseUInt16List_image h5
+    obtain ⟨e1, hr1, hb1⟩ := readUInt16_extract h1
+    subst hr1
+    obtain ⟨e2, hr2, hb2⟩ := take_extract h2
+    subst hr2
+    obtain ⟨e3, hr3, hb3, hsz3⟩ := readVector8_extract h3
+    subst hr3
+    obtain ⟨e4, hr4, hb4, hsz4⟩ := readVector16_extract h4
+    subst hr4
+    obtain ⟨e5, hr5, hb5, hsz5⟩ := readVector8_extract h6
+    subst hr5
+    rw [hc1] at e5 hb5 h7
+    unfold parseClientExtensionBlock at h7
+    split at h7
+    · cases h7
+      simp at hnonempty
+    · split at h7
+      · cases h7
+      · rename_i extBytes r6 h14
+        split at h7
+        · cases h7
+        · rename_i hreq
+          obtain ⟨e6, hr6, hb6, hsz6⟩ := readVector16_extract h14
+          subst hr6
+          have hend : 0 + 2 + 32 + 1 + sessionId.size + 2 + csBytes.size + 1 + 1 +
+              2 + extBytes.size = msg.body.size := requireEnd_end hreq
+          have hexts : extBytes = extensionsBytes extensions.toList :=
+            parseExtensions_image h7
+          have a2 : msg.body.extract 0 (0 + 2 + 32) =
+              appendUInt16 ByteArray.empty legacyTls12Version ++ random := by
+            rw [extract_split (W := msg.body) (i := 0) (j := 0 + 2)
+              (by omega) (by omega), e1, e2]
+          have a3 : msg.body.extract 0 (0 + 2 + 32 + 1 + sessionId.size) =
+              appendUInt16 ByteArray.empty legacyTls12Version ++ random ++
+                (ByteArray.empty.push (UInt8.ofNat sessionId.size) ++
+                  sessionId) := by
+            rw [extract_split (W := msg.body) (i := 0) (j := 0 + 2 + 32)
+              (by omega) (by omega), a2, e3]
+          have a4 : msg.body.extract 0
+              (0 + 2 + 32 + 1 + sessionId.size + 2 + csBytes.size) =
+              appendUInt16 ByteArray.empty legacyTls12Version ++ random ++
+                (ByteArray.empty.push (UInt8.ofNat sessionId.size) ++
+                  sessionId) ++
+                (appendUInt16 ByteArray.empty (UInt16.ofNat csBytes.size) ++
+                  csBytes) := by
+            rw [extract_split (W := msg.body) (i := 0)
+              (j := 0 + 2 + 32 + 1 + sessionId.size) (by omega) (by omega),
+              a3, e4]
+          have a5 : msg.body.extract 0
+              (0 + 2 + 32 + 1 + sessionId.size + 2 + csBytes.size + 1 + 1) =
+              appendUInt16 ByteArray.empty legacyTls12Version ++ random ++
+                (ByteArray.empty.push (UInt8.ofNat sessionId.size) ++
+                  sessionId) ++
+                (appendUInt16 ByteArray.empty (UInt16.ofNat csBytes.size) ++
+                  csBytes) ++
+                (ByteArray.empty.push (UInt8.ofNat 1) ++ compression) := by
+            rw [extract_split (W := msg.body) (i := 0)
+              (j := 0 + 2 + 32 + 1 + sessionId.size + 2 + csBytes.size)
+              (by omega) (by omega), a4, e5]
+          have a6 : msg.body.extract 0
+              (0 + 2 + 32 + 1 + sessionId.size + 2 + csBytes.size + 1 + 1 + 2 +
+                extBytes.size) =
+              appendUInt16 ByteArray.empty legacyTls12Version ++ random ++
+                (ByteArray.empty.push (UInt8.ofNat sessionId.size) ++
+                  sessionId) ++
+                (appendUInt16 ByteArray.empty (UInt16.ofNat csBytes.size) ++
+                  csBytes) ++
+                (ByteArray.empty.push (UInt8.ofNat 1) ++ compression) ++
+                (appendUInt16 ByteArray.empty (UInt16.ofNat extBytes.size) ++
+                  extBytes) := by
+            rw [extract_split (W := msg.body) (i := 0)
+              (j := 0 + 2 + 32 + 1 + sessionId.size + 2 + csBytes.size + 1 + 1)
+              (by omega) (by omega), a5, e6]
+          rw [hend, ByteArray.extract_zero_size, hcs, hexts, hcompeq] at a6
+          rw [a6]
+          unfold clientHelloBody
+          rfl
+
+/-- **ClientHello canonicity**: the body a `parseClientHello` accepted is
+exactly `clientHelloBody` of the fields it returned — the random, the legacy
+session id, the cipher-suite list and the whole extension list, in wire order,
+with the null compression method RFC 8446 mandates. Re-encoding a parsed
+ClientHello therefore reproduces the bytes it came from, and `decode_encoded`
+retains the framed message on top of that.
+
+The hypothesis excludes only the pre-extension ClientHello shape, which carries
+no extension block at all and so is two bytes shorter than `clientHelloBody` of
+an empty extension list. Every TLS 1.3 ClientHello has extensions:
+`parseClientHello_canonical_of_offersTls13` discharges the hypothesis from
+`offersTls13`. -/
+theorem parseClientHello_canonical {msg : Message} {ch : ClientHello}
+    (h : parseClientHello msg = .ok ch) (hexts : ch.extensions.isEmpty = false) :
+    msg.body = clientHelloBody ch.random ch.legacySessionId
+      ch.cipherSuites.toList ch.extensions.toList :=
+  (parseClientHello_spec h).2 hexts
+
+/-- **ClientHello canonicity for TLS 1.3 clients**: a ClientHello that offered
+TLS 1.3 carried an extension block (that is where supported_versions lives), so
+it re-encodes to exactly the body it was parsed from. -/
+theorem parseClientHello_canonical_of_offersTls13 {msg : Message}
+    {ch : ClientHello} (h : parseClientHello msg = .ok ch)
+    (h13 : ch.offersTls13 = true) :
+    msg.body = clientHelloBody ch.random ch.legacySessionId
+      ch.cipherSuites.toList ch.extensions.toList := by
+  refine (parseClientHello_spec h).2 ?_
+  cases hE : ch.extensions.isEmpty with
+  | false => rfl
+  | true =>
+    rw [(parseClientHello_spec h).1 hE] at h13
+    exact absurd h13 Bool.false_ne_true
+
+/-- **Retry comparison**: two ClientHellos whose parses agree on the random, the
+legacy session id, the cipher suites and the whole extension list have
+byte-identical bodies. This is the check RFC 8446 section 4.1.2 demands of a
+second ClientHello after a HelloRetryRequest: comparing the *parsed* fields is
+as strong as comparing the bytes. -/
+theorem parseClientHello_body_injective {msg₁ msg₂ : Message}
+    {ch₁ ch₂ : ClientHello} (h₁ : parseClientHello msg₁ = .ok ch₁)
+    (h₂ : parseClientHello msg₂ = .ok ch₂)
+    (hexts : ch₁.extensions.isEmpty = false)
+    (hrandom : ch₁.random = ch₂.random)
+    (hsid : ch₁.legacySessionId = ch₂.legacySessionId)
+    (hcs : ch₁.cipherSuites = ch₂.cipherSuites)
+    (hext : ch₁.extensions = ch₂.extensions) : msg₁.body = msg₂.body := by
+  rw [parseClientHello_canonical h₁ hexts,
+    parseClientHello_canonical h₂ (by rw [← hext]; exact hexts),
+    hrandom, hsid, hcs, hext]
+
 /-! ### ServerHello and HelloRetryRequest body inversion
 
 The framing laws recover the `Message`; these laws take its body apart. Every
