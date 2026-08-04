@@ -454,6 +454,166 @@ theorem Decoder.feed_residual {decoder next : Decoder} {chunk : ByteArray}
       subst h1
       exact decodeBuffered_residual hd
 
+private theorem wellFormed_mk {ct : ContentType} {v : UInt16}
+    {frag : ByteArray}
+    (h : match ct with
+      | .applicationData =>
+          aeadTagLength + 1 ≤ frag.size ∧ frag.size ≤ maxCiphertextLength
+      | _ => frag.size ≤ maxPlaintextLength) :
+    RawRecord.WellFormed ⟨ct, v, frag⟩ := by
+  cases ct <;> exact h
+
+/-- Frames produced by the decoder satisfy the encoder-side length bounds. -/
+theorem decodeStep_wellFormed {buffered rest : ByteArray}
+    {record : RawRecord}
+    (h : decodeStep buffered = .ok (some (record, rest))) :
+    record.WellFormed := by
+  unfold decodeStep at h
+  split at h
+  · simp at h
+  · split at h
+    · simp at h
+    · rename_i ct hct
+      split at h
+      · simp at h
+      · rename_i hcheck
+        split at h
+        · simp at h
+        · simp only [Except.ok.injEq, Option.some.injEq, Prod.mk.injEq] at h
+          obtain ⟨hrec, hrest⟩ := h
+          have hsize : (buffered.extract headerLength
+              (headerLength + (getUInt16 buffered 3).toNat)).size =
+              (getUInt16 buffered 3).toNat := by
+            rw [ByteArray.size_extract]
+            omega
+          rw [← hrec]
+          apply wellFormed_mk
+          cases ct with
+          | applicationData =>
+              unfold checkFragmentLength at hcheck
+              rw [if_pos (by decide)] at hcheck
+              split at hcheck
+              · cases hcheck
+              · split at hcheck
+                · cases hcheck
+                · refine ⟨?_, ?_⟩ <;> (rw [hsize]; omega)
+          | changeCipherSpec =>
+              unfold checkFragmentLength at hcheck
+              rw [if_neg (by decide)] at hcheck
+              split at hcheck
+              · cases hcheck
+              · rw [hsize]
+                omega
+          | alert =>
+              unfold checkFragmentLength at hcheck
+              rw [if_neg (by decide)] at hcheck
+              split at hcheck
+              · cases hcheck
+              · rw [hsize]
+                omega
+          | handshake =>
+              unfold checkFragmentLength at hcheck
+              rw [if_neg (by decide)] at hcheck
+              split at hcheck
+              · cases hcheck
+              · rw [hsize]
+                omega
+
+/-- Framing is stable under additional input: a complete frame at the head
+of the buffer decodes identically no matter how many bytes follow it. -/
+theorem decodeStep_append_some {buffered rest : ByteArray}
+    {record : RawRecord} (chunk : ByteArray)
+    (h : decodeStep buffered = .ok (some (record, rest))) :
+    decodeStep (buffered ++ chunk) = .ok (some (record, rest ++ chunk)) := by
+  rw [← decodeStep_conservation h, ByteArray.append_assoc]
+  exact decodeStep_encode_append (rest ++ chunk) (decodeStep_wellFormed h)
+
+private theorem decodeBuffered_accum {b res : ByteArray}
+    {acc ems : Array RawRecord} (recs : Array RawRecord)
+    (h : decodeBuffered b acc = .ok (res, ems)) :
+    decodeBuffered b (recs ++ acc) = .ok (res, recs ++ ems) := by
+  match hstep : decodeStep b with
+  | .error e =>
+      rw [decodeBuffered_step_error hstep] at h
+      cases h
+  | .ok none =>
+      rw [decodeBuffered_step_none hstep] at h
+      simp only [Except.ok.injEq, Prod.mk.injEq] at h
+      obtain ⟨h1, h2⟩ := h
+      subst h1
+      subst h2
+      exact decodeBuffered_step_none hstep
+  | .ok (some (record, rest)) =>
+      rw [decodeBuffered_step_some hstep] at h
+      have ih := decodeBuffered_accum (recs := recs) h
+      rw [Array.append_push] at ih
+      rw [decodeBuffered_step_some hstep]
+      exact ih
+  termination_by b.size
+  decreasing_by exact decodeStep_size_lt hstep
+
+private theorem decodeBuffered_extend {b res chunk : ByteArray}
+    {recs ems : Array RawRecord}
+    (h : decodeBuffered b recs = .ok (res, ems)) :
+    decodeBuffered (b ++ chunk) recs = decodeBuffered (res ++ chunk) ems := by
+  match hstep : decodeStep b with
+  | .error e =>
+      rw [decodeBuffered_step_error hstep] at h
+      cases h
+  | .ok none =>
+      rw [decodeBuffered_step_none hstep] at h
+      simp only [Except.ok.injEq, Prod.mk.injEq] at h
+      obtain ⟨h1, h2⟩ := h
+      subst h1
+      subst h2
+      rfl
+  | .ok (some (record, rest)) =>
+      rw [decodeBuffered_step_some hstep] at h
+      rw [decodeBuffered_step_some (decodeStep_append_some chunk hstep)]
+      exact decodeBuffered_extend h
+  termination_by b.size
+  decreasing_by exact decodeStep_size_lt hstep
+
+/-- **Fragmentation independence**: transport chunk boundaries are
+irrelevant. Feeding `c1` and then `c2` yields exactly the records and
+residual of feeding `c1 ++ c2` at once. -/
+theorem Decoder.feed_append {d d1 d2 : Decoder} {c1 c2 : ByteArray}
+    {r1 r2 : Array RawRecord}
+    (h1 : d.feed c1 = .ok (d1, r1)) (h2 : d1.feed c2 = .ok (d2, r2)) :
+    d.feed (c1 ++ c2) = .ok (d2, r1 ++ r2) := by
+  unfold Decoder.feed at h1 h2 ⊢
+  cases hd1 : decodeBuffered (d.buffered ++ c1) #[] with
+  | error e =>
+      rw [hd1, except_bind_error] at h1
+      cases h1
+  | ok out1 =>
+      obtain ⟨res1, ems1⟩ := out1
+      rw [hd1, except_bind_ok] at h1
+      simp only [except_pure, Except.ok.injEq, Prod.mk.injEq] at h1
+      obtain ⟨hb1, hr1⟩ := h1
+      cases hd2 : decodeBuffered (d1.buffered ++ c2) #[] with
+      | error e =>
+          rw [hd2, except_bind_error] at h2
+          cases h2
+      | ok out2 =>
+          obtain ⟨res2, ems2⟩ := out2
+          rw [hd2, except_bind_ok] at h2
+          simp only [except_pure, Except.ok.injEq, Prod.mk.injEq] at h2
+          obtain ⟨hb2, hr2⟩ := h2
+          have hd1' : decodeBuffered (d.buffered ++ c1) #[] =
+              .ok (d1.buffered, r1) := by
+            rw [hd1, ← hb1, hr1]
+          have hd2' : decodeBuffered (d1.buffered ++ c2) #[] =
+              .ok (d2.buffered, r2) := by
+            rw [hd2, ← hb2, hr2]
+          have hext := decodeBuffered_extend (chunk := c2) hd1'
+          have haccum := decodeBuffered_accum (recs := r1) hd2'
+          rw [Array.append_empty] at haccum
+          rw [show d.buffered ++ (c1 ++ c2) = d.buffered ++ c1 ++ c2 from
+            ByteArray.append_assoc.symm]
+          rw [hext, haccum, except_bind_ok]
+          simp only [except_pure]
+
 /-! ## Sequence numbers and nonces -/
 
 theorem size_sequenceBytes (seq : UInt64) :
