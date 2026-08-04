@@ -39,8 +39,9 @@ Four Bazel packages:
   theorems about the record framer as implemented: byte conservation,
   fragmentation independence, encode/decode roundtrips, and
   sequence-number/nonce lemmas.
-- **`Test/`** — nine hermetic test binaries plus a manual loopback server
-  harness for external-client interop runs.
+- **`Test/`** — nine hermetic test binaries, a one-shot loopback server
+  harness, and a scripted (manual-tag) interoperability gate that drives the
+  harness with real OpenSSL, curl, and Go `crypto/tls` clients.
 
 ## Protocol scope
 
@@ -63,10 +64,17 @@ Implemented and negotiated today:
 Explicitly not yet supported (a candid list): PSK and session resumption
 (NewSessionTicket is parsed and discarded; the server never issues tickets),
 0-RTT, client certificates, AES-GCM suites, client-side HelloRetryRequest
-processing, and post-quantum hybrid groups. The narrow server-side
-ClientHello acceptance (ChaCha20-Poly1305 + X25519/P-256 + Ed25519) means
-mainstream clients such as Go `crypto/tls` or OpenSSL `s_client` do not
-negotiate with the server yet; broadening acceptance is roadmap work.
+processing, and post-quantum hybrid groups (a hybrid key share in a
+ClientHello is tolerated and skipped, not negotiated). The server's
+*negotiated* surface stays deliberately narrow (ChaCha20-Poly1305 +
+X25519/P-256 + Ed25519 — algorithms every modern client implements), but
+its *acceptance* follows RFC 8446's select-from-overlap rule: unknown cipher
+suites, groups, signature schemes, GREASE values, and extensions are
+tolerated wherever the RFC permits. Mainstream clients interoperate with
+the server today — OpenSSL `s_client`, curl, and Go `crypto/tls` all
+complete handshakes and fetch a page over the loopback harness, including
+the HelloRetryRequest path when their first flight carries only key shares
+this server does not implement (see the interop gate under Tests).
 
 ## X.509
 
@@ -165,11 +173,29 @@ zeroization of Lean-side key material.
 | `x509_der_test`, `x509_certificate_test`, `x509_chain_test`, `x509_signature_test`, `x509_hostname_test`, `x509_channel_binding_test` | DER/PEM strictness corpus; OpenSSL-generated RSA/P-256/Ed25519 fixtures; chain validation success and eleven failure classes; RSA/ECDSA/PSS signature vectors and boundary rejections; hostname and channel-binding rules |
 
 Honest interop note: the hermetic "interop" test pairs this repo's own
-client and server. `bazel run //Test:tls_external_server -- 8443` starts a
-manual loopback harness intended for gates against independent clients
-(OpenSSL, Go); those runs are not yet scripted or part of CI, and the
-current server acceptance is too narrow for mainstream clients to complete
-a handshake (see Protocol scope).
+client and server. Interop against *independent* clients is a separate,
+scripted gate — `bazel test //Test:external_interop_test
+--test_output=streamed` — which starts the one-shot loopback harness
+(`bazel run //Test:tls_external_server -- 8443` runs it manually) and
+drives six externally implemented handshakes, asserting completion and the
+HTTP/1.1 200 body:
+
+- OpenSSL `s_client` with default groups (tolerating its X25519MLKEM768
+  hybrid key share), and a forced HelloRetryRequest run
+  (`-groups P-384:X25519`: the only first-flight share is P-384, which this
+  server does not implement, so it must retry to X25519);
+- curl fetching the page, once normally and once against a server that
+  reads the transport 7 bytes at a time (record reassembly at arbitrary
+  TCP boundaries);
+- Go `crypto/tls` with its default configuration, and a forced
+  HelloRetryRequest run (CurvePreferences restricted to
+  {X25519MLKEM768, P-256}, so the server must retry to P-256).
+
+The gate is tagged `manual`/`local` — it binds loopback ports and shells
+out to host `openssl` and `curl` (the Go cases skip gracefully without a
+`go` binary; use `nix shell nixpkgs#go -c bazel test ...`) — so
+`bazel test //...` stays hermetic and offline. Verified against OpenSSL
+3.6.1, curl 8.18.0, and Go 1.25.6.
 
 ## Building
 
@@ -197,8 +223,9 @@ build because it compiles and links the HACL\* C shim.
 4. ✅ Handshake codecs for both roles, including HelloRetryRequest, ALPN, SNI
 5. ✅ Sans-I/O client and server state machines
 6. ✅ X.509: strict DER/PEM, chain validation, hostname, channel binding
-7. Broaden server ClientHello acceptance for mainstream-client interop;
-   scripted OpenSSL/Go interop gates
+7. ✅ Mainstream-client server interop (OpenSSL, curl, Go `crypto/tls`,
+   including their HelloRetryRequest paths) with a scripted gate
+   (`//Test:external_interop_test`)
 8. AES-GCM suites; client-side HelloRetryRequest
 9. PSK, resumption, 0-RTT; client certificates
 10. Protocol-level proofs — record-layer laws are done (`Tls.Record.Laws`:
