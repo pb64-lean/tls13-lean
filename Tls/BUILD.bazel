@@ -57,6 +57,16 @@ lean_assurance_test(
         "Tls.Server.run_nonce_nodup",
         "Tls.Server.feed_nonce_nodup",
         "Tls.Record.nonceOf_inj",
+        # Nonce non-reuse with the epoch-freshness hypothesis discharged: the
+        # epochs a client run installs are strictly increasing nodes of the
+        # RFC 8446 key schedule, so distinctness follows from the injectivity
+        # of HKDF-Expand-Label alone.
+        "Tls.Record.EpochsFrom.nodup",
+        "Tls.Record.SpecExtends.nonce_nodup",
+        "Tls.Client.run_epochs",
+        "Tls.Client.run_nonce_nodup_spec",
+        "Tls.Client.feed_nonce_nodup_spec",
+        "Tls.Client.start_run_nonce_nodup",
         "Tls.Record.TrafficKeys.nonce_inj",
         "Tls.Record.sequenceBytes_inj",
         # Record layer: framing conserves bytes, and open inverts seal.
@@ -106,6 +116,7 @@ lean_assurance_test(
         "Tls.Client.closeNotify_connected",
         "Tls.Client.feedWithFailure_closed",
         "Tls.Client.State.WellFormed.noReadKeys",
+        "Tls.Client.State.WellFormed.noWriteKeys",
         "Tls.Client.run_wellFormed",
         "Tls.Server.acceptClientFinished_verified",
         "Tls.Server.sendHelloRetryRequest_messageHash",

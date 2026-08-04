@@ -51,6 +51,10 @@ lean_assurance_test(
         "TLS13.KeySchedule.Spec.Derived.tree_rfc8446",
         "TLS13.KeySchedule.Spec.HkdfLabel.encode_bytes",
         "TLS13.KeySchedule.Spec.emptyContext_rfc8446",
+        # Key schedule: distinct nodes of the diagram — including a key-update
+        # chain of any length — have distinct traffic secrets, given only that
+        # HKDF-Expand-Label is injective.
+        "TLS13.KeySchedule.Spec.Epoch.eq_of_secret_eq",
         # Key schedule: the implementation refines it.
         "TLS13.KeySchedule.hkdfLabel_encode",
         "TLS13.KeySchedule.hkdfLabel_bytes",

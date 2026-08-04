@@ -30,10 +30,14 @@ Scope, stated honestly:
   can forbid that. Threading one state is the caller's obligation.
 * Only the *write* direction is covered. Nonce reuse is a sender property;
   read-side nonces are the peer's.
-* Distinctness across traffic epochs is the `secrets.Nodup` hypothesis, not a
-  theorem: TLS derives each new epoch with HKDF-Expand-Label, which is an opaque
-  HACL\* binding here (`Tls.Record.Laws.WriteRun.nodup` documents the same
-  boundary). Within one epoch nothing is assumed.
+* Distinctness across traffic epochs is a `secrets.Nodup` hypothesis in
+  `run_nonce_nodup`. `run_nonce_nodup_spec` discharges it: the epochs a run
+  installs are the RFC 8446 §7.1 / §7.2 nodes, in strictly increasing order, so
+  they are distinct as soon as `HKDF-Expand-Label` is injective
+  (`TLS13.KeySchedule.Spec.ExpandLabelInjective`). That injectivity is still an
+  assumption about the opaque HACL\* binding — but it is an assumption about the
+  primitive, not about the particular byte strings one run produced. Within one
+  epoch nothing is assumed at all.
 -/
 
 private theorem except_bind_ok_inv {α β : Type} {m : Except Error α}
@@ -545,12 +549,17 @@ dropped every handshake secret and the handshake transcript.** Before the
 connection is established that clause says nothing, which is exactly right —
 the handshake states are the ones that legitimately hold those secrets.
 
-**A client that has not yet accepted the ServerHello holds no read epoch.**
+**A client that has not yet accepted the ServerHello holds neither traffic
+epoch.**
 This is the state-only half of the inbound application-data rule: opening any
 protected record needs a read epoch (`requireReadKeys`), so in
 `waitingServerHello` the engine cannot decrypt anything at all, and *a fortiori*
 cannot hand plaintext to the caller. Only `acceptServerHello` installs the first
-read epoch, and it leaves `waitingServerHello` in the same step. The rest of the
+read epoch, and it leaves `waitingServerHello` in the same step. The same holds
+of the *write* epoch, which is what makes `acceptServerHello` the installation
+of the connection's first epoch rather than the replacement of one — exactly
+what `run_nonce_nodup_spec` needs in order to know that no epoch is revisited.
+The rest of the
 inbound rule is inherently about an *output* rather than a state and stays a
 transition law: `feed_plaintext_connected` / `run_plaintext_connected` below say
 that any feed or run which delivers plaintext delivers it with a `connected`
@@ -568,7 +577,8 @@ def State.WellFormed (state : State) : Prop :=
       state.clientHandshakeTrafficSecret? = none ∧
       state.serverHandshakeTrafficSecret? = none ∧
       state.transcript = ByteArray.empty) ∧
-  (state.phase = .waitingServerHello → state.readKeys? = none)
+  (state.phase = .waitingServerHello →
+    state.readKeys? = none ∧ state.writeKeys? = none)
 
 /-- The established-connection clause, as a projection. -/
 theorem State.WellFormed.connected {state : State} (h : state.WellFormed)
@@ -582,7 +592,15 @@ theorem State.WellFormed.connected {state : State} (h : state.WellFormed)
 /-- **A client waiting for the ServerHello holds no read epoch**, so it can
 decrypt nothing and therefore deliver nothing. -/
 theorem State.WellFormed.noReadKeys {state : State} (h : state.WellFormed)
-    (hp : state.phase = .waitingServerHello) : state.readKeys? = none := h.2 hp
+    (hp : state.phase = .waitingServerHello) : state.readKeys? = none := (h.2 hp).1
+
+/-- **A client waiting for the ServerHello holds no write epoch either.** The
+mirror of `noReadKeys`, and what makes the ServerHello the *first* epoch of the
+connection: `acceptServerHello` cannot be replacing one (see
+`run_nonce_nodup_spec`, where that is exactly what rules out an epoch being
+reused). -/
+theorem State.WellFormed.noWriteKeys {state : State} (h : state.WellFormed)
+    (hp : state.phase = .waitingServerHello) : state.writeKeys? = none := (h.2 hp).2
 
 /-- Opening a record needs a read epoch, so a successful `requireReadKeys`
 witnesses that the state holds one. -/
@@ -594,42 +612,57 @@ private theorem requireReadKeys_isSome {state : State}
   · rename_i hk; rw [hk]; rfl
   · cases h
 
+/-- Protecting a record needs a write epoch, so a successful `requireWriteKeys`
+witnesses that the state holds one. -/
+private theorem requireWriteKeys_isSome {state : State}
+    {keys : Record.TrafficKeys} (h : requireWriteKeys state = .ok keys) :
+    state.writeKeys?.isSome = true := by
+  rw [requireWriteKeys_ok h]; rfl
+
 /-- Transfer the invariant across a state update that changes no field it
-mentions, except by installing traffic keys. A *new* read epoch is only ever
-derived from an existing one, so the second disjunct of `hread` carries the
-witness that `s` already had one — which is what keeps the
-`waitingServerHello` clause true of `t`. -/
+mentions, except by installing traffic keys. A *new* epoch — in either
+direction — is only ever derived from an existing one, so the second disjunct of
+`hread` / `hwrite` carries the witness that `s` already had one, which is what
+keeps the `waitingServerHello` clause true of `t`. -/
 private theorem wellFormed_transfer {s t : State} (hinv : s.WellFormed)
     (hphase : t.phase = s.phase)
-    (hwrite : t.writeKeys? = s.writeKeys? ∨ ∃ k, t.writeKeys? = some k)
+    (hwrite : t.writeKeys? = s.writeKeys? ∨
+      (∃ k, t.writeKeys? = some k) ∧ s.writeKeys?.isSome = true)
     (hread : t.readKeys? = s.readKeys? ∨
       (∃ k, t.readKeys? = some k) ∧ s.readKeys?.isSome = true)
     (h1 : t.handshakeSecret? = s.handshakeSecret?)
     (h2 : t.clientHandshakeTrafficSecret? = s.clientHandshakeTrafficSecret?)
     (h3 : t.serverHandshakeTrafficSecret? = s.serverHandshakeTrafficSecret?)
     (h4 : t.transcript = s.transcript) : t.WellFormed := by
-  refine ⟨fun hc => ?_, fun hp => ?_⟩
+  refine ⟨fun hc => ?_, fun hp => ⟨?_, ?_⟩⟩
   · obtain ⟨a, b, c, d, e, f⟩ := hinv.1 (hphase ▸ hc)
     refine ⟨?_, ?_, by rw [h1]; exact c, by rw [h2]; exact d,
       by rw [h3]; exact e, by rw [h4]; exact f⟩
     · cases hwrite with
       | inl hw => rw [hw]; exact a
-      | inr hw => obtain ⟨k, hk⟩ := hw; rw [hk]; rfl
+      | inr hw => obtain ⟨⟨k, hk⟩, -⟩ := hw; rw [hk]; rfl
     · cases hread with
       | inl hr => rw [hr]; exact b
       | inr hr => obtain ⟨⟨k, hk⟩, -⟩ := hr; rw [hk]; rfl
   · cases hread with
-    | inl hr => rw [hr]; exact hinv.2 (hphase ▸ hp)
+    | inl hr => rw [hr]; exact (hinv.2 (hphase ▸ hp)).1
     | inr hr =>
         obtain ⟨-, hs⟩ := hr
-        rw [hinv.2 (hphase ▸ hp)] at hs
+        rw [(hinv.2 (hphase ▸ hp)).1] at hs
+        exact absurd hs (by decide)
+  · cases hwrite with
+    | inl hw => rw [hw]; exact (hinv.2 (hphase ▸ hp)).2
+    | inr hw =>
+        obtain ⟨-, hs⟩ := hw
+        rw [(hinv.2 (hphase ▸ hp)).2] at hs
         exact absurd hs (by decide)
 
-/-- A fresh client connection is waiting for the ServerHello and holds no read
-epoch. -/
+/-- A fresh client connection is waiting for the ServerHello and holds neither
+traffic epoch. -/
 private theorem start_phase_readKeys {config : Config} {out : Output}
     (h : start config = .ok out) :
-    out.state.phase = .waitingServerHello ∧ out.state.readKeys? = none := by
+    out.state.phase = .waitingServerHello ∧ out.state.readKeys? = none ∧
+      out.state.writeKeys? = none := by
   unfold start at h
   simp only [pure_bind] at h
   obtain ⟨_, h⟩ := unless_ok h
@@ -646,7 +679,7 @@ private theorem start_phase_readKeys {config : Config} {out : Output}
                     | (obtain ⟨hello, _, h⟩ := except_bind_ok_inv h
                        obtain ⟨wire, _, h⟩ := except_bind_ok_inv h
                        cases h
-                       exact ⟨rfl, rfl⟩)
+                       exact ⟨rfl, rfl, rfl⟩)
                     | (split at h <;>
                         first
                           | cases h
@@ -654,7 +687,7 @@ private theorem start_phase_readKeys {config : Config} {out : Output}
                              obtain ⟨hello, _, h⟩ := except_bind_ok_inv h
                              obtain ⟨wire, _, h⟩ := except_bind_ok_inv h
                              cases h
-                             exact ⟨rfl, rfl⟩))))
+                             exact ⟨rfl, rfl, rfl⟩))))
       | (split at h <;>
           first
             | cases h
@@ -664,7 +697,7 @@ private theorem start_phase_readKeys {config : Config} {out : Output}
                    | (obtain ⟨hello, _, h⟩ := except_bind_ok_inv h
                       obtain ⟨wire, _, h⟩ := except_bind_ok_inv h
                       cases h
-                      exact ⟨rfl, rfl⟩)
+                      exact ⟨rfl, rfl, rfl⟩)
                    | (split at h <;>
                        first
                          | cases h
@@ -672,7 +705,7 @@ private theorem start_phase_readKeys {config : Config} {out : Output}
                             obtain ⟨hello, _, h⟩ := except_bind_ok_inv h
                             obtain ⟨wire, _, h⟩ := except_bind_ok_inv h
                             cases h
-                            exact ⟨rfl, rfl⟩))))
+                            exact ⟨rfl, rfl, rfl⟩))))
 
 /-- A fresh client connection is waiting for the ServerHello. -/
 theorem start_phase {config : Config} {out : Output}
@@ -696,8 +729,8 @@ theorem sealFatalAlert_wellFormed {state : State} {description : UInt8}
   obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
   obtain ⟨next, wire⟩ := sealed
   cases h
-  exact wellFormed_transfer hinv rfl (.inr ⟨_, rfl⟩) (.inl rfl) rfl rfl
-    rfl rfl
+  exact wellFormed_transfer hinv rfl (.inr ⟨⟨_, rfl⟩, requireWriteKeys_isSome hk⟩)
+    (.inl rfl) rfl rfl rfl rfl
 
 private theorem emitCloseNotify_wellFormed {state next : State} {wire : ByteArray}
     (h : emitCloseNotify state = .ok (next, wire)) (hinv : state.WellFormed) :
@@ -709,7 +742,8 @@ private theorem emitCloseNotify_wellFormed {state next : State} {wire : ByteArra
     obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
     obtain ⟨sealedKeys, wireBytes⟩ := sealed
     cases h
-    exact wellFormed_transfer hinv rfl (.inr ⟨_, rfl⟩) (.inl rfl) rfl rfl
+    exact wellFormed_transfer hinv rfl (.inr ⟨⟨_, rfl⟩, requireWriteKeys_isSome hk⟩)
+      (.inl rfl) rfl rfl
       rfl rfl
 
 theorem sealApplication_wellFormed {state : State} {plaintext : ByteArray}
@@ -726,8 +760,8 @@ theorem sealApplication_wellFormed {state : State} {plaintext : ByteArray}
         obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
         obtain ⟨nextKeys, records⟩ := sealed
         cases h
-        exact wellFormed_transfer hinv rfl (.inr ⟨_, rfl⟩) (.inl rfl) rfl rfl
-          rfl rfl
+        exact wellFormed_transfer hinv rfl
+          (.inr ⟨⟨_, rfl⟩, requireWriteKeys_isSome hk⟩) (.inl rfl) rfl rfl rfl rfl
   · cases h
 
 theorem closeNotify_wellFormed {state : State} {out : Output}
@@ -768,8 +802,8 @@ private theorem sendKeyUpdateResponse_wellFormed {state next : State}
   obtain ⟨advancedKeys, wireBytes⟩ := sealed
   obtain ⟨updatedKeys, hu, h⟩ := except_bind_ok_inv h
   cases h
-  exact wellFormed_transfer hinv rfl (.inr ⟨_, rfl⟩) (.inl rfl) rfl rfl
-    rfl rfl
+  exact wellFormed_transfer hinv rfl (.inr ⟨⟨_, rfl⟩, requireWriteKeys_isSome hk⟩)
+    (.inl rfl) rfl rfl rfl rfl
 
 private theorem acceptKeyUpdate_wellFormed {state next : State}
     {message : Handshake.Message} {wire : ByteArray}
@@ -1996,6 +2030,657 @@ theorem acceptKeyUpdate_keySchedule {H : Spec.Hkdf} (hi : Implements H)
   split at h
   · cases h; rfl
   · rw [sendKeyUpdateResponse_readKeys h]
+
+/-! ## Nonce non-reuse without the epoch-freshness hypothesis
+
+`run_nonce_nodup` concludes `secrets.Nodup → nonces.Nodup`: distinctness *across*
+epochs was left as a hypothesis, because HKDF is an opaque HACL\* binding. The
+laws above remove the need for it. The engine does not choose its epoch secrets
+freely — `acceptServerHello` installs `client_handshake_traffic_secret`,
+`completeServerHandshake` replaces it with
+`client_application_traffic_secret_0`, and every KeyUpdate rolls that forward
+under `"traffic upd"` — so the epochs of a run are, in order, strictly
+increasing nodes of the RFC 8446 §7.1 / §7.2 derivation tree
+(`Spec.Epoch.Lt`). Under `Spec.ExpandLabelInjective`, distinct nodes have
+distinct traffic secrets (`Spec.Epoch.eq_of_secret_eq`), so `secrets.Nodup`
+becomes a theorem: `run_nonce_nodup_spec`.
+
+Two things this does **not** do. It is not a proof about HKDF: the injectivity
+of `HKDF-Expand-Label` is still an assumption about HACL\*'s code, exactly like
+the AEAD round trip in `Tls.Record.open_seal`. And it does not constrain a
+caller who clones a `State`; single-threading remains the caller's obligation.
+What has changed is the *size* of the assumption — from "these particular byte
+strings happen to differ" to a standard, reviewable property of a KDF. The
+KeyUpdate chain is covered for arbitrarily many updates: `Spec.Epoch.updates`
+is an unbounded `Nat`, and the induction in `Spec.Epoch.eq_of_secret_eq` peels
+one `"traffic upd"` at a time. -/
+
+/-- The label a client's write epoch is derived under in a given phase: RFC 8446
+§7.1's `"c hs traffic"` while the handshake runs, `"c ap traffic"` once the
+connection is established. -/
+def writeEpochLabel : Phase → Spec.Label
+  | .connected => .cApTraffic
+  | _ => .cHsTraffic
+
+theorem writeEpochLabel_valid (p : Phase) :
+    writeEpochLabel p ≠ Spec.Label.trafficUpd := by
+  cases p <;> (intro hc; cases hc)
+
+theorem writeEpochLabel_of_ne_connected {p : Phase} (h : p ≠ .connected) :
+    writeEpochLabel p = Spec.Label.cHsTraffic := by
+  cases p <;> first | rfl | exact absurd rfl h
+
+/-- **Which node of the key schedule a client's write state is in.** `none`
+before the first epoch is installed; otherwise the §7.1 derivation the write
+traffic secret came from, plus the number of §7.2 KeyUpdates since. The phase
+fixes the label: a handshake-phase client writes under `"c hs traffic"`, an
+established one under `"c ap traffic"`. -/
+def State.WriteEpoch (H : Spec.Hkdf) (state : State) (o : Option Spec.Epoch) : Prop :=
+  Record.EpochOf H o state.writeKeys? ∧
+    ∀ e, o = some e → e.label = writeEpochLabel state.phase
+
+theorem State.WriteEpoch.valid {H : Spec.Hkdf} {state : State}
+    {o : Option Spec.Epoch} (h : state.WriteEpoch H o) :
+    ∀ e, o = some e → e.Valid := by
+  intro e he
+  show e.label ≠ Spec.Label.trafficUpd
+  rw [h.2 e he]
+  exact writeEpochLabel_valid _
+
+/-- The write side of one engine step, refined by the key schedule: it maps the
+epoch the connection was in to the epoch it ends in, and the epochs it abandoned
+on the way join the run's epoch list in strictly increasing order. `SpecEffect`
+composes exactly as `WriteEffect` does. -/
+def SpecEffect (H : Spec.Hkdf) (before after : State) : Prop :=
+  ∀ o, before.WriteEpoch H o →
+    ∃ o', after.WriteEpoch H o' ∧
+      Record.SpecExtends H o o' before.writeKeys? after.writeKeys?
+
+theorem SpecEffect.trans {H : Spec.Hkdf} {a b c : State}
+    (h1 : SpecEffect H a b) (h2 : SpecEffect H b c) : SpecEffect H a c := by
+  intro o ho
+  obtain ⟨o', ho', hx⟩ := h1 o ho
+  obtain ⟨o'', ho'', hx'⟩ := h2 o' ho'
+  exact ⟨o'', ho'', hx.trans hx'⟩
+
+/-- A step that protects records but installs no epoch. -/
+theorem SpecEffect.within {H : Spec.Hkdf} {before after : State}
+    (hp : writeEpochLabel after.phase = writeEpochLabel before.phase)
+    (hx : Record.WithinEpoch H before.writeKeys? after.writeKeys?) :
+    SpecEffect H before after := by
+  intro o ho
+  obtain ⟨ha, hs⟩ := hx.apply ho.1
+  exact ⟨o, ⟨ha, fun e he => by rw [hp]; exact ho.2 e he⟩, hs⟩
+
+/-- Prefix a step with a state change that touches neither the write keys nor
+the phase's epoch label — which is what every field the engine updates between
+epochs (buffers, transcript, read keys, flags) amounts to. -/
+theorem SpecEffect.of_eq {H : Spec.Hkdf} {a b c : State} (h : SpecEffect H b c)
+    (hw : b.writeKeys? = a.writeKeys?)
+    (hp : writeEpochLabel b.phase = writeEpochLabel a.phase) :
+    SpecEffect H a c := by
+  intro o ho
+  have ho' : b.WriteEpoch H o :=
+    ⟨by rw [hw]; exact ho.1, fun e he => by rw [hp]; exact ho.2 e he⟩
+  obtain ⟨o', ho'', hx⟩ := h o ho'
+  rw [hw] at hx
+  exact ⟨o', ho'', hx⟩
+
+theorem sealFatalAlert_epochs {H : Spec.Hkdf} {state : State} {description : UInt8}
+    {out : Output} (h : sealFatalAlert state description = .ok out) :
+    SpecEffect H state out.state := by
+  unfold sealFatalAlert at h
+  obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
+  obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
+  obtain ⟨next, wire⟩ := sealed
+  cases h
+  refine SpecEffect.within rfl ?_
+  show Record.WithinEpoch H state.writeKeys? (some next)
+  rw [requireWriteKeys_ok hk]
+  exact Record.WithinEpoch.of_seal (liftRecord_ok hs)
+
+private theorem emitCloseNotify_epochs {H : Spec.Hkdf} {state next : State}
+    {wire : ByteArray} (h : emitCloseNotify state = .ok (next, wire)) :
+    SpecEffect H state next := by
+  unfold emitCloseNotify at h
+  split at h
+  · cases h; exact SpecEffect.within rfl (Record.WithinEpoch.refl _)
+  · obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
+    obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
+    obtain ⟨sealedKeys, wireBytes⟩ := sealed
+    cases h
+    refine SpecEffect.within rfl ?_
+    show Record.WithinEpoch H state.writeKeys? (some sealedKeys)
+    rw [requireWriteKeys_ok hk]
+    exact Record.WithinEpoch.of_seal (liftRecord_ok hs)
+
+private theorem sealChunks_epochs {H : Spec.Hkdf} {keys keys' : Record.TrafficKeys}
+    {plaintext : ByteArray} {offset : Nat} {records records' : Array ByteArray}
+    (h : sealChunks keys plaintext offset records = .ok (keys', records')) :
+    Record.WithinEpoch H (some keys) (some keys') := by
+  unfold sealChunks at h
+  split at h
+  · cases h; exact Record.WithinEpoch.refl _
+  · simp only [] at h
+    split at h
+    · cases h
+    · rename_i nextKeys wire hpair
+      exact Record.WithinEpoch.trans
+        (Record.WithinEpoch.of_seal (liftRecord_ok hpair)) (sealChunks_epochs h)
+  termination_by plaintext.size - offset
+  decreasing_by
+    have : 0 < Record.maxPlaintextLength := by decide
+    omega
+
+theorem sealApplication_epochs {H : Spec.Hkdf} {state : State} {plaintext : ByteArray}
+    {out : Output} (h : sealApplication state plaintext = .ok out) :
+    SpecEffect H state out.state := by
+  unfold sealApplication at h
+  simp only [pure_bind] at h
+  split at h
+  · split at h
+    · cases h
+    · split at h
+      · cases h; exact SpecEffect.within rfl (Record.WithinEpoch.refl _)
+      · obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
+        obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
+        obtain ⟨nextKeys, records⟩ := sealed
+        cases h
+        refine SpecEffect.within rfl ?_
+        show Record.WithinEpoch H state.writeKeys? (some nextKeys)
+        rw [requireWriteKeys_ok hk]
+        exact sealChunks_epochs hs
+  · cases h
+
+theorem closeNotify_epochs {H : Spec.Hkdf} {state : State} {out : Output}
+    (h : closeNotify state = .ok out) : SpecEffect H state out.state := by
+  unfold closeNotify at h
+  simp only [pure_bind] at h
+  split at h
+  case isFalse => cases h
+  obtain ⟨pair, hp, h⟩ := except_bind_ok_inv h
+  obtain ⟨next, wire⟩ := pair
+  cases h
+  exact emitCloseNotify_epochs hp
+
+private theorem processAlert_epochs {H : Spec.Hkdf} {state next : State}
+    {fragment : ByteArray} {duringHandshake : Bool} {wire : ByteArray}
+    (h : processAlert state fragment duringHandshake = .ok (next, wire)) :
+    SpecEffect H state next := by
+  unfold processAlert at h
+  simp only [pure_bind] at h
+  split at h
+  case isFalse => cases h
+  split at h
+  case isFalse => cases h
+  split at h
+  · split at h
+    · cases h
+    · have hw := emitCloseNotify_epochs (H := H) h
+      exact hw
+  · cases h
+
+/-- **A KeyUpdate response moves the write side to the §7.2 successor epoch.**
+The reciprocal KeyUpdate is sealed under the old epoch — so that record is
+accounted for in the old epoch's nonce budget — and only then is the traffic
+secret rolled forward, to `HKDF-Expand-Label(old, "traffic upd", "", 32)`, which
+is a strictly later node of the schedule. -/
+private theorem sendKeyUpdateResponse_epochs {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {wire : ByteArray}
+    (h : sendKeyUpdateResponse state = .ok (next, wire)) : SpecEffect H state next := by
+  unfold sendKeyUpdateResponse at h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
+  obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
+  obtain ⟨advancedKeys, wireBytes⟩ := sealed
+  obtain ⟨updatedKeys, hu, h⟩ := except_bind_ok_inv h
+  cases h
+  intro o ho
+  have hw : state.writeKeys? = some keys := requireWriteKeys_ok hk
+  have hE : Record.EpochOf H o (some keys) := by rw [← hw]; exact ho.1
+  obtain ⟨e, rfl, hsec⟩ := Record.EpochOf.some_inv hE
+  have hadv : advancedKeys.secret = e.secret H := by
+    rw [Record.seal_secret_eq (liftRecord_ok hs)]; exact hsec
+  have hupd := Record.TrafficKeys.update_spec hi (liftRecord_ok hu)
+  refine ⟨some e.next, ⟨Record.EpochOf.intro ?_, fun e' he' => ?_⟩, ?_⟩
+  · rw [hupd.secret_eq, hadv, Spec.Epoch.secret_next]
+  · cases he'
+    exact ho.2 e rfl
+  · rw [hw]
+    exact (Record.SpecExtends.of_seal (liftRecord_ok hs)).trans
+      (Record.SpecExtends.rekey hadv (ho.valid e rfl) (Spec.Epoch.lt_next e))
+
+private theorem acceptKeyUpdate_epochs {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {message : Handshake.Message} {wire : ByteArray}
+    (h : acceptKeyUpdate state message = .ok (next, wire)) :
+    SpecEffect H state next := by
+  unfold acceptKeyUpdate at h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  split at h
+  · cases h
+    exact SpecEffect.within rfl (Record.WithinEpoch.refl _)
+  · have hw := sendKeyUpdateResponse_epochs hi h
+    exact SpecEffect.of_eq hw rfl rfl
+
+/-- **Accepting the ServerHello installs the connection's first write epoch.**
+The `waitingServerHello` clause of `State.WellFormed` is what makes this an
+installation rather than a replacement: there was no epoch to abandon, so no
+epoch can be revisited here. -/
+private theorem acceptServerHello_epochs {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {message : Handshake.Message}
+    (h : acceptServerHello state message = .ok next) (hinv : state.WellFormed) :
+    SpecEffect H state next := by
+  unfold acceptServerHello at h
+  simp only [pure_bind] at h
+  obtain ⟨hph, h⟩ := unless_ok h
+  have hnone : state.writeKeys? = none := hinv.noWriteKeys (phase_eq_of_beq hph)
+  have hgoal : ∀ (parent ctx : ByteArray) (wk : Record.TrafficKeys) (n : State),
+      Record.deriveTrafficKeys
+          (TLS13.KeySchedule.deriveSecret parent "c hs traffic" ctx) = .ok wk →
+      n.writeKeys? = some wk →
+      writeEpochLabel n.phase = Spec.Label.cHsTraffic →
+      SpecEffect H state n := by
+    intro parent ctx wk n hd hwk hlab o ho
+    have ho' : o = none := Record.EpochOf.none_inv (by rw [← hnone]; exact ho.1)
+    subst ho'
+    refine ⟨some ⟨parent, .cHsTraffic, ctx, 0⟩, ⟨?_, fun e he => ?_⟩, ?_⟩
+    · rw [hwk]
+      exact Record.EpochOf.intro
+        ((Record.deriveTrafficKeys_spec hi hd).secret_eq.trans
+          (TLS13.KeySchedule.deriveSecret_spec hi parent .cHsTraffic ctx))
+    · cases he
+      exact hlab.symm
+    · rw [hnone, hwk]
+      exact Record.SpecExtends.install
+  obtain ⟨hello, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  split at h
+  · split at h
+    · split at h
+      · obtain ⟨writeKeys, hw, h⟩ := except_bind_ok_inv h
+        obtain ⟨readKeys, hr, h⟩ := except_bind_ok_inv h
+        cases h
+        exact hgoal _ _ _ _ (liftRecord_ok hw) rfl rfl
+      · cases h
+    · cases h
+  · split at h
+    · split at h
+      · split at h
+        · obtain ⟨writeKeys, hw, h⟩ := except_bind_ok_inv h
+          obtain ⟨readKeys, hr, h⟩ := except_bind_ok_inv h
+          cases h
+          exact hgoal _ _ _ _ (liftRecord_ok hw) rfl rfl
+        · cases h
+      · cases h
+    · cases h
+
+/-- **Becoming established moves the write side from the handshake epoch to the
+application epoch.** `"c ap traffic"` sits at a later stage of the schedule than
+`"c hs traffic"` (`Spec.Label.stage`), so the new epoch is strictly later than
+the old one however many records the handshake epoch protected. The state
+invariant supplies the missing half: a client holding a handshake secret is not
+already established, so the epoch it is leaving really is a handshake epoch. -/
+private theorem completeServerHandshake_epochs {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {message : Handshake.Message} {wire : ByteArray}
+    (h : completeServerHandshake state message = .ok (next, wire))
+    (hinv : state.WellFormed) : SpecEffect H state next := by
+  unfold completeServerHandshake at h
+  simp only [pure_bind] at h
+  obtain ⟨finished, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverSecret, _, h⟩ := except_bind_ok_inv h
+  split at h
+  case isFalse => cases h
+  obtain ⟨handshake, hhsec, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientApplicationKeys, hcak, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverApplicationKeys, hsak, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientHandshakeSecret, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientFinished, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨handshakeWriteKeys, hk, h⟩ := except_bind_ok_inv h
+  obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
+  obtain ⟨advancedKeys, finishedWire⟩ := sealed
+  have hnc : state.phase ≠ .connected := by
+    intro hc
+    have hnone := (hinv.connected hc).2.2.1
+    rw [requireHandshakeSecret_ok hhsec] at hnone
+    cases hnone
+  have hgoal : ∀ (parent ctx : ByteArray) (wk : Record.TrafficKeys) (n : State),
+      Record.deriveTrafficKeys
+          (TLS13.KeySchedule.deriveSecret parent "c ap traffic" ctx) = .ok wk →
+      n.writeKeys? = some wk →
+      writeEpochLabel n.phase = Spec.Label.cApTraffic → SpecEffect H state n := by
+    intro parent ctx wk n hd hwk hlab o ho
+    have hw : state.writeKeys? = some handshakeWriteKeys := requireWriteKeys_ok hk
+    have hE : Record.EpochOf H o (some handshakeWriteKeys) := by rw [← hw]; exact ho.1
+    obtain ⟨e, rfl, hsec⟩ := Record.EpochOf.some_inv hE
+    have hadv : advancedKeys.secret = e.secret H := by
+      rw [Record.seal_secret_eq (liftRecord_ok hs)]; exact hsec
+    have hlt : e.Lt ⟨parent, Spec.Label.cApTraffic, ctx, 0⟩ := by
+      refine Or.inl ?_
+      rw [show e.label = Spec.Label.cHsTraffic from
+        (ho.2 e rfl).trans (writeEpochLabel_of_ne_connected hnc)]
+      exact (by decide : (1 : Nat) < 2)
+    refine ⟨some ⟨parent, .cApTraffic, ctx, 0⟩, ⟨?_, fun e' he' => ?_⟩, ?_⟩
+    · rw [hwk]
+      exact Record.EpochOf.intro
+        ((Record.deriveTrafficKeys_spec hi hd).secret_eq.trans
+          (TLS13.KeySchedule.deriveSecret_spec hi parent .cApTraffic ctx))
+    · cases he'
+      exact hlab.symm
+    · rw [hw, hwk]
+      exact (Record.SpecExtends.of_seal (liftRecord_ok hs)).trans
+        (Record.SpecExtends.rekey hadv (ho.valid e rfl) hlt)
+  split at h
+  · cases h; exact hgoal _ _ _ _ (liftRecord_ok hcak) rfl rfl
+  · obtain ⟨compatibilityWire, _, h⟩ := except_bind_ok_inv h
+    cases h
+    exact hgoal _ _ _ _ (liftRecord_ok hcak) rfl rfl
+
+private theorem processHandshakeBuffer_epochs {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {wire : ByteArray}
+    (h : processHandshakeBuffer state = .ok (next, wire))
+    (hinv : state.WellFormed) : SpecEffect H state next := by
+  unfold processHandshakeBuffer at h
+  split at h
+  · cases h
+  · cases h; exact SpecEffect.within rfl (Record.WithinEpoch.refl _)
+  · rename_i message rest htake
+    have hsize : rest.size < state.handshakeBuffered.size := takeHandshake?_size htake
+    simp only [pure_bind] at h
+    split at h
+    · cases h
+    · rename_i hph
+      have hph' : writeEpochLabel state.phase = Spec.Label.cHsTraffic := by
+        rw [show state.phase = Phase.waitingEncryptedExtensions from hph]; rfl
+      obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+      obtain ⟨alpn, _, h⟩ := except_bind_ok_inv h
+      split at h
+      · obtain ⟨_, h⟩ := unless_ok h
+        have hw := processHandshakeBuffer_epochs hi h
+          ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
+        exact SpecEffect.of_eq hw rfl hph'.symm
+      · have hw := processHandshakeBuffer_epochs hi h
+          ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
+        exact SpecEffect.of_eq hw rfl hph'.symm
+    · rename_i hph
+      have hph' : writeEpochLabel state.phase = Spec.Label.cHsTraffic := by
+        rw [show state.phase = Phase.waitingCertificate from hph]; rfl
+      obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+      have hw := processHandshakeBuffer_epochs hi h
+        ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
+      exact SpecEffect.of_eq hw rfl hph'.symm
+    · rename_i hph
+      have hph' : writeEpochLabel state.phase = Spec.Label.cHsTraffic := by
+        rw [show state.phase = Phase.waitingCertificateVerify from hph]; rfl
+      obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+      split at h
+      · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        obtain ⟨_, h⟩ := unless_ok h
+        obtain ⟨_, h⟩ := unless_ok h
+        have hw := processHandshakeBuffer_epochs hi h
+          ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
+        exact SpecEffect.of_eq hw rfl hph'.symm
+      · cases h
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨_, h⟩ := unless_ok h
+      have hw := completeServerHandshake_epochs hi h
+        (wellFormed_transfer hinv rfl (.inl rfl) (.inl rfl) rfl rfl rfl rfl)
+      exact SpecEffect.of_eq hw rfl rfl
+    · split at h
+      · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        have hw := processHandshakeBuffer_epochs hi h
+          (wellFormed_transfer hinv rfl (.inl rfl) (.inl rfl) rfl rfl rfl rfl)
+        exact SpecEffect.of_eq hw rfl rfl
+      · split at h
+        · split at h
+          · cases h
+          · rename_i stateK wireK hacc
+            split at h
+            · cases h
+            · rename_i stateF moreWire hnext
+              cases h
+              have hbuf : stateK.handshakeBuffered.size <
+                  state.handshakeBuffered.size := by
+                rw [acceptKeyUpdate_buffered hacc]; exact hsize
+              have hinvK := acceptKeyUpdate_wellFormed hacc
+                (wellFormed_transfer hinv rfl (.inl rfl) (.inl rfl) rfl rfl rfl rfl)
+              have h1 := acceptKeyUpdate_epochs hi hacc
+              have h2 := processHandshakeBuffer_epochs hi hnext hinvK
+              exact SpecEffect.of_eq (SpecEffect.trans h1 h2) rfl rfl
+        · cases h
+  termination_by state.handshakeBuffered.size
+  decreasing_by
+    all_goals first
+      | exact hsize
+      | exact hbuf
+
+private theorem feedPlaintextHandshake_epochs {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {fragment : ByteArray}
+    (h : feedPlaintextHandshake state fragment = .ok next)
+    (hinv : state.WellFormed) : SpecEffect H state next := by
+  unfold feedPlaintextHandshake at h
+  simp only [pure_bind] at h
+  obtain ⟨framed, _, h⟩ := except_bind_ok_inv h
+  split at h
+  · split at h
+    · have hw := acceptServerHello_epochs hi h
+        (wellFormed_transfer hinv rfl (.inl rfl) (.inl rfl) rfl rfl rfl rfl)
+      exact SpecEffect.of_eq hw rfl rfl
+    · cases h
+  · cases h; exact SpecEffect.within rfl (Record.WithinEpoch.refl _)
+
+private theorem processProtectedRecord_epochs {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {record : Record.RawRecord} {plain wire : ByteArray}
+    (h : processProtectedRecord state record = .ok (next, plain, wire))
+    (hinv : state.WellFormed) : SpecEffect H state next := by
+  unfold processProtectedRecord at h
+  simp only [pure_bind] at h
+  obtain ⟨readKeys, hrk, h⟩ := except_bind_ok_inv h
+  obtain ⟨opened, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨nextReadKeys, plaintext⟩ := opened
+  have hinv' : ({ state with readKeys? := some nextReadKeys } : State).WellFormed :=
+    wellFormed_transfer hinv rfl (.inl rfl)
+      (.inr ⟨⟨_, rfl⟩, requireReadKeys_isSome hrk⟩) rfl rfl rfl rfl
+  refine SpecEffect.of_eq (b := { state with readKeys? := some nextReadKeys }) ?_ rfl rfl
+  split at h
+  · obtain ⟨_, h⟩ := if_throw_ok h
+    split at h
+    · obtain ⟨_, h⟩ := unless_ok h
+      cases h
+      exact SpecEffect.within rfl (Record.WithinEpoch.refl _)
+    · obtain ⟨pair, hpb, h⟩ := except_bind_ok_inv h
+      obtain ⟨stateH, wireH⟩ := pair
+      cases h
+      have hw := processHandshakeBuffer_epochs hi hpb
+        (wellFormed_transfer hinv' rfl (.inl rfl) (.inl rfl) rfl rfl rfl rfl)
+      exact SpecEffect.of_eq hw rfl rfl
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨pair, hpa, h⟩ := except_bind_ok_inv h
+      obtain ⟨stateA, wireA⟩ := pair
+      cases h
+      have hw := processAlert_epochs (H := H) hpa
+      exact hw
+    · cases h
+  · split at h
+    · obtain ⟨pair, hpb, h⟩ := except_bind_ok_inv h
+      obtain ⟨stateH, wireH⟩ := pair
+      cases h
+      have hw := processHandshakeBuffer_epochs hi hpb
+        (wellFormed_transfer hinv' rfl (.inl rfl) (.inl rfl) rfl rfl rfl rfl)
+      exact SpecEffect.of_eq hw rfl rfl
+    · obtain ⟨_, h⟩ := unless_ok h
+      obtain ⟨pair, hpa, h⟩ := except_bind_ok_inv h
+      obtain ⟨stateA, wireA⟩ := pair
+      cases h
+      have hw := processAlert_epochs (H := H) hpa
+      exact hw
+    · cases h
+
+private theorem processRecord_epochs {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {record : Record.RawRecord} {plain wire : ByteArray}
+    (h : processRecord state record = .ok (next, plain, wire))
+    (hinv : state.WellFormed) : SpecEffect H state next := by
+  unfold processRecord at h
+  simp only [pure_bind] at h
+  split at h <;> split at h <;>
+    first
+      | (obtain ⟨_, h⟩ := unless_ok h
+         cases h
+         exact SpecEffect.within rfl (Record.WithinEpoch.refl _))
+      | (obtain ⟨stateP, hfp, h⟩ := except_bind_ok_inv h
+         cases h
+         have hw := feedPlaintextHandshake_epochs hi hfp hinv
+         exact hw)
+      | (obtain ⟨_, h⟩ := unless_ok h
+         obtain ⟨pair, hpa, h⟩ := except_bind_ok_inv h
+         obtain ⟨stateA, wireA⟩ := pair
+         cases h
+         have hw := processAlert_epochs (H := H) hpa
+         exact hw)
+      | exact processProtectedRecord_epochs hi h hinv
+      | cases h
+
+private theorem processRecords_epochs {H : Spec.Hkdf} (hi : Implements H)
+    {records : List Record.RawRecord} :
+    ∀ {state : State} {plaintext wireBytes : ByteArray} {out : Output},
+      processRecords state records plaintext wireBytes = .ok out →
+      state.WellFormed → SpecEffect H state out.state := by
+  induction records with
+  | nil =>
+      intro state plaintext wireBytes out h hinv
+      unfold processRecords at h
+      cases h
+      exact SpecEffect.within rfl (Record.WithinEpoch.refl _)
+  | cons record rest ih =>
+      intro state plaintext wireBytes out h hinv
+      unfold processRecords at h
+      split at h
+      · cases h
+      · rename_i stateN cleartext outbound hpr
+        have h1 := processRecord_epochs hi hpr hinv
+        have h2 := ih h (processRecord_wellFormed hpr hinv)
+        exact SpecEffect.trans h1 h2
+
+theorem feedWithFailure_epochs {H : Spec.Hkdf} (hi : Implements H)
+    {initial : State} {chunk : ByteArray} {out : Output}
+    (h : feedWithFailure initial chunk = .ok out) (hinv : initial.WellFormed) :
+    SpecEffect H initial out.state := by
+  unfold feedWithFailure at h
+  split at h
+  · cases h
+  · split at h
+    · cases h
+    · have hw := processRecords_epochs hi h hinv
+      exact hw
+
+theorem feed_epochs {H : Spec.Hkdf} (hi : Implements H) {state : State}
+    {chunk : ByteArray} {out : Output} (h : feed state chunk = .ok out)
+    (hinv : state.WellFormed) : SpecEffect H state out.state := by
+  unfold feed at h
+  split at h
+  · rename_i output hfeed
+    cases h
+    exact feedWithFailure_epochs hi hfeed hinv
+  · cases h
+
+theorem step_epochs {H : Spec.Hkdf} (hi : Implements H) {state : State} {op : Op}
+    {out : Output} (h : step state op = .ok out) (hinv : state.WellFormed) :
+    SpecEffect H state out.state := by
+  unfold step at h
+  split at h
+  · exact feed_epochs hi h hinv
+  · exact sealApplication_epochs h
+  · exact closeNotify_epochs h
+  · exact sealFatalAlert_epochs h
+
+/-- **Every epoch a run installs is a strictly later node of the RFC 8446 §7.1 /
+§7.2 key schedule than the one it replaces.** -/
+theorem run_epochs {H : Spec.Hkdf} (hi : Implements H) {ops : List Op} :
+    ∀ {state : State} {out : Output}, run state ops = .ok out →
+      state.WellFormed → SpecEffect H state out.state := by
+  induction ops with
+  | nil =>
+      intro state out h hinv
+      unfold run at h; cases h
+      exact SpecEffect.within rfl (Record.WithinEpoch.refl _)
+  | cons op rest ih =>
+      intro state out h hinv
+      unfold run at h
+      split at h
+      · cases h
+      · rename_i out1 hstep
+        split at h
+        · cases h
+        · rename_i final hrun
+          have h1 := step_epochs hi hstep hinv
+          have h2 := ih hrun (step_wellFormed hstep hinv)
+          cases h
+          exact SpecEffect.trans h1 h2
+
+/-- A client that has not yet accepted the ServerHello is in no epoch at all. -/
+private theorem writeEpoch_start {H : Spec.Hkdf} {state : State}
+    (hinv : state.WellFormed) (hph : state.phase = .waitingServerHello) :
+    state.WriteEpoch H none :=
+  ⟨by rw [hinv.noWriteKeys hph]; exact Record.EpochOf.idle, fun e he => by cases he⟩
+
+/-- **Nonce non-reuse across a client connection, with the epoch-freshness
+hypothesis discharged.** For any run of a client that has not yet accepted the
+ServerHello — in particular any client from `start` — there is a
+`Tls.Record.Laws.WriteRun` from the connection's initial write state to its
+final one whose (traffic secret, nonce) pairs are pairwise distinct. Unlike
+`run_nonce_nodup`, nothing about the epochs is assumed: they are the RFC 8446
+§7.1 / §7.2 nodes the engine actually installs, in strictly increasing order,
+and any number of KeyUpdates is covered.
+
+The residual assumptions, both visible in the statement, are exactly two, and
+neither is about this run: `hi`, that `H` is the HACL\* HKDF (so the theorem is
+about the code that ships), and `hinj`, that `HKDF-Expand-Label` never maps
+distinct arguments to the same bytes. `hinj` is *not* proved here — HKDF is an
+opaque `@[extern]` binding — and this is not a security proof. What it buys is a
+much smaller thing to trust: a standard property of a KDF, in place of a claim
+that some particular list of byte strings happens to have no repeats.
+
+As before, a caller who clones a `State` and drives two connections from it is
+outside the theorem's reach; single-threading the state remains the caller's
+obligation. -/
+theorem run_nonce_nodup_spec {H : Spec.Hkdf} (hi : Implements H)
+    (hinj : Spec.ExpandLabelInjective H) {ops : List Op} {state : State}
+    {out : Output} (hinv : state.WellFormed)
+    (hph : state.phase = .waitingServerHello) (h : run state ops = .ok out) :
+    ∃ (secrets : List ByteArray) (nonces : List (ByteArray × ByteArray)),
+      Record.WriteRun state.writeKeys? out.state.writeKeys? secrets nonces ∧
+        nonces.Nodup := by
+  obtain ⟨o', ho', hx⟩ := run_epochs hi h hinv none (writeEpoch_start hinv hph)
+  exact hx.nonce_nodup hinj ho'.1 ho'.valid
+
+/-- `run_nonce_nodup_spec` for a single `feed`. -/
+theorem feed_nonce_nodup_spec {H : Spec.Hkdf} (hi : Implements H)
+    (hinj : Spec.ExpandLabelInjective H) {state : State} {chunk : ByteArray}
+    {out : Output} (hinv : state.WellFormed)
+    (hph : state.phase = .waitingServerHello) (h : feed state chunk = .ok out) :
+    ∃ (secrets : List ByteArray) (nonces : List (ByteArray × ByteArray)),
+      Record.WriteRun state.writeKeys? out.state.writeKeys? secrets nonces ∧
+        nonces.Nodup := by
+  obtain ⟨o', ho', hx⟩ := feed_epochs hi h hinv none (writeEpoch_start hinv hph)
+  exact hx.nonce_nodup hinj ho'.1 ho'.valid
+
+/-- **A client driven from `start` never reuses a nonce.** The form a caller
+sees: begin the connection with `start`, drive it with `run`, and the write side
+of the whole run has no repeated (traffic secret, nonce) pair — assuming only
+that HACL\*'s `HKDF-Expand-Label` is injective. -/
+theorem start_run_nonce_nodup {H : Spec.Hkdf} (hi : Implements H)
+    (hinj : Spec.ExpandLabelInjective H) {config : Config} {ops : List Op}
+    {started out : Output} (hstart : start config = .ok started)
+    (h : run started.state ops = .ok out) :
+    ∃ (secrets : List ByteArray) (nonces : List (ByteArray × ByteArray)),
+      Record.WriteRun started.state.writeKeys? out.state.writeKeys? secrets nonces ∧
+        nonces.Nodup :=
+  run_nonce_nodup_spec hi hinj (start_wellFormed hstart) (start_phase hstart) h
 
 end Client
 end Tls

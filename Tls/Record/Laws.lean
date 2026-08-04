@@ -918,6 +918,11 @@ def TrafficKeys.DerivedFrom (H : TLS13.KeySchedule.Spec.Hkdf) (keys : TrafficKey
     keys.iv = TLS13.KeySchedule.Spec.trafficIv H secret aeadIvLength ∧
     keys.seq = 0
 
+/-- The traffic secret an epoch's record-protection state was derived from. -/
+theorem TrafficKeys.DerivedFrom.secret_eq {H : TLS13.KeySchedule.Spec.Hkdf}
+    {keys : TrafficKeys} {secret : ByteArray} (h : keys.DerivedFrom H secret) :
+    keys.secret = secret := h.1
+
 /-- **`deriveTrafficKeys` is RFC 8446 §7.3.** -/
 theorem deriveTrafficKeys_spec {H : TLS13.KeySchedule.Spec.Hkdf}
     (hi : TLS13.KeySchedule.Implements H) {secret : ByteArray} {keys : TrafficKeys}
@@ -1566,6 +1571,26 @@ def EpochOf (H : Spec.Hkdf) : Option Spec.Epoch → Option TrafficKeys → Prop
   | some e, some k => k.secret = e.secret H
   | _, _ => False
 
+/-- A state that carries the traffic secret of epoch `e` is in epoch `e`. -/
+theorem EpochOf.intro {H : Spec.Hkdf} {e : Spec.Epoch} {k : TrafficKeys}
+    (h : k.secret = e.secret H) : EpochOf H (some e) (some k) := h
+
+theorem EpochOf.idle {H : Spec.Hkdf} : EpochOf H none none := trivial
+
+/-- A state that carries traffic keys is in a definite epoch. -/
+theorem EpochOf.some_inv {H : Spec.Hkdf} {o : Option Spec.Epoch} {k : TrafficKeys}
+    (h : EpochOf H o (some k)) : ∃ e, o = some e ∧ k.secret = e.secret H := by
+  cases o with
+  | none => exact ((h : False)).elim
+  | some e => exact ⟨e, rfl, h⟩
+
+/-- A state with no traffic keys is in no epoch. -/
+theorem EpochOf.none_inv {H : Spec.Hkdf} {o : Option Spec.Epoch}
+    (h : EpochOf H o none) : o = none := by
+  cases o with
+  | none => rfl
+  | some e => exact ((h : False)).elim
+
 /-- The traffic-secret list of a run, described by the key schedule: it is the
 list of secrets of a strictly increasing sequence of epochs, each of them a §7.1
 derivation (`Spec.Epoch.Valid`) rather than a bare update, and none of them
@@ -1659,6 +1684,36 @@ theorem SpecExtends.rekey {H : Spec.Hkdf} {e e' : Spec.Epoch}
     | tail _ hx =>
         exact ⟨(hmem x hx).1,
           Or.inr (Spec.Epoch.lt_of_lt_of_le hlt (hmem x hx).2)⟩
+
+/-- A stretch of the write path that stays inside one epoch: it may protect any
+number of records, but the traffic secret it ends on is the one it started on.
+This is the shape of every engine step except the three that install an epoch,
+and it composes by `trans`. -/
+def WithinEpoch (H : Spec.Hkdf) (before after : Option TrafficKeys) : Prop :=
+  ∀ o, EpochOf H o before → EpochOf H o after ∧ SpecExtends H o o before after
+
+/-- Apply a `WithinEpoch` step to the epoch the connection is in. -/
+theorem WithinEpoch.apply {H : Spec.Hkdf} {a b : Option TrafficKeys}
+    (h : WithinEpoch H a b) {o : Option Spec.Epoch} (ho : EpochOf H o a) :
+    EpochOf H o b ∧ SpecExtends H o o a b := h o ho
+
+theorem WithinEpoch.refl {H : Spec.Hkdf} (a : Option TrafficKeys) :
+    WithinEpoch H a a := fun o ho => ⟨ho, SpecExtends.refl o a⟩
+
+theorem WithinEpoch.trans {H : Spec.Hkdf} {a b c : Option TrafficKeys}
+    (h1 : WithinEpoch H a b) (h2 : WithinEpoch H b c) : WithinEpoch H a c :=
+  fun o ho => ⟨(h2 o (h1 o ho).1).1, (h1 o ho).2.trans (h2 o (h1 o ho).1).2⟩
+
+/-- Protecting one record with the state machine's own write keys. `seal`
+advances the sequence number and leaves the traffic secret alone, so the epoch
+is unchanged. -/
+theorem WithinEpoch.of_seal {H : Spec.Hkdf} {keys next : TrafficKeys}
+    {contentType : ContentType} {fragment wire : ByteArray} {paddingLength : Nat}
+    (h : «seal» keys contentType fragment paddingLength = .ok (next, wire)) :
+    WithinEpoch H (some keys) (some next) := by
+  intro o ho
+  obtain ⟨e, rfl, hsec⟩ := EpochOf.some_inv ho
+  exact ⟨EpochOf.intro (by rw [seal_secret_eq h]; exact hsec), SpecExtends.of_seal h⟩
 
 /-- Read back the run a chain of refined steps certifies, together with the
 strictly increasing epoch list that makes its traffic secrets distinct. -/
