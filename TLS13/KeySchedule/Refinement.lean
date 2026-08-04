@@ -147,5 +147,46 @@ theorem derived_spec {H : Spec.Hkdf} (hi : Implements H) (inp : Spec.Inputs)
       Spec.derived H inp d :=
   deriveSecret_spec hi _ _ _
 
+/-! ## Engine-facing forms
+
+The state machines compute the schedule from values they hold — an ECDHE output,
+a stored handshake secret, a transcript hash they just took — rather than from a
+`Spec.Inputs` record. These are the same theorems with those values supplied as
+hypotheses, so an engine law can discharge them one equation at a time. -/
+
+/-- The Handshake Secret as an engine builds it: from the default (all-zero)
+PSK, the ECDHE shared secret, and the hash of the empty transcript. -/
+theorem handshakeSecret_node_spec {H : Spec.Hkdf} (hi : Implements H)
+    (inp : Spec.Inputs) {shared emptyHash : ByteArray} (hpsk : inp.psk = zeros)
+    (hecdhe : inp.ecdhe = shared) (hempty : inp.hash .empty = emptyHash) :
+    handshakeSecret earlySecret shared emptyHash = Spec.secret H inp .handshake := by
+  have h := handshakeSecret_spec hi inp
+  rw [hpsk, hecdhe, hempty] at h
+  exact h
+
+/-- The Master Secret as an engine builds it: from the handshake secret it
+stored and the hash of the empty transcript. -/
+theorem masterSecret_node_spec {H : Spec.Hkdf} (hi : Implements H)
+    (inp : Spec.Inputs) {handshake emptyHash : ByteArray}
+    (hhandshake : handshake = Spec.secret H inp .handshake)
+    (hempty : inp.hash .empty = emptyHash) :
+    masterSecret handshake emptyHash = Spec.secret H inp .master := by
+  have h := masterSecret_spec hi inp
+  rw [hempty] at h
+  rw [hhandshake]
+  exact h
+
+/-- One `Derive-Secret` node as an engine calls it: the parent secret it holds
+and the transcript hash it just computed. The hypotheses are exactly "this is
+the RFC's parent" and "this is the RFC's transcript"; the label comes from the
+node itself, so a mistyped label cannot satisfy the conclusion. -/
+theorem deriveSecret_node_spec {H : Spec.Hkdf} (hi : Implements H)
+    (inp : Spec.Inputs) (d : Spec.Derived) {parentSecret transcriptHash : ByteArray}
+    (hparent : parentSecret = Spec.secret H inp d.parent)
+    (hhash : inp.hash d.context = transcriptHash) :
+    deriveSecret parentSecret d.label.text transcriptHash = Spec.derived H inp d := by
+  rw [hparent, ← hhash]
+  exact derived_spec hi inp d
+
 end KeySchedule
 end TLS13

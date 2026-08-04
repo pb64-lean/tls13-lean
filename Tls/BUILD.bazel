@@ -81,8 +81,20 @@ lean_assurance_test(
         "Tls.Handshake.takeMessage?_canonical",
         "Tls.Handshake.decodeOne_injective",
         "Tls.Handshake.takeMessage?_conservation",
+        # Key schedule: the engines install the RFC 8446 §7.1 epochs, with the
+        # RFC's parents, labels, contexts and lengths — structural refinement,
+        # parametric over the opaque HKDF (see //TLS13:tls13_assurance for the
+        # specification side).
+        "Tls.Record.deriveTrafficKeys_spec",
+        "Tls.Record.updateTrafficSecret_spec",
+        "Tls.Record.TrafficKeys.update_spec",
+        "Tls.Client.finishedVerifyData_spec",
+        "Tls.Client.acceptServerHello_keySchedule",
+        "Tls.Client.completeServerHandshake_keySchedule",
+        "Tls.Client.acceptKeyUpdate_keySchedule",
         # State machines: the transitions that define what "connected" means.
         "Tls.Client.completeServerHandshake_verified",
+        "Tls.Client.acceptServerHello_transcript",
         "Tls.Client.acceptKeyUpdate_epoch",
         "Tls.Client.sealApplication_connected",
         "Tls.Client.feed_plaintext_connected",

@@ -531,7 +531,7 @@ the full server flight (ServerHello, then encrypted EncryptedExtensions/
 Certificate/CertificateVerify/Finished), and advance to
 `waitingClientFinished`. `transcriptPrefix` is either CH1 or
 message_hash(CH1)||HRR||CH2. -/
-private def completeClientHello (state : State) (hello : Handshake.ClientHello)
+def completeClientHello (state : State) (hello : Handshake.ClientHello)
     (group : Handshake.NamedGroup)
     (transcriptPrefix : ByteArray) :
     Except Error (State × ByteArray) := do

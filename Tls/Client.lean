@@ -396,7 +396,12 @@ private def checkServerHello (state : State) (hello : Handshake.ServerHello) :
       s!"server selected key-share group {hello.selectedGroup.toUInt16} \
         that the client did not offer")
 
-private def acceptServerHello (state : State) (message : Handshake.Message) :
+/-- Accept the ServerHello: check the echoed session id and the negotiated
+parameters, complete the key exchange, and install the RFC 8446 §7.1 handshake
+traffic epochs over the ClientHello…ServerHello transcript. Public (but not
+`@[expose]`d) so `Tls.Client.Laws` can state its transcript and key-schedule
+laws as public theorems. -/
+def acceptServerHello (state : State) (message : Handshake.Message) :
     Except Error State := do
   unless state.phase == .waitingServerHello do
     throw (.unexpectedHandshake state.phase message.msgType)

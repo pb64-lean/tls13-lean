@@ -4,6 +4,9 @@ public import Tls.Record
 -- The open∘seal law quantifies over the opaque AEAD binding, so its statement
 -- names the HACL* functions.
 public import HaclStar.Aead
+-- The §7.3 / §7.2 key-derivation laws are stated against the RFC 8446
+-- specification and its refinement by `TLS13.KeySchedule`.
+public import TLS13.KeySchedule.Refinement
 import all Tls.Record
 
 public section
@@ -62,6 +65,18 @@ private theorem except_throw {α : Type} (e : Error) :
     (throw e : Except Error α) = Except.error e := rfl
 private theorem except_map_throw {α β : Type} (f : α → β) (e : Error) :
     (f <$> (throw e : Except Error α)) = (Except.error e : Except Error β) := rfl
+
+/-- Peel an `unless c do throw e` guard out of a successful `do` block. The
+guard elaborates to a join point that `split at` cannot enter, so unification
+against this term-level shape does the work instead. -/
+private theorem unless_ok {α : Type} {c : Bool} {e : Error}
+    {f : PUnit → Except Error α} {b : α}
+    (h : (if c = true then (pure PUnit.unit : Except Error PUnit) >>= f
+          else (throw e : Except Error PUnit) >>= f) = .ok b) :
+    c = true ∧ f PUnit.unit = .ok b := by
+  by_cases hc : c = true
+  · rw [if_pos hc] at h; exact ⟨hc, h⟩
+  · rw [if_neg hc] at h; cases h
 
 /-! ## Content types -/
 
@@ -869,6 +884,90 @@ theorem TrafficKeys.secret_update {keys keys' : TrafficKeys}
       rw [hs] at h
       rw [except_bind_ok] at h
       rw [(deriveTrafficKeys_ok h).2]
+
+/-! ## RFC 8446 §7.3 and §7.2: the record layer's own derivations
+
+The record layer performs three of the specification's derivations itself: the
+AEAD key and static IV of an epoch (§7.3) and the successor traffic secret of a
+KeyUpdate (§7.2). All three are `HKDF-Expand-Label` with the **empty byte
+string** as context — not the hash of an empty transcript — which is exactly the
+distinction `TLS13.KeySchedule.Spec.emptyContext_rfc8446` records.
+
+As in `open_seal`, the laws are parametric: they hold for *any* `Spec.Hkdf` the
+HACL\* bindings implement, so they constrain the derivation structure and assume
+nothing about what HKDF computes. -/
+
+private theorem mkTrafficKeys_fields {secret key iv : ByteArray}
+    {keys : TrafficKeys} (h : mkTrafficKeys secret key iv = .ok keys) :
+    keys.secret = secret ∧ keys.key = key ∧ keys.iv = iv ∧ keys.seq = 0 := by
+  unfold mkTrafficKeys at h
+  split at h
+  · split at h
+    · cases h; exact ⟨rfl, rfl, rfl, rfl⟩
+    · cases h
+  · cases h
+
+/-- `keys` is the RFC 8446 §7.3 record-protection state of traffic secret
+`secret`: the AEAD key and the static IV are `HKDF-Expand-Label` of the secret
+under `"key"` and `"iv"` with an empty context and this cipher suite's lengths,
+and the record sequence number starts at zero. -/
+def TrafficKeys.DerivedFrom (H : TLS13.KeySchedule.Spec.Hkdf) (keys : TrafficKeys)
+    (secret : ByteArray) : Prop :=
+  keys.secret = secret ∧
+    keys.key = TLS13.KeySchedule.Spec.trafficKey H secret aeadKeyLength ∧
+    keys.iv = TLS13.KeySchedule.Spec.trafficIv H secret aeadIvLength ∧
+    keys.seq = 0
+
+/-- **`deriveTrafficKeys` is RFC 8446 §7.3.** -/
+theorem deriveTrafficKeys_spec {H : TLS13.KeySchedule.Spec.Hkdf}
+    (hi : TLS13.KeySchedule.Implements H) {secret : ByteArray} {keys : TrafficKeys}
+    (h : deriveTrafficKeys secret = .ok keys) : keys.DerivedFrom H secret := by
+  unfold deriveTrafficKeys at h
+  cases hv : validateSecret secret with
+  | error e => rw [hv, except_bind_error] at h; cases h
+  | ok u =>
+      rw [hv, except_bind_ok] at h
+      obtain ⟨hsec, hkey, hiv, hseq⟩ := mkTrafficKeys_fields h
+      refine ⟨hsec, ?_, ?_, hseq⟩
+      · rw [hkey]
+        exact TLS13.KeySchedule.expandLabel_spec hi secret .key ByteArray.empty
+          aeadKeyLength
+      · rw [hiv]
+        exact TLS13.KeySchedule.expandLabel_spec hi secret .iv ByteArray.empty
+          aeadIvLength
+
+/-- **`updateTrafficSecret` is RFC 8446 §7.2**: `HKDF-Expand-Label` of the
+current secret under `"traffic upd"` with an empty context, at hash length. -/
+theorem updateTrafficSecret_spec {H : TLS13.KeySchedule.Spec.Hkdf}
+    (hi : TLS13.KeySchedule.Implements H) {secret next : ByteArray}
+    (h : updateTrafficSecret secret = .ok next) :
+    next = TLS13.KeySchedule.Spec.nextTrafficSecret H secret := by
+  unfold updateTrafficSecret at h
+  cases hv : validateSecret secret with
+  | error e => rw [hv, except_bind_error] at h; cases h
+  | ok u =>
+      rw [hv, except_bind_ok] at h
+      obtain ⟨_, h⟩ := unless_ok h
+      cases h
+      rw [show (TLS13.KeySchedule.hashLen : Nat) = H.hashLen from hi.hashLen_eq.symm]
+      exact TLS13.KeySchedule.expandLabel_spec hi secret .trafficUpd ByteArray.empty
+        H.hashLen
+
+/-- **A KeyUpdate installs the §7.2 successor epoch, derived per §7.3.** The
+new state's traffic secret is `HKDF-Expand-Label(old, "traffic upd", "", 32)`
+and its key, IV and sequence number are that secret's §7.3 record-protection
+state. -/
+theorem TrafficKeys.update_spec {H : TLS13.KeySchedule.Spec.Hkdf}
+    (hi : TLS13.KeySchedule.Implements H) {keys keys' : TrafficKeys}
+    (h : keys.update = .ok keys') :
+    keys'.DerivedFrom H (TLS13.KeySchedule.Spec.nextTrafficSecret H keys.secret) := by
+  unfold TrafficKeys.update at h
+  cases hs : updateTrafficSecret keys.secret with
+  | error e => rw [hs, except_bind_error] at h; cases h
+  | ok next =>
+      rw [hs, except_bind_ok] at h
+      rw [← updateTrafficSecret_spec hi hs]
+      exact deriveTrafficKeys_spec hi h
 
 /-! ## Seal and open
 
