@@ -143,9 +143,18 @@ laws then prove the implementation computes it. Read the fine print:
   the client's link across the *whole* encrypted server flight
   (EncryptedExtensions, Certificate, CertificateVerify, Finished) in one
   statement, so the two client laws compose into ServerHello → established
-  connection. What is still not mechanised is the transport plumbing between
-  `feed` and that function — record framing, decryption and dispatch — which
-  moves bytes and touches no key state.
+  connection, and `Tls.Client.feed_keySchedule` carries it the rest of the way
+  out to the API boundary, through the record framing, decryption and dispatch
+  in between. Two caveats on that last step, both visible in its statement:
+  a feed may deliver the server Finished *and* a post-handshake KeyUpdate in
+  separate records, so the epochs it ends on are the §7.1 application secrets
+  after `n` §7.2 `"traffic upd"` steps (`n = 0` when no KeyUpdate followed), and
+  the law is stated for a feed that does not itself accept the ServerHello —
+  `acceptServerHello_keySchedule` is the law for that step, and joining the two
+  into one whole-handshake statement is not done. The server has no `feed`-level
+  analogue yet: its establishment transition also moves the *read* epoch from
+  `c hs traffic` to `c ap traffic` when the client Finished arrives, which does
+  not fit the same "rolled forward" shape.
 - The **empirical** anchor is separate and complementary: `hacl_kat_test` checks
   the schedule against RFC 8448's published values (`33ad0a1c…`, `6f2615a1…`)
   and the `HkdfLabel` layout against a hand-written encoding. A proof cannot say
@@ -489,7 +498,7 @@ test binary is built, so a violation is a red target, not a stale README:
 | --- | --- |
 | `//HaclStar:haclstar_assurance` | The trusted C boundary: the 16 `@[extern] opaque` bindings are accounted for and no proof hole exists in the FFI package |
 | `//TLS13:tls13_assurance` | 23 principal theorems — the RFC 8446 §7.1 derivation tree as data (`Derived.tree_rfc8446`, `Label.text_rfc8446`), the `HkdfLabel` wire image byte for byte, the refinement of `expandLabel`/`deriveSecret`/Early/Handshake/Master/`Derive-Secret`, and epoch distinctness from `HKDF-Expand-Label` injectivity (`Spec.Epoch.eq_of_secret_eq`, unbounded in the number of key updates); plus DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies` |
-| `//Tls:tls_assurance` | 73 principal theorems — nonce non-reuse (`WriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, and the stronger `run_nonce_nodup_spec`/`start_run_nonce_nodup` that assume only `HKDF-Expand-Label` injectivity, plus `run_epochs`, `EpochsFrom.nodup`, nonce and sequence injectivity), record conservation and seal/open inversion, ClientHello canonicity and body injectivity, the §7.3/§7.2/§4.4.4 record-layer and Finished derivations and the engines' §7.1 epoch installations, and the state-machine transition and invariant laws (including both directions of the connected-only application-data rule and both engines' no-epoch-before-the-first-flight clauses) |
+| `//Tls:tls_assurance` | 74 principal theorems — nonce non-reuse (`WriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, and the stronger `run_nonce_nodup_spec`/`start_run_nonce_nodup` that assume only `HKDF-Expand-Label` injectivity, plus `run_epochs`, `EpochsFrom.nodup`, nonce and sequence injectivity), record conservation and seal/open inversion, ClientHello canonicity and body injectivity, the §7.3/§7.2/§4.4.4 record-layer and Finished derivations and the engines' §7.1 epoch installations (including `Tls.Client.feed_keySchedule`, the linkage stated at the `feed` boundary), and the state-machine transition and invariant laws (including both directions of the connected-only application-data rule and both engines' no-epoch-before-the-first-flight clauses) |
 
 Each target also scans every constant of the whole first-party closure
 (`HaclStar`, `TLS13`, `Tls` — 28 modules, ~5080 constants): nothing may reach
@@ -597,7 +606,10 @@ build because it compiles and links the HACL\* C shim.
     key-schedule refinement against RFC 8446 §7.1 (`TLS13.KeySchedule.Spec`
     transcribes the derivation tree as data; `TLS13.KeySchedule.Refinement`
     and the engines' laws prove the implementation computes it, parametrically
-    over the opaque HKDF). What remains: the §7.1 branches this implementation
+    over the opaque HKDF, out to `Tls.Client.feed_keySchedule` at the API
+    boundary). What remains: the server has no `feed`-level key-schedule
+    statement yet, and the client's does not join with
+    `acceptServerHello_keySchedule` into a single whole-handshake law; the §7.1 branches this implementation
     does not compute (PSK binders, early data, exporter and resumption master
     secrets) have a specification but no refinement, since there is no code to
     refine; and there is still no security argument — no proof about
