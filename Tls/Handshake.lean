@@ -1979,11 +1979,12 @@ theorem encodeCertificateVerify_parse {algorithm : UInt16}
   simp only [hr16, hv16, hend]
   rw [if_neg hemp]
 
-/-! ### Extension lists
+/-! ### Reading an encoded field out of an assembled message body
 
-The extension parser is a loop, so its laws are proved once, for an arbitrary
-list of extensions sitting at an arbitrary offset inside a larger buffer, and
-then reused by every message that carries extensions. -/
+Message bodies are concatenations of encoded fields. Each lemma below reads
+one field sitting between an arbitrary prefix `P` (already consumed) and an
+arbitrary suffix `S` (not yet consumed), so a body proof is just a walk down
+the field list. -/
 
 /-- Reading inside a sandwiched middle segment. -/
 private theorem get!_mid {P M S : ByteArray} {k : Nat} (h : k < M.size) :
@@ -1999,6 +2000,130 @@ private theorem extract_mid (P M S : ByteArray) :
   rw [Nat.add_zero] at h
   rw [h]
   exact ByteArray.extract_append_eq_left rfl
+
+/-- A fixed-size field read. -/
+private theorem take_at {P X S : ByteArray} {n : Nat} (hn : X.size = n) :
+    Reader.take { bytes := P ++ (X ++ S), offset := P.size } n =
+      .ok (X, { bytes := P ++ (X ++ S), offset := P.size + n }) := by
+  subst hn
+  rw [take_eval (by rw [ByteArray.size_append, ByteArray.size_append]; omega),
+    extract_mid]
+
+private theorem readUInt8_at {P S : ByteArray} {b : UInt8} :
+    Reader.readUInt8 (Reader.mk (P ++ (ByteArray.empty.push b ++ S)) P.size) =
+      .ok (b, Reader.mk (P ++ (ByteArray.empty.push b ++ S)) (P.size + 1)) := by
+  have h0 : (P ++ (ByteArray.empty.push b ++ S)).get! P.size = b := by
+    have h := get!_mid (P := P) (M := ByteArray.empty.push b) (S := S) (k := 0)
+      (by show 0 < 1; omega)
+    rw [Nat.add_zero] at h
+    rw [h]
+    rfl
+  have hbound : P.size < (P ++ (ByteArray.empty.push b ++ S)).size := by
+    rw [ByteArray.size_append, ByteArray.size_append]
+    show P.size < P.size + (1 + S.size)
+    omega
+  rw [readUInt8_eval hbound, h0]
+
+private theorem readUInt16_at {P S : ByteArray} {v : UInt16} :
+    Reader.readUInt16
+        (Reader.mk (P ++ (appendUInt16 ByteArray.empty v ++ S)) P.size) =
+      .ok (v, Reader.mk (P ++ (appendUInt16 ByteArray.empty v ++ S))
+        (P.size + 2)) := by
+  have hA : (appendUInt16 ByteArray.empty v).size = 2 := rfl
+  have h0 : (P ++ (appendUInt16 ByteArray.empty v ++ S)).get! P.size =
+      (v >>> 8).toUInt8 := by
+    have h := get!_mid (P := P) (M := appendUInt16 ByteArray.empty v) (S := S)
+      (k := 0) (by rw [hA]; omega)
+    rw [Nat.add_zero] at h
+    rw [h]
+    rfl
+  have h1 : (P ++ (appendUInt16 ByteArray.empty v ++ S)).get! (P.size + 1) =
+      v.toUInt8 := by
+    rw [get!_mid (by rw [hA]; omega)]
+    rfl
+  have hbound : P.size + 2 ≤ (P ++ (appendUInt16 ByteArray.empty v ++ S)).size := by
+    rw [ByteArray.size_append, ByteArray.size_append, hA]
+    omega
+  rw [readUInt16_eval hbound, h0, h1, uint16_recompose]
+
+private theorem readUInt24_at {P S : ByteArray} {n : Nat} (h : n < 2 ^ 24) :
+    Reader.readUInt24 (Reader.mk (P ++ (length24Bytes n ++ S)) P.size) =
+      .ok (n, Reader.mk (P ++ (length24Bytes n ++ S)) (P.size + 3)) := by
+  have hA : (length24Bytes n).size = 3 := rfl
+  have h0 : (P ++ (length24Bytes n ++ S)).get! P.size =
+      UInt8.ofNat (n >>> 16) := by
+    have h := get!_mid (P := P) (M := length24Bytes n) (S := S) (k := 0)
+      (by rw [hA]; omega)
+    rw [Nat.add_zero] at h
+    rw [h]
+    rfl
+  have h1 : (P ++ (length24Bytes n ++ S)).get! (P.size + 1) =
+      UInt8.ofNat (n >>> 8) := by
+    rw [get!_mid (by rw [hA]; omega)]
+    rfl
+  have h2 : (P ++ (length24Bytes n ++ S)).get! (P.size + 2) = UInt8.ofNat n := by
+    rw [get!_mid (by rw [hA]; omega)]
+    rfl
+  have hbound : P.size + 3 ≤ (P ++ (length24Bytes n ++ S)).size := by
+    rw [ByteArray.size_append, ByteArray.size_append, hA]
+    omega
+  rw [readUInt24_eval hbound, h0, h1, h2, uint24_recompose h]
+
+private theorem readVector8_at {P X S : ByteArray} (hsz : X.size < 2 ^ 8) :
+    Reader.readVector8 (Reader.mk
+        (P ++ (ByteArray.empty.push (UInt8.ofNat X.size) ++ (X ++ S)))
+        P.size) =
+      .ok (X, Reader.mk
+        (P ++ (ByteArray.empty.push (UInt8.ofNat X.size) ++ (X ++ S)))
+        (P.size + 1 + X.size)) := by
+  unfold Reader.readVector8
+  rw [readUInt8_at]
+  show Reader.take (Reader.mk
+    (P ++ (ByteArray.empty.push (UInt8.ofNat X.size) ++ (X ++ S)))
+    (P.size + 1)) (UInt8.ofNat X.size).toNat = _
+  rw [UInt8.toNat_ofNat', Nat.mod_eq_of_lt hsz,
+    show P ++ (ByteArray.empty.push (UInt8.ofNat X.size) ++ (X ++ S)) =
+      (P ++ ByteArray.empty.push (UInt8.ofNat X.size)) ++ (X ++ S) from
+        ByteArray.append_assoc.symm,
+    show P.size + 1 = (P ++ ByteArray.empty.push (UInt8.ofNat X.size)).size from
+      by rw [ByteArray.size_append]; rfl,
+    take_at rfl]
+
+private theorem readVector16_at {P X S : ByteArray} (hsz : X.size < 2 ^ 16) :
+    Reader.readVector16 (Reader.mk
+        (P ++ (appendUInt16 ByteArray.empty (UInt16.ofNat X.size) ++ (X ++ S)))
+        P.size) =
+      .ok (X, Reader.mk
+        (P ++ (appendUInt16 ByteArray.empty (UInt16.ofNat X.size) ++ (X ++ S)))
+        (P.size + 2 + X.size)) := by
+  unfold Reader.readVector16
+  rw [readUInt16_at]
+  show Reader.take (Reader.mk
+    (P ++ (appendUInt16 ByteArray.empty (UInt16.ofNat X.size) ++ (X ++ S)))
+    (P.size + 2)) (UInt16.ofNat X.size).toNat = _
+  rw [UInt16.toNat_ofNat', Nat.mod_eq_of_lt hsz,
+    show P ++ (appendUInt16 ByteArray.empty (UInt16.ofNat X.size) ++ (X ++ S)) =
+      (P ++ appendUInt16 ByteArray.empty (UInt16.ofNat X.size)) ++ (X ++ S) from
+        ByteArray.append_assoc.symm,
+    show P.size + 2 =
+      (P ++ appendUInt16 ByteArray.empty (UInt16.ofNat X.size)).size from by
+        rw [ByteArray.size_append]; rfl,
+    take_at rfl]
+
+private theorem readVector24_at {P X S : ByteArray} (hsz : X.size < 2 ^ 24) :
+    Reader.readVector24
+        (Reader.mk (P ++ (length24Bytes X.size ++ (X ++ S))) P.size) =
+      .ok (X, Reader.mk (P ++ (length24Bytes X.size ++ (X ++ S)))
+        (P.size + 3 + X.size)) := by
+  unfold Reader.readVector24
+  rw [readUInt24_at hsz]
+  show Reader.take (Reader.mk (P ++ (length24Bytes X.size ++ (X ++ S)))
+    (P.size + 3)) X.size = _
+  rw [show P ++ (length24Bytes X.size ++ (X ++ S)) =
+      (P ++ length24Bytes X.size) ++ (X ++ S) from ByteArray.append_assoc.symm,
+    show P.size + 3 = (P ++ length24Bytes X.size).size from by
+      rw [ByteArray.size_append]; rfl,
+    take_at rfl]
 
 private theorem size_extensionBytes (e : Extension) :
     (extensionBytes e).size = 4 + e.data.size := by
@@ -2201,6 +2326,90 @@ theorem parseExtensions_extensionsBytes (l : List Extension)
   rw [parseExtensionsLoop_extensionsBytes l ByteArray.empty #[] hsz
     (fun _ _ => Array.any_empty) hdistinct]
   rfl
+
+/-! ### EncryptedExtensions -/
+
+/-- A body that is exactly one `uint16`-prefixed vector reads back as that
+vector, leaving the cursor at the end. -/
+private theorem readVector16_body {X : ByteArray} (hsz : X.size < 2 ^ 16) :
+    Reader.readVector16
+        (Reader.mk (appendUInt16 ByteArray.empty (UInt16.ofNat X.size) ++ X) 0) =
+      .ok (X, Reader.mk (appendUInt16 ByteArray.empty (UInt16.ofNat X.size) ++ X)
+        (2 + X.size)) := by
+  have h := readVector16_at (P := ByteArray.empty) (X := X) (S := ByteArray.empty)
+    hsz
+  rw [ByteArray.append_empty, ByteArray.empty_append] at h
+  exact h
+
+/-- EncryptedExtensions with a known extension list parses back to that list. -/
+private theorem parseEncryptedExtensions_of_body {msg : Message}
+    {l : List Extension} (hty : msg.msgType = encryptedExtensionsType)
+    (hbody : msg.body = appendUInt16 ByteArray.empty
+      (UInt16.ofNat (extensionsBytes l).size) ++ extensionsBytes l)
+    (hsz : (extensionsBytes l).size < 2 ^ 16)
+    (hesz : ∀ e ∈ l, e.data.size < 2 ^ 16)
+    (hdist :
+      l.Pairwise (fun a b => (a.extensionType == b.extensionType) = false)) :
+    parseEncryptedExtensions msg =
+      .ok { extensions := l.toArray, encoded := msg.encoded } := by
+  unfold parseEncryptedExtensions
+  rw [hty, if_pos (show (encryptedExtensionsType == encryptedExtensionsType) = true
+    from rfl), hbody]
+  rw [readVector16_body hsz]
+  simp only [requireEnd_eval (b := appendUInt16 ByteArray.empty
+    (UInt16.ofNat (extensionsBytes l).size) ++ extensionsBytes l)
+    (off := 2 + (extensionsBytes l).size) (context := "EncryptedExtensions")
+    (by rw [ByteArray.size_append]; rfl)]
+  simp only [parseExtensions_extensionsBytes l hesz hdist]
+
+/-- **Parse inverts encode for EncryptedExtensions** with no ALPN selection:
+the message carries an empty extension list. -/
+theorem encodeEncryptedExtensions_parse_none {msg : Message}
+    (h : encodeEncryptedExtensions none = .ok msg) :
+    parseEncryptedExtensions msg =
+      .ok { extensions := #[], encoded := msg.encoded } := by
+  unfold encodeEncryptedExtensions at h
+  obtain ⟨u, hu, h⟩ := bind_ok_ex h
+  obtain ⟨V, hV, h⟩ := bind_ok_ex h
+  obtain ⟨hszlt, hVeq⟩ := encodeVector16_ok hV
+  obtain ⟨hlt, hmsg⟩ := frame_spec h
+  exact parseEncryptedExtensions_of_body (l := [])
+    (by rw [hmsg]) (by rw [hmsg]; exact hVeq) hszlt (by simp) List.Pairwise.nil
+
+/-- **Parse inverts encode for EncryptedExtensions** with an ALPN selection:
+the message carries exactly one extension, the ALPN one. -/
+theorem encodeEncryptedExtensions_parse_some {protocol : String} {msg : Message}
+    (h : encodeEncryptedExtensions (some protocol) = .ok msg) :
+    ∃ alpnData, parseEncryptedExtensions msg =
+      .ok { extensions := #[{ extensionType := alpnExtension, data := alpnData }],
+            encoded := msg.encoded } := by
+  unfold encodeEncryptedExtensions at h
+  obtain ⟨A, hA, h⟩ := bind_ok_ex h
+  obtain ⟨u, hu, h⟩ := bind_ok_ex h
+  obtain ⟨V, hV, h⟩ := bind_ok_ex h
+  obtain ⟨hszlt, hVeq⟩ := encodeVector16_ok hV
+  obtain ⟨hlt, hmsg⟩ := frame_spec h
+  unfold encodeAlpnServerExtension at hA
+  obtain ⟨hemp, hA⟩ | ⟨hemp, hA⟩ := ite_ok_cases hA
+  · obtain ⟨_, hu', _⟩ := bind_ok_ex hA
+    cases hu'
+  obtain ⟨V8, _, hA⟩ := bind_ok_ex hA
+  obtain ⟨V16, _, hA⟩ := bind_ok_ex hA
+  obtain ⟨D, _, hA⟩ := bind_ok_ex hA
+  obtain ⟨hDsz, hAeq⟩ := encodeExtension_eq hA
+  refine ⟨D, ?_⟩
+  have hbytes : extensionsBytes [{ extensionType := alpnExtension, data := D }] =
+      ByteArray.empty ++ A := by
+    rw [hAeq, ByteArray.empty_append]
+    show extensionBytes { extensionType := alpnExtension, data := D } ++
+      extensionsBytes [] = _
+    rw [show extensionsBytes ([] : List Extension) = ByteArray.empty from rfl,
+      ByteArray.append_empty]
+  exact parseEncryptedExtensions_of_body
+    (l := [{ extensionType := alpnExtension, data := D }])
+    (by rw [hmsg]) (by rw [hmsg, hbytes]; exact hVeq) (by rw [hbytes]; exact hszlt)
+    (by intro e he; rw [List.mem_singleton] at he; subst he; exact hDsz)
+    (List.pairwise_singleton ..)
 
 end Handshake
 end Tls
