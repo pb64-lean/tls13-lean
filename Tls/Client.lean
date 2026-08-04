@@ -799,28 +799,32 @@ private def processRecord (state : State) (record : Record.RawRecord) :
       | .applicationData => processProtectedRecord state record
       | contentType => throw (.unexpectedRecord state.phase contentType)
 
+/-- Drive `processRecord` over framed records in wire order, accumulating the
+decrypted plaintext and the outbound bytes. Written as explicit list recursion
+rather than a `for` loop so the engine laws can induct over a whole feed (a
+`for` elaborates to `forIn` join points that `split`/`cases` cannot enter). -/
+private def processRecords (state : State) (records : List Record.RawRecord)
+    (plaintext wireBytes : ByteArray) : Except Failure Output :=
+  match records with
+  | [] => .ok { state, wireBytes, plaintext }
+  | record :: rest =>
+    match processRecord state record with
+    | .error error => .error { state, error }
+    | .ok (next, cleartext, outbound) =>
+        processRecords next rest (plaintext ++ cleartext) (wireBytes ++ outbound)
+
 /-- Incrementally consume arbitrary transport bytes, retaining the latest
 successfully advanced state on failure for fatal-alert emission. -/
 def feedWithFailure (initial : State) (chunk : ByteArray) :
-    Except Failure Output := do
+    Except Failure Output :=
   if initial.closed && !chunk.isEmpty then
-    throw { state := initial, error := .connectionClosed }
-  let (decoder, records) ←
+    .error { state := initial, error := .connectionClosed }
+  else
     match liftRecord (initial.decoder.feed chunk) with
-    | .ok decoded => pure decoded
-    | .error error => throw { state := initial, error }
-  let mut state := { initial with decoder }
-  let mut plaintext := ByteArray.empty
-  let mut wireBytes := ByteArray.empty
-  for record in records do
-    let (next, cleartext, outbound) ←
-      match processRecord state record with
-      | .ok output => pure output
-      | .error error => throw { state, error }
-    state := next
-    plaintext := plaintext ++ cleartext
-    wireBytes := wireBytes ++ outbound
-  pure { state, wireBytes, plaintext }
+    | .error error => .error { state := initial, error }
+    | .ok (decoder, records) =>
+        processRecords { initial with decoder } records.toList ByteArray.empty
+          ByteArray.empty
 
 /--
 Incrementally consume arbitrary transport bytes. The returned plaintext is

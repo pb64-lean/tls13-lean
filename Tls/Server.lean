@@ -224,20 +224,25 @@ private def liftHandshake {α : Type} (result : Except String α) : Except Error
 private def liftRecord {α : Type} (result : Except Record.Error α) : Except Error α :=
   result.mapError Error.recordLayer
 
-private def sealHandshakeFlight (initialKeys : Record.TrafficKeys)
-    (flight : ByteArray) : Except Error ByteArray := do
-  let mut keys := initialKeys
-  let mut offset := 0
-  let mut wireBytes := ByteArray.empty
-  while offset < flight.size do
+/-- Protect a server handshake flight, splitting it at TLS's 2^14-byte record
+limit and returning the advanced traffic state alongside the wire bytes.
+Explicit well-founded recursion (not a `while` loop, whose `Loop.forIn` is
+`partial` and therefore opaque to proofs) so the nonce laws can account for
+every record it protects. -/
+private def sealHandshakeFlight (keys : Record.TrafficKeys) (flight : ByteArray)
+    (offset : Nat) (wireBytes : ByteArray) :
+    Except Error (Record.TrafficKeys × ByteArray) :=
+  if flight.size ≤ offset then
+    .ok (keys, wireBytes)
+  else
     let stop := min flight.size (offset + Record.maxPlaintextLength)
-    let fragment := flight.extract offset stop
-    let (nextKeys, record) ←
-      liftRecord (Record.«seal» keys .handshake fragment)
-    keys := nextKeys
-    wireBytes := wireBytes ++ record
-    offset := stop
-  pure wireBytes
+    match liftRecord (Record.«seal» keys .handshake (flight.extract offset stop)) with
+    | .error e => .error e
+    | .ok (keys, record) => sealHandshakeFlight keys flight stop (wireBytes ++ record)
+  termination_by flight.size - offset
+  decreasing_by
+    have : 0 < Record.maxPlaintextLength := by decide
+    omega
 
 private def requireReadKeys (state : State) : Except Error Record.TrafficKeys :=
   match state.readKeys? with
@@ -538,7 +543,8 @@ private def completeClientHello (state : State) (hello : Handshake.ClientHello)
   -- nonempty legacy session id).
   let flight := encryptedExtensions.encoded ++ certificate.encoded
     ++ certVerify.encoded ++ serverFinished.encoded
-  let sealedFlight ← sealHandshakeFlight serverWriteKeys flight
+  let (_, sealedFlight) ←
+    sealHandshakeFlight serverWriteKeys flight 0 ByteArray.empty
   let serverHelloWire ← liftRecord (Record.encodePlaintext .handshake serverHello.encoded)
   let sendCompatibilityCcs :=
     !hello.legacySessionId.isEmpty && !state.compatibilityCcsSent
@@ -949,27 +955,31 @@ private def processRecord (state : State) (record : Record.RawRecord) :
       | .applicationData => processProtectedRecord state record
       | contentType => throw (.unexpectedRecord state.phase contentType)
 
+/-- Drive `processRecord` over framed records in wire order, accumulating the
+decrypted plaintext and the outbound bytes. Written as explicit list recursion
+rather than a `for` loop so the engine laws can induct over a whole feed (a
+`for` elaborates to `forIn` join points that `split`/`cases` cannot enter). -/
+private def processRecords (state : State) (records : List Record.RawRecord)
+    (plaintext wireBytes : ByteArray) : Except Failure Output :=
+  match records with
+  | [] => .ok { state, wireBytes, plaintext }
+  | record :: rest =>
+    match processRecord state record with
+    | .error error => .error { state, error }
+    | .ok (next, cleartext, outbound) =>
+        processRecords next rest (plaintext ++ cleartext) (wireBytes ++ outbound)
+
 /-- Incrementally consume transport bytes, retaining the latest advanced state on
 failure so an I/O shell can seal a fatal alert under the correct epoch. -/
-def feedWithFailure (initial : State) (chunk : ByteArray) : Except Failure Output := do
+def feedWithFailure (initial : State) (chunk : ByteArray) : Except Failure Output :=
   if initial.closed && !chunk.isEmpty then
-    throw { state := initial, error := .connectionClosed }
-  let (decoder, records) ←
+    .error { state := initial, error := .connectionClosed }
+  else
     match liftRecord (initial.decoder.feed chunk) with
-    | .ok decoded => pure decoded
-    | .error error => throw { state := initial, error }
-  let mut state := { initial with decoder }
-  let mut plaintext := ByteArray.empty
-  let mut wireBytes := ByteArray.empty
-  for record in records do
-    let (next, cleartext, outbound) ←
-      match processRecord state record with
-      | .ok output => pure output
-      | .error error => throw { state, error }
-    state := next
-    plaintext := plaintext ++ cleartext
-    wireBytes := wireBytes ++ outbound
-  pure { state, wireBytes, plaintext }
+    | .error error => .error { state := initial, error }
+    | .ok (decoder, records) =>
+        processRecords { initial with decoder } records.toList ByteArray.empty
+          ByteArray.empty
 
 /-- Consume transport bytes. `wireBytes` carries the server flight (in response to
 ClientHello) plus any KeyUpdate/close_notify; `plaintext` is decrypted
