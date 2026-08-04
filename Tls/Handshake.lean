@@ -4800,24 +4800,11 @@ private theorem findExtension?_of_mem {l : List Extension} {e : Extension}
 
 
 
-/-- **ClientHello preservation (GREASE tolerance)**: a ClientHello whose
-extension list carries the four extensions this implementation interprets
-(`supported_versions`, `supported_groups`, `key_share`,
-`signature_algorithms`) *anywhere in it*, interleaved in any order with any
-number of extensions it does not interpret, parses with *every* offered list
-returned verbatim: the cipher suites, the version identifiers, the
-supported-group identifiers, the key-share group identifiers and the
-signature-scheme identifiers all come back in wire order with nothing dropped,
-whatever the values are, and the whole extension list — unknown entries
-included — is retained as sent. Only the derived views (`supportedGroups`,
-`keyShares`) narrow to what this implementation knows. This is what a
-GREASE-sending client requires of a server.
-
-The only ordering-flavoured hypothesis left is `hedist`: no two extensions may
-share a type. RFC 8446 forbids duplicate extensions, and `parseExtensions`
-rejects them, so every ClientHello this implementation would accept satisfies
-it. -/
-theorem parseClientHello_clientHelloBody_mem {msg : Message}
+/-- The workhorse behind the ClientHello preservation laws: it takes the
+`pre_shared_key` precondition as an abstract hypothesis, so both the
+PSK-free (`parseClientHello_clientHelloBody_mem`) and the PSK-offering
+(`parseClientHello_clientHelloBody_psk`) statements share this proof. -/
+private theorem parseClientHello_clientHelloBody_core {msg : Message}
     {random legacySessionId : ByteArray} {cipherSuites : List UInt16}
     {versions groups algorithms : List UInt16}
     {shares : List (UInt16 × ByteArray)} {extensions : List Extension}
@@ -4836,8 +4823,8 @@ theorem parseClientHello_clientHelloBody_mem {msg : Message}
     (hSGmem : clientSupportedGroupsExtension groups ∈ extensions)
     (hKSmem : clientKeyShareExtension shares ∈ extensions)
     (hSAmem : clientSignatureAlgorithmsExtension algorithms ∈ extensions)
+    (hpsk : checkClientPsk extensions.toArray = .ok ())
     (hnone : ∀ e ∈ extensions,
-      (e.extensionType == preSharedKeyExtension) = false ∧
       (e.extensionType == serverNameExtension) = false ∧
       (e.extensionType == alpnExtension) = false)
     (hv8 : (uint16ListBytes versions).size < 2 ^ 8) (hvne : versions ≠ [])
@@ -4963,12 +4950,10 @@ theorem parseClientHello_clientHelloBody_mem {msg : Message}
     cases cipherSuites with
     | nil => exact absurd rfl hcsne
     | cons a t => simp
-  have hPsk : findExtension? extensions.toArray preSharedKeyExtension = none :=
-    findExtension?_eq_none (fun e he => (hnone e he).1)
   have hSN : findExtension? extensions.toArray serverNameExtension = none :=
-    findExtension?_eq_none (fun e he => (hnone e he).2.1)
+    findExtension?_eq_none (fun e he => (hnone e he).1)
   have hAL : findExtension? extensions.toArray alpnExtension = none :=
-    findExtension?_eq_none (fun e he => (hnone e he).2.2)
+    findExtension?_eq_none (fun e he => (hnone e he).2)
   have hSV : findExtension? extensions.toArray supportedVersionsExtension =
       some (clientSupportedVersionsExtension versions) :=
     findExtension?_of_mem hedist hSVmem
@@ -4996,7 +4981,7 @@ theorem parseClientHello_clientHelloBody_mem {msg : Message}
   rw [if_neg hAtEnd]
   simp only [r6, requireEnd_eval (context := "ClientHello") hend,
     parseExtensions_extensionsBytes extensions hesz hedist,
-    checkClientPsk_none hPsk,
+    hpsk,
     parseOptionalExtension_some hSV, parseClientVersions_body hv8 hvne,
     parseOptionalExtension_some hSG, parseClientGroups_body hg16 hgne,
     parseOptionalExtension_some hKS,
@@ -5006,6 +4991,176 @@ theorem parseClientHello_clientHelloBody_mem {msg : Message}
     parseOptionalExtension_none hSN, parseOptionalExtension_none hAL,
     hSG, Option.isSome_some, Bool.true_and, horder, Bool.not_true]
   rw [if_neg Bool.false_ne_true]
+
+/-- **ClientHello preservation (GREASE tolerance)**: a ClientHello whose
+extension list carries the four extensions this implementation interprets
+(`supported_versions`, `supported_groups`, `key_share`,
+`signature_algorithms`) *anywhere in it*, interleaved in any order with any
+number of extensions it does not interpret, parses with *every* offered list
+returned verbatim: the cipher suites, the version identifiers, the
+supported-group identifiers, the key-share group identifiers and the
+signature-scheme identifiers all come back in wire order with nothing dropped,
+whatever the values are, and the whole extension list — unknown entries
+included — is retained as sent. Only the derived views (`supportedGroups`,
+`keyShares`) narrow to what this implementation knows. This is what a
+GREASE-sending client requires of a server.
+
+The only ordering-flavoured hypothesis left is `hedist`: no two extensions may
+share a type. RFC 8446 forbids duplicate extensions, and `parseExtensions`
+rejects them, so every ClientHello this implementation would accept satisfies
+it. -/
+theorem parseClientHello_clientHelloBody_mem {msg : Message}
+    {random legacySessionId : ByteArray} {cipherSuites : List UInt16}
+    {versions groups algorithms : List UInt16}
+    {shares : List (UInt16 × ByteArray)} {extensions : List Extension}
+    (hty : msg.msgType = clientHelloType)
+    (hbody : msg.body =
+      clientHelloBody random legacySessionId cipherSuites extensions)
+    (hR : random.size = 32) (hsid : legacySessionId.size < 2 ^ 8)
+    (hsid32 : legacySessionId.size ≤ 32)
+    (hcs : (uint16ListBytes cipherSuites).size < 2 ^ 16)
+    (hcsne : cipherSuites ≠ [])
+    (hE : (extensionsBytes extensions).size < 2 ^ 16)
+    (hesz : ∀ e ∈ extensions, e.data.size < 2 ^ 16)
+    (hedist : extensions.Pairwise
+      (fun a b => (a.extensionType == b.extensionType) = false))
+    (hSVmem : clientSupportedVersionsExtension versions ∈ extensions)
+    (hSGmem : clientSupportedGroupsExtension groups ∈ extensions)
+    (hKSmem : clientKeyShareExtension shares ∈ extensions)
+    (hSAmem : clientSignatureAlgorithmsExtension algorithms ∈ extensions)
+    (hnone : ∀ e ∈ extensions,
+      (e.extensionType == preSharedKeyExtension) = false ∧
+      (e.extensionType == serverNameExtension) = false ∧
+      (e.extensionType == alpnExtension) = false)
+    (hv8 : (uint16ListBytes versions).size < 2 ^ 8) (hvne : versions ≠ [])
+    (hg16 : (uint16ListBytes groups).size < 2 ^ 16) (hgne : groups ≠ [])
+    (hk16 : (keyShareEntriesBytes shares).size < 2 ^ 16)
+    (hksz : ∀ e ∈ shares, e.2.size < 2 ^ 16)
+    (hkne : ∀ e ∈ shares, e.2.isEmpty = false)
+    (hkdist : shares.Pairwise (fun a b => (a.1 == b.1) = false))
+    (ha16 : (uint16ListBytes algorithms).size < 2 ^ 16) (hane : algorithms ≠ [])
+    (horder :
+      isOrderedSubset (shares.map Prod.fst).toArray groups.toArray = true) :
+    parseClientHello msg = .ok
+      { random := random, legacySessionId := legacySessionId,
+        cipherSuites := cipherSuites.toArray,
+        supportedVersionIds := versions.toArray,
+        supportedGroupIds := groups.toArray,
+        supportedGroups := knownGroups groups,
+        keyShareGroupIds := (shares.map Prod.fst).toArray,
+        keyShares := knownKeyShares shares,
+        signatureAlgorithms := algorithms.toArray,
+        serverName := none, alpnProtocols := #[],
+        extensions := extensions.toArray,
+        offersTls13 := versions.toArray.contains tls13Version,
+        encoded := msg.encoded } :=
+  parseClientHello_clientHelloBody_core hty hbody hR hsid hsid32 hcs hcsne hE
+    hesz hedist hSVmem hSGmem hKSmem hSAmem
+    (checkClientPsk_none (findExtension?_eq_none (fun e he => (hnone e he).1)))
+    (fun e he => ⟨(hnone e he).2.1, (hnone e he).2.2⟩)
+    hv8 hvne hg16 hgne hk16 hksz hkne hkdist ha16 hane horder
+
+/-- `checkClientPsk` accepts a ClientHello that offers `pre_shared_key` as its
+final extension and carries a non-empty `psk_key_exchange_modes` vector — the
+two conditions RFC 8446 section 4.2.11 attaches to a PSK offer. -/
+private theorem checkClientPsk_ok {front : List Extension}
+    {pskData pskModes : ByteArray}
+    (hdist : (front ++ [Extension.mk preSharedKeyExtension pskData]).Pairwise
+      (fun a b => (a.extensionType == b.extensionType) = false))
+    (hmodes : Extension.mk pskKeyExchangeModesExtension
+        (ByteArray.empty.push (UInt8.ofNat pskModes.size) ++ pskModes) ∈
+      front ++ [Extension.mk preSharedKeyExtension pskData])
+    (hsz : pskModes.size < 2 ^ 8) (hne : pskModes.isEmpty = false) :
+    checkClientPsk (front ++ [Extension.mk preSharedKeyExtension pskData]).toArray =
+      .ok () := by
+  have hpsk : findExtension?
+      (front ++ [Extension.mk preSharedKeyExtension pskData]).toArray
+      preSharedKeyExtension = some (Extension.mk preSharedKeyExtension pskData) :=
+    findExtension?_of_mem (e := Extension.mk preSharedKeyExtension pskData) hdist
+      (by simp)
+  have hmodes' : findExtension?
+      (front ++ [Extension.mk preSharedKeyExtension pskData]).toArray
+      pskKeyExchangeModesExtension =
+      some (Extension.mk pskKeyExchangeModesExtension
+        (ByteArray.empty.push (UInt8.ofNat pskModes.size) ++ pskModes)) :=
+    findExtension?_of_mem hdist hmodes
+  unfold checkClientPsk
+  rw [hpsk, if_pos (by simp), hmodes']
+  simp only [readVector8_body hsz,
+    requireEnd_eval (b := ByteArray.empty.push (UInt8.ofNat pskModes.size) ++
+        pskModes)
+      (off := 0 + 1 + pskModes.size)
+      (context := "ClientHello psk_key_exchange_modes")
+      (by rw [ByteArray.size_append]; rfl)]
+  rw [if_neg (by rw [hne]; exact Bool.false_ne_true)]
+
+/-- **ClientHello preservation with a PSK offer**: the same law for a
+ClientHello that resumes. RFC 8446 requires `pre_shared_key` to be the last
+extension and to travel with a non-empty `psk_key_exchange_modes`; given that
+shape the parser accepts the message and still returns every offered list
+verbatim. The PSK identities and binders themselves stay opaque (`pskData` is
+arbitrary) — this codec does not interpret them, and the extension list retains
+them byte for byte. -/
+theorem parseClientHello_clientHelloBody_psk {msg : Message}
+    {random legacySessionId : ByteArray} {cipherSuites : List UInt16}
+    {versions groups algorithms : List UInt16}
+    {shares : List (UInt16 × ByteArray)} {front : List Extension}
+    {pskData pskModes : ByteArray}
+    (hty : msg.msgType = clientHelloType)
+    (hbody : msg.body = clientHelloBody random legacySessionId cipherSuites
+      (front ++ [Extension.mk preSharedKeyExtension pskData]))
+    (hR : random.size = 32) (hsid : legacySessionId.size < 2 ^ 8)
+    (hsid32 : legacySessionId.size ≤ 32)
+    (hcs : (uint16ListBytes cipherSuites).size < 2 ^ 16)
+    (hcsne : cipherSuites ≠ [])
+    (hE : (extensionsBytes
+      (front ++ [Extension.mk preSharedKeyExtension pskData])).size < 2 ^ 16)
+    (hesz : ∀ e ∈ front ++ [Extension.mk preSharedKeyExtension pskData],
+      e.data.size < 2 ^ 16)
+    (hedist : (front ++ [Extension.mk preSharedKeyExtension pskData]).Pairwise
+      (fun a b => (a.extensionType == b.extensionType) = false))
+    (hSVmem : clientSupportedVersionsExtension versions ∈
+      front ++ [Extension.mk preSharedKeyExtension pskData])
+    (hSGmem : clientSupportedGroupsExtension groups ∈
+      front ++ [Extension.mk preSharedKeyExtension pskData])
+    (hKSmem : clientKeyShareExtension shares ∈
+      front ++ [Extension.mk preSharedKeyExtension pskData])
+    (hSAmem : clientSignatureAlgorithmsExtension algorithms ∈
+      front ++ [Extension.mk preSharedKeyExtension pskData])
+    (hmodesMem : Extension.mk pskKeyExchangeModesExtension
+        (ByteArray.empty.push (UInt8.ofNat pskModes.size) ++ pskModes) ∈
+      front ++ [Extension.mk preSharedKeyExtension pskData])
+    (hmodes8 : pskModes.size < 2 ^ 8) (hmodesne : pskModes.isEmpty = false)
+    (hnone : ∀ e ∈ front ++ [Extension.mk preSharedKeyExtension pskData],
+      (e.extensionType == serverNameExtension) = false ∧
+      (e.extensionType == alpnExtension) = false)
+    (hv8 : (uint16ListBytes versions).size < 2 ^ 8) (hvne : versions ≠ [])
+    (hg16 : (uint16ListBytes groups).size < 2 ^ 16) (hgne : groups ≠ [])
+    (hk16 : (keyShareEntriesBytes shares).size < 2 ^ 16)
+    (hksz : ∀ e ∈ shares, e.2.size < 2 ^ 16)
+    (hkne : ∀ e ∈ shares, e.2.isEmpty = false)
+    (hkdist : shares.Pairwise (fun a b => (a.1 == b.1) = false))
+    (ha16 : (uint16ListBytes algorithms).size < 2 ^ 16) (hane : algorithms ≠ [])
+    (horder :
+      isOrderedSubset (shares.map Prod.fst).toArray groups.toArray = true) :
+    parseClientHello msg = .ok
+      { random := random, legacySessionId := legacySessionId,
+        cipherSuites := cipherSuites.toArray,
+        supportedVersionIds := versions.toArray,
+        supportedGroupIds := groups.toArray,
+        supportedGroups := knownGroups groups,
+        keyShareGroupIds := (shares.map Prod.fst).toArray,
+        keyShares := knownKeyShares shares,
+        signatureAlgorithms := algorithms.toArray,
+        serverName := none, alpnProtocols := #[],
+        extensions := (front ++
+          [Extension.mk preSharedKeyExtension pskData]).toArray,
+        offersTls13 := versions.toArray.contains tls13Version,
+        encoded := msg.encoded } :=
+  parseClientHello_clientHelloBody_core hty hbody hR hsid hsid32 hcs hcsne hE
+    hesz hedist hSVmem hSGmem hKSmem hSAmem
+    (checkClientPsk_ok hedist hmodesMem hmodes8 hmodesne) hnone
+    hv8 hvne hg16 hgne hk16 hksz hkne hkdist ha16 hane horder
 
 /-- **ClientHello preservation, ordered special case**: the same law when the
 four interpreted extensions come last, after the uninterpreted ones. Kept as
