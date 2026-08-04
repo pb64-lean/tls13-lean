@@ -9,6 +9,8 @@ lean_library(
     name = "tls13",
     srcs = [
         "KeySchedule.lean",
+        "KeySchedule/Refinement.lean",
+        "KeySchedule/Spec.lean",
         "X509.lean",
         "X509/Certificate.lean",
         "X509/ChannelBinding.lean",
@@ -24,13 +26,18 @@ lean_library(
     deps = ["//HaclStar:haclstar"],
 )
 
-# Compile-time audit of the X.509 / DER tier. The principal theorems are the
-# retention chain that makes certificate verification mean anything: the DER
-# decoder hands back the exact substring it consumed, a decoded
-# `TBSCertificate` retains those bytes, and issuer vetting verified the
-# signature over exactly them. `module_prefixes` deliberately reaches past this
-# library into HaclStar so the `@[extern]` allowance is exercised here too: the
-# audit fails if native code appears anywhere but the FFI package.
+# Compile-time audit of the key-schedule and X.509 / DER tiers. The principal
+# theorems are (a) the RFC 8446 §7.1 refinement chain — the derivation tree
+# transcribed as data, the `HkdfLabel` wire image byte for byte, and each
+# implementation function shown to compute its specification counterpart for
+# *any* HKDF the HACL\* bindings implement — and (b) the retention chain that
+# makes certificate verification mean anything: the DER decoder hands back the
+# exact substring it consumed, a decoded `TBSCertificate` retains those bytes,
+# and issuer vetting verified the signature over exactly them.
+# `module_prefixes` deliberately reaches past this library into HaclStar so the
+# `@[extern]` allowance is exercised here too: the audit fails if native code
+# appears anywhere but the FFI package. `allowed_axioms` is left at the rule
+# default, which is exactly `propext`, `Classical.choice`, `Quot.sound`.
 lean_assurance_test(
     name = "tls13_assurance",
     allowed_extern_modules = ["HaclStar"],
@@ -39,6 +46,20 @@ lean_assurance_test(
         "TLS13",
     ],
     principal_theorems = [
+        # Key schedule: the RFC 8446 §7.1 derivation tree, as data.
+        "TLS13.KeySchedule.Spec.Label.text_rfc8446",
+        "TLS13.KeySchedule.Spec.Derived.tree_rfc8446",
+        "TLS13.KeySchedule.Spec.HkdfLabel.encode_bytes",
+        "TLS13.KeySchedule.Spec.emptyContext_rfc8446",
+        # Key schedule: the implementation refines it.
+        "TLS13.KeySchedule.hkdfLabel_encode",
+        "TLS13.KeySchedule.hkdfLabel_bytes",
+        "TLS13.KeySchedule.expandLabel_spec",
+        "TLS13.KeySchedule.deriveSecret_spec",
+        "TLS13.KeySchedule.earlySecret_spec",
+        "TLS13.KeySchedule.handshakeSecret_spec",
+        "TLS13.KeySchedule.masterSecret_spec",
+        "TLS13.KeySchedule.derived_spec",
         # DER: what the decoder accepted, byte for byte.
         "TLS13.X509.DER.decode_encoded",
         "TLS13.X509.DER.decode_inj",
