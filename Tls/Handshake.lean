@@ -1046,16 +1046,38 @@ structure ClientHello where
   encoded : ByteArray
   deriving Inhabited
 
-private def parseUInt16List (bytes : ByteArray) : Except String (Array UInt16) := do
+/-- One step of uint16-vector parsing. Explicit well-founded recursion over
+the unconsumed bytes (not a `while` loop) so the list laws below can evaluate
+it. -/
+private def parseUInt16ListLoop (r : Reader) (out : Array UInt16) :
+    Except String (Array UInt16) :=
+  if r.atEnd then
+    .ok out
+  else
+    match h16 : r.readUInt16 with
+    | .error e => .error e
+    | .ok (value, r') =>
+      have hlt : r'.bytes.size - r'.offset < r.bytes.size - r.offset := by
+        obtain ⟨hb, ho, hle⟩ := readUInt16_ok h16
+        rw [hb]
+        omega
+      parseUInt16ListLoop r' (out.push value)
+  termination_by r.bytes.size - r.offset
+  decreasing_by exact hlt
+
+/-- Parse a `uint16` vector body (cipher suites, supported groups, supported
+versions, signature algorithms). Values are not interpreted, so unknown
+(including GREASE) values are kept verbatim and in order. -/
+def parseUInt16List (bytes : ByteArray) : Except String (Array UInt16) :=
   if bytes.size % 2 != 0 then
-    throw "uint16 list has an odd byte length"
-  let mut r : Reader := { bytes }
-  let mut out : Array UInt16 := #[]
-  while !r.atEnd do
-    let (value, r') ← r.readUInt16
-    out := out.push value
-    r := r'
-  pure out
+    .error "uint16 list has an odd byte length"
+  else
+    parseUInt16ListLoop { bytes } #[]
+
+/-- The wire image of a `uint16` vector body. -/
+def uint16ListBytes : List UInt16 → ByteArray
+  | [] => ByteArray.empty
+  | v :: rest => appendUInt16 ByteArray.empty v ++ uint16ListBytes rest
 
 private def parseSupportedGroups (bytes : ByteArray) :
     Except String (Array UInt16 × Array NamedGroup) := do
@@ -3264,6 +3286,96 @@ theorem decodeOne_prefix_error {msgType : UInt8} {body : ByteArray} {msg : Messa
         rw [hbytes2, hpsize] at hle3
         rw [ho3, hoff2, hlen] at hle3
         omega
+
+/-! ### `uint16` vectors (cipher suites, groups, versions, algorithms) -/
+
+private theorem size_uint16ListBytes : ∀ l : List UInt16,
+    (uint16ListBytes l).size = 2 * l.length := by
+  intro l
+  induction l with
+  | nil => rfl
+  | cons v rest ih =>
+    show (appendUInt16 ByteArray.empty v ++ uint16ListBytes rest).size = _
+    rw [ByteArray.size_append,
+      show (appendUInt16 ByteArray.empty v).size = 2 from rfl, ih]
+    simp [Nat.mul_succ]
+    omega
+
+private theorem parseUInt16ListLoop_end {E : ByteArray} {off : Nat}
+    {out : Array UInt16} (h : off = E.size) :
+    parseUInt16ListLoop (Reader.mk E off) out = .ok out := by
+  unfold parseUInt16ListLoop
+  rw [if_pos]
+  show (off == E.size) = true
+  rw [h]
+  exact beq_self_eq_true E.size
+
+private theorem parseUInt16ListLoop_cons {P S : ByteArray} {v : UInt16}
+    {out : Array UInt16} :
+    parseUInt16ListLoop
+        (Reader.mk (P ++ (appendUInt16 ByteArray.empty v ++ S)) P.size) out =
+      parseUInt16ListLoop (Reader.mk (P ++ (appendUInt16 ByteArray.empty v ++ S))
+        (P ++ appendUInt16 ByteArray.empty v).size) (out.push v) := by
+  have hA : (appendUInt16 ByteArray.empty v).size = 2 := rfl
+  have hread := readUInt16_at (P := P) (S := S) (v := v)
+  have hnotend : ¬((Reader.mk (P ++ (appendUInt16 ByteArray.empty v ++ S))
+      P.size).atEnd = true) := by
+    show ¬(P.size == (P ++ (appendUInt16 ByteArray.empty v ++ S)).size) = true
+    rw [beq_iff_eq, ByteArray.size_append, ByteArray.size_append, hA]
+    omega
+  rw [show (P ++ appendUInt16 ByteArray.empty v).size = P.size + 2 from by
+    rw [ByteArray.size_append, hA]]
+  rw [parseUInt16ListLoop.eq_def, if_neg hnotend]
+  split
+  · rename_i err heq
+    rw [hread] at heq
+    cases heq
+  · rename_i x r' heq
+    rw [hread] at heq
+    simp only [Except.ok.injEq, Prod.mk.injEq] at heq
+    obtain ⟨rfl, rfl⟩ := heq
+    rfl
+
+private theorem parseUInt16ListLoop_uint16ListBytes : ∀ (l : List UInt16)
+    (P : ByteArray) (out : Array UInt16),
+    parseUInt16ListLoop (Reader.mk (P ++ uint16ListBytes l) P.size) out =
+      .ok (out.toList ++ l).toArray := by
+  intro l
+  induction l with
+  | nil =>
+    intro P out
+    rw [show uint16ListBytes ([] : List UInt16) = ByteArray.empty from rfl,
+      ByteArray.append_empty, parseUInt16ListLoop_end rfl, List.append_nil,
+      Array.toArray_toList]
+  | cons v rest ih =>
+    intro P out
+    rw [show uint16ListBytes (v :: rest) =
+      appendUInt16 ByteArray.empty v ++ uint16ListBytes rest from rfl]
+    rw [parseUInt16ListLoop_cons]
+    rw [show P ++ (appendUInt16 ByteArray.empty v ++ uint16ListBytes rest) =
+      (P ++ appendUInt16 ByteArray.empty v) ++ uint16ListBytes rest from
+        ByteArray.append_assoc.symm]
+    rw [ih (P ++ appendUInt16 ByteArray.empty v) (out.push v)]
+    rw [Array.toList_push, List.append_assoc]
+    rfl
+
+/-- **`uint16`-vector roundtrip (GREASE tolerance)**: parsing the wire image of
+any `uint16` list returns exactly that list, in order. The values are
+arbitrary, so unknown cipher suites, unknown/GREASE named groups, versions and
+signature schemes are all carried through unchanged — re-encoding the parse
+result reproduces the original bytes (`uint16ListBytes l`). -/
+theorem parseUInt16List_uint16ListBytes (l : List UInt16) :
+    parseUInt16List (uint16ListBytes l) = .ok l.toArray := by
+  unfold parseUInt16List
+  rw [if_neg (by
+    rw [size_uint16ListBytes]
+    simp [Nat.mul_mod_right])]
+  rw [show ({ bytes := uint16ListBytes l } : Reader) =
+    Reader.mk (ByteArray.empty ++ uint16ListBytes l) ByteArray.empty.size from by
+    rw [ByteArray.empty_append]
+    rfl]
+  rw [parseUInt16ListLoop_uint16ListBytes l ByteArray.empty #[]]
+  rfl
 
 end Handshake
 end Tls
