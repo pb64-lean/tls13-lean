@@ -352,7 +352,7 @@ test binary is built, so a violation is a red target, not a stale README:
 | `//Tls:tls_assurance` | 46 principal theorems — nonce non-reuse (`WriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, nonce and sequence injectivity), record conservation and seal/open inversion, ClientHello canonicity and body injectivity, and the state-machine transition and invariant laws (including both directions of the connected-only application-data rule) |
 
 Each target also scans every constant of the whole first-party closure
-(`HaclStar`, `TLS13`, `Tls` — 26 modules, ~4650 constants): nothing may reach
+(`HaclStar`, `TLS13`, `Tls` — 26 modules, ~4750 constants): nothing may reach
 `sorryAx`, no axiom may be declared outside the allowed set, and **no
 `@[extern]` constant may live outside the `HaclStar` modules**. That last check
 is what makes the FFI-boundary claim in the previous section mechanical: native
