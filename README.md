@@ -36,9 +36,14 @@ Four Bazel packages:
   with KeyUpdate, handshake codecs for both roles (including
   HelloRetryRequest, ALPN, SNI), and the client (`Tls.Client`) and server
   (`Tls.Server`) state machines. `Tls.Record.Laws` proves kernel-checked
-  theorems about the record framer as implemented: byte conservation,
-  fragmentation independence, encode/decode roundtrips, and
-  sequence-number/nonce lemmas.
+  theorems about the record layer as implemented: byte conservation,
+  fragmentation independence, encode/decode roundtrips,
+  sequence-number/nonce lemmas, and record-protection laws — `seal`
+  advances the sequence number exactly once preserving key/IV/secret, and
+  (parametrically over the opaque HACL\* AEAD binding) `open` inverts
+  `seal`, wire bytes and all. The handshake layer mirrors framing
+  conservation: a decoded message's retained `encoded` bytes plus the
+  remainder reproduce the input buffer exactly.
 - **`Test/`** — nine hermetic test binaries, a one-shot loopback server
   harness, and a scripted (manual-tag) interoperability gate that drives the
   harness with real OpenSSL, curl, and Go `crypto/tls` clients.
@@ -230,5 +235,7 @@ build because it compiles and links the HACL\* C shim.
 9. PSK, resumption, 0-RTT; client certificates
 10. Protocol-level proofs — record-layer laws are done (`Tls.Record.Laws`:
     framing conservation, fragmentation independence, roundtrips,
-    nonce/sequence lemmas); key schedule, handshake parsers, and
-    state-machine invariants remain
+    nonce/sequence lemmas, seal/open protection laws with the open∘seal
+    identity stated parametrically over the opaque AEAD FFI, and
+    handshake-message extraction conservation); key schedule, handshake
+    parsers, and state-machine invariants remain
