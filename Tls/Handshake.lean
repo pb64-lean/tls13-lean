@@ -3167,5 +3167,103 @@ theorem encodeNewSessionTicket_parse {ticketLifetime ticketAgeAdd : UInt32}
             simp only [parseExtensions_empty]
             rfl
 
+/-! ### Reassembly independence
+
+The record layer hands the handshake layer a byte stream that it may have
+split at arbitrary points (`Tls.Record.Laws` proves the split is conserved).
+These laws say the handshake decoder only ever sees that stream: where the
+splits fell cannot change the outcome, an incomplete frame is never decoded,
+and back-to-back messages are peeled in order. -/
+
+/-- **Split independence**: however a framed message's bytes were divided
+between records, decoding the reassembled buffer yields the message and
+leaves the following bytes untouched. -/
+theorem decodeOne_frame_split {msgType : UInt8} {body : ByteArray} {msg : Message}
+    (h : frame msgType body = .ok msg) (a b rest : ByteArray)
+    (hsplit : a ++ b = msg.encoded) :
+    decodeOne (a ++ (b ++ rest)) = .ok (msg, rest) := by
+  rw [← ByteArray.append_assoc, hsplit]
+  exact decodeOne_frame h rest
+
+/-- **In-order peeling**: two framed messages sharing a buffer are decoded one
+at a time, each with the rest of the stream as residual. -/
+theorem decodeOne_frame_concat {t₁ t₂ : UInt8} {b₁ b₂ : ByteArray}
+    {m₁ m₂ : Message} (h₁ : frame t₁ b₁ = .ok m₁) (h₂ : frame t₂ b₂ = .ok m₂)
+    (rest : ByteArray) :
+    decodeOne (m₁.encoded ++ (m₂.encoded ++ rest)) = .ok (m₁, m₂.encoded ++ rest) ∧
+    decodeOne (m₂.encoded ++ rest) = .ok (m₂, rest) :=
+  ⟨decodeOne_frame h₁ (m₂.encoded ++ rest), decodeOne_frame h₂ rest⟩
+
+/-- **Incomplete frames are never decoded**: any strict prefix of a framed
+message is rejected, so a reassembler that waits for more bytes can never
+have missed a message. -/
+theorem decodeOne_prefix_error {msgType : UInt8} {body : ByteArray} {msg : Message}
+    (h : frame msgType body = .ok msg) {k : Nat} (hk : k < msg.encoded.size) :
+    ∃ e, decodeOne (msg.encoded.extract 0 k) = .error e := by
+  obtain ⟨hlt, hmsg⟩ := frame_spec h
+  have hP1 : (ByteArray.empty.push msgType).size = 1 := rfl
+  have hPL : (ByteArray.empty.push msgType ++ length24Bytes body.size).size = 4 := by
+    rw [ByteArray.size_append, hP1]
+    rfl
+  have hEsize : msg.encoded.size = 4 + body.size := by
+    rw [hmsg]
+    show (ByteArray.empty.push msgType ++ length24Bytes body.size ++ body).size = _
+    rw [ByteArray.size_append, hPL]
+  have hb : ∀ i, 1 ≤ i → i < 4 →
+      msg.encoded.get! i = (length24Bytes body.size).get! (i - 1) := by
+    intro i h1 h4
+    rw [hmsg]
+    show (ByteArray.empty.push msgType ++ length24Bytes body.size ++ body).get! i = _
+    rw [get!_append_left (by rw [hPL]; omega),
+      get!_append_right (by rw [hP1]; omega)
+        (by rw [hP1, show (length24Bytes body.size).size = 3 from rfl]; omega),
+      hP1]
+  have hpsize : (msg.encoded.extract 0 k).size = k := by
+    rw [ByteArray.size_extract]
+    omega
+  unfold decodeOne
+  split
+  · exact ⟨_, rfl⟩
+  · rename_i mt r₁ h1
+    split
+    · exact ⟨_, rfl⟩
+    · rename_i len r₂ h2
+      split
+      · exact ⟨_, rfl⟩
+      · rename_i bodyBytes r₃ h3
+        exfalso
+        obtain ⟨hb1, ho1, hle1⟩ := readUInt8_ok h1
+        obtain ⟨hb2, ho2, hle2⟩ := readUInt24_ok h2
+        obtain ⟨hb3, ho3, hle3⟩ := take_ok h3
+        have hr₁ : r₁ = { bytes := msg.encoded.extract 0 k, offset := 1 } := by
+          rcases r₁ with ⟨bs, off⟩
+          have hbs : bs = msg.encoded.extract 0 k := hb1
+          have hoff : off = 1 := ho1
+          rw [hbs, hoff]
+        rw [hr₁] at h2 hb2 ho2 hle2
+        have hoff2 : r₂.offset = 4 := by rw [ho2]
+        have hbytes2 : r₂.bytes = msg.encoded.extract 0 k := hb2
+        have hk4 : 4 ≤ k := by
+          rw [hoff2] at hle2
+          have hle2' : (4 : Nat) ≤ (msg.encoded.extract 0 k).size := hle2
+          rw [hpsize] at hle2'
+          exact hle2'
+        -- Four header bytes are present, so the length field is the real one.
+        have heval := readUInt24_eval (b := msg.encoded.extract 0 k) (off := 1)
+          (by rw [hpsize]; omega)
+        rw [h2] at heval
+        simp only [Except.ok.injEq, Prod.mk.injEq] at heval
+        have hlen : len = body.size := by
+          rw [heval.1,
+            extract_get! (s := 0) (k := 1) (by omega) (by omega),
+            extract_get! (s := 0) (k := 2) (by omega) (by omega),
+            extract_get! (s := 0) (k := 3) (by omega) (by omega),
+            hb 1 (by omega) (by omega), hb 2 (by omega) (by omega),
+            hb 3 (by omega) (by omega)]
+          exact uint24_recompose hlt
+        rw [hbytes2, hpsize] at hle3
+        rw [ho3, hoff2, hlen] at hle3
+        omega
+
 end Handshake
 end Tls
