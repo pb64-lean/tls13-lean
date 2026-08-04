@@ -92,6 +92,9 @@ lean_assurance_test(
         "Tls.Client.acceptServerHello_keySchedule",
         "Tls.Client.completeServerHandshake_keySchedule",
         "Tls.Client.acceptKeyUpdate_keySchedule",
+        "Tls.Server.finishedVerifyData_spec",
+        "Tls.Server.completeClientHello_keySchedule",
+        "Tls.Server.acceptKeyUpdate_keySchedule",
         # State machines: the transitions that define what "connected" means.
         "Tls.Client.completeServerHandshake_verified",
         "Tls.Client.acceptServerHello_transcript",

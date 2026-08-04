@@ -2,6 +2,7 @@ module
 
 public import Tls.Server
 public import Tls.Record.Laws
+public import TLS13.KeySchedule.Refinement
 import all Tls.Server
 import all Tls.Record
 
@@ -1635,6 +1636,175 @@ theorem feed_nonce_nodup {state : State} {chunk : ByteArray} {out : Output}
         (secrets.Nodup → nonces.Nodup) := by
   obtain ⟨secrets, nonces, hrun⟩ := Record.Extends.run (feed_write h)
   exact ⟨secrets, nonces, hrun, fun hfresh => hrun.nodup hfresh⟩
+
+/-! ## The engine installs the RFC 8446 §7.1 epochs
+
+The laws below tie the server's actual key installations to the specification in
+`TLS13.KeySchedule.Spec`: at each transition, the epoch secrets the engine
+stores are the specification's, derived from the right parent secret, under the
+right label, over the right transcript.
+
+As everywhere else, this is *structural* refinement. It is stated for an
+arbitrary `Spec.Hkdf` the HACL\* bindings implement, so it says nothing about
+what HKDF computes — only that the engine applies it in the RFC's shape. The
+empirical half is `Test/HaclKat.lean`'s RFC 8448 vectors; if the two ever
+disagree, the vectors are right. -/
+
+open TLS13.KeySchedule
+
+/-- **The Finished MAC is keyed by RFC 8446 §4.4.4's `finished_key`**:
+`HKDF-Expand-Label(BaseKey, "finished", "", Hash.length)` — an *empty* context,
+not a transcript hash — and the transcript hash is the HMAC message. -/
+theorem finishedVerifyData_spec {H : Spec.Hkdf} (hi : Implements H)
+    (trafficSecret transcriptHash : ByteArray) :
+    finishedVerifyData trafficSecret transcriptHash =
+      HaclStar.hmacSha256 (Spec.finishedKey H trafficSecret) transcriptHash := by
+  have he : expandLabel trafficSecret (Spec.Label.finished).text ByteArray.empty
+      hashLen = Spec.finishedKey H trafficSecret := by
+    rw [show (hashLen : Nat) = H.hashLen from hi.hashLen_eq.symm]
+    exact expandLabel_spec hi trafficSecret .finished ByteArray.empty H.hashLen
+  exact congrArg (fun k => HaclStar.hmacSha256 k transcriptHash) he
+
+/-- **Answering a ClientHello installs the RFC 8446 §7.1 epochs.** There is an
+(EC)DHE shared secret of hash length and a server flight — ServerHello,
+EncryptedExtensions, Certificate, CertificateVerify, Finished — such that, for
+any key-schedule inputs with no PSK, that shared secret, and the transcript
+hashes of exactly those two message sequences, the epochs the server installs
+are the specification's:
+
+* the read epoch is `client_handshake_traffic_secret`, over
+  ClientHello…ServerHello;
+* the write epoch is already `server_application_traffic_secret_0` — the server
+  installs it in this same step, having just sealed its flight under the
+  handshake epoch — over ClientHello…server Finished;
+* the retained client application epoch is
+  `client_application_traffic_secret_0`, over the same transcript;
+* and the client Finished the server will demand is HMAC-keyed by §4.4.4's
+  `finished_key` of the **client handshake** traffic secret, over the
+  ClientHello…server Finished transcript.
+
+Note which transcript goes where: the `"derived"` steps feeding the Handshake
+and Master Secrets bind the **empty** message sequence, the handshake-traffic
+secrets bind ClientHello…ServerHello, and the application-traffic secrets bind
+the longer ClientHello…server Finished sequence. -/
+theorem completeClientHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {hello : Handshake.ClientHello}
+    {group : Handshake.NamedGroup} {transcriptPrefix wire : ByteArray}
+    (h : completeClientHello state hello group transcriptPrefix = .ok (next, wire)) :
+    ∃ (ecdhe : ByteArray) (serverHello encryptedExtensions certificate certVerify
+        serverFinished : Handshake.Message),
+      ecdhe.size = hashLen ∧
+      ∀ inp : Spec.Inputs,
+        inp.psk = zeros →
+        inp.ecdhe = ecdhe →
+        inp.hash .empty = HaclStar.sha256 ByteArray.empty →
+        inp.hash .serverHello =
+          HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded) →
+        inp.hash .serverFinished =
+          HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded ++
+            encryptedExtensions.encoded ++ certificate.encoded ++ certVerify.encoded ++
+            serverFinished.encoded) →
+        (∃ rk, next.readKeys? = some rk ∧
+          Record.TrafficKeys.DerivedFrom H rk (Spec.derived H inp .cHsTraffic)) ∧
+        (∃ wk, next.writeKeys? = some wk ∧
+          Record.TrafficKeys.DerivedFrom H wk (Spec.derived H inp .sApTraffic)) ∧
+        (∃ ck, next.clientApplicationKeys? = some ck ∧
+          Record.TrafficKeys.DerivedFrom H ck (Spec.derived H inp .cApTraffic)) ∧
+        next.expectedClientFinished? =
+          some (HaclStar.hmacSha256
+            (Spec.finishedKey H (Spec.derived H inp .cHsTraffic))
+            (inp.hash .serverFinished)) := by
+  unfold completeClientHello at h
+  simp only [pure_bind] at h
+  obtain ⟨exchanged, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverPublic, sharedSecret⟩ := exchanged
+  obtain ⟨hsize, h⟩ := unless_ok h
+  obtain ⟨serverHello, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverWriteKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientReadKeys, hcrk, h⟩ := except_bind_ok_inv h
+  obtain ⟨encryptedExtensions, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨certificate, _, h⟩ := except_bind_ok_inv h
+  split at h
+  case h_2 => cases h
+  obtain ⟨_, h⟩ := unless_ok h
+  obtain ⟨certVerify, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverFinished, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverApplicationKeys, hsak, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientApplicationKeys, hcak, h⟩ := except_bind_ok_inv h
+  obtain ⟨flightSealed, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨flightKeys, sealedFlight⟩ := flightSealed
+  obtain ⟨serverHelloWire, _, h⟩ := except_bind_ok_inv h
+  have hderiv : ∀ inp : Spec.Inputs,
+      inp.psk = zeros → inp.ecdhe = sharedSecret →
+      inp.hash .empty = HaclStar.sha256 ByteArray.empty →
+      inp.hash .serverHello = HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded) →
+      inp.hash .serverFinished =
+        HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded ++
+          encryptedExtensions.encoded ++ certificate.encoded ++ certVerify.encoded ++
+          serverFinished.encoded) →
+      Record.TrafficKeys.DerivedFrom H clientReadKeys (Spec.derived H inp .cHsTraffic) ∧
+      Record.TrafficKeys.DerivedFrom H serverApplicationKeys
+        (Spec.derived H inp .sApTraffic) ∧
+      Record.TrafficKeys.DerivedFrom H clientApplicationKeys
+        (Spec.derived H inp .cApTraffic) ∧
+      finishedVerifyData
+          (deriveSecret (handshakeSecret earlySecret sharedSecret
+            (HaclStar.sha256 ByteArray.empty)) "c hs traffic"
+            (HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded)))
+          (HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded ++
+            encryptedExtensions.encoded ++ certificate.encoded ++ certVerify.encoded ++
+            serverFinished.encoded)) =
+        HaclStar.hmacSha256 (Spec.finishedKey H (Spec.derived H inp .cHsTraffic))
+          (inp.hash .serverFinished) := by
+    intro inp hpsk hecdhe hempty hsh hfin
+    have hhs := handshakeSecret_node_spec hi inp hpsk hecdhe hempty
+    have hchs := deriveSecret_node_spec hi inp .cHsTraffic hhs hsh
+    have hms := masterSecret_node_spec hi inp hhs hempty
+    have hsap := deriveSecret_node_spec hi inp .sApTraffic hms hfin
+    have hcap := deriveSecret_node_spec hi inp .cApTraffic hms hfin
+    refine ⟨?_, ?_, ?_, ?_⟩
+    · rw [← hchs]; exact Record.deriveTrafficKeys_spec hi (liftRecord_ok hcrk)
+    · rw [← hsap]; exact Record.deriveTrafficKeys_spec hi (liftRecord_ok hsak)
+    · rw [← hcap]; exact Record.deriveTrafficKeys_spec hi (liftRecord_ok hcak)
+    · refine Eq.trans (finishedVerifyData_spec hi _ _) ?_
+      rw [← hfin]
+      exact congrArg
+        (fun s => HaclStar.hmacSha256 (Spec.finishedKey H s) (inp.hash .serverFinished))
+        hchs
+  refine ⟨sharedSecret, serverHello, encryptedExtensions, certificate, certVerify,
+    serverFinished, eq_of_beq hsize, fun inp h1 h2 h3 h4 h5 => ?_⟩
+  obtain ⟨a, b, c, d⟩ := hderiv inp h1 h2 h3 h4 h5
+  split at h
+  · cases h
+    exact ⟨⟨_, rfl, a⟩, ⟨_, rfl, b⟩, ⟨_, rfl, c⟩, congrArg some d⟩
+  · obtain ⟨ccsWire, _, h⟩ := except_bind_ok_inv h
+    cases h
+    exact ⟨⟨_, rfl, a⟩, ⟨_, rfl, b⟩, ⟨_, rfl, c⟩, congrArg some d⟩
+
+/-- **A KeyUpdate installs the RFC 8446 §7.2 successor epoch.** The new read
+epoch's secret is `HKDF-Expand-Label(old, "traffic upd", "", Hash.length)` —
+empty context, not a transcript hash — and its key, IV and sequence number are
+that secret's §7.3 record-protection state. -/
+theorem acceptKeyUpdate_keySchedule {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {message : Handshake.Message} {wire : ByteArray}
+    (h : acceptKeyUpdate state message = .ok (next, wire)) :
+    ∃ keys keys', state.readKeys? = some keys ∧ next.readKeys? = some keys' ∧
+      Record.TrafficKeys.DerivedFrom H keys'
+        (Spec.nextTrafficSecret H keys.secret) := by
+  unfold acceptKeyUpdate at h
+  obtain ⟨update, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨readKeys, hread, h⟩ := except_bind_ok_inv h
+  obtain ⟨updated, hupd, h⟩ := except_bind_ok_inv h
+  have hread' : state.readKeys? = some readKeys := by
+    unfold requireReadKeys at hread
+    cases hs : state.readKeys? with
+    | none => rw [hs] at hread; cases hread
+    | some k => rw [hs] at hread; cases hread; rfl
+  refine ⟨readKeys, updated, hread', ?_,
+    Record.TrafficKeys.update_spec hi (liftRecord_ok hupd)⟩
+  split at h
+  · cases h; rfl
+  · rw [sendKeyUpdateResponse_readKeys h]
 
 end Server
 end Tls
