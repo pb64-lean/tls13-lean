@@ -88,6 +88,10 @@ lean_assurance_test(
         "Tls.Handshake.parseExtensions_injective",
         "Tls.Handshake.decode_encoded",
         "Tls.Handshake.decode_frame",
+        "Tls.Handshake.decodeOne_canonical",
+        "Tls.Handshake.decode_canonical",
+        "Tls.Handshake.takeMessage?_canonical",
+        "Tls.Handshake.decodeOne_injective",
         "Tls.Handshake.takeMessage?_conservation",
         # State machines: the transitions that define what "connected" means.
         "Tls.Client.completeServerHandshake_verified",

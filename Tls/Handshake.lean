@@ -5068,17 +5068,20 @@ theorem parseClientHello_clientHelloBody_mem {msg : Message}
 
 /-- `checkClientPsk` accepts a ClientHello that offers `pre_shared_key` as its
 final extension and carries a non-empty `psk_key_exchange_modes` vector — the
-two conditions RFC 8446 section 4.2.11 attaches to a PSK offer. -/
-private theorem checkClientPsk_ok {front : List Extension}
+two conditions RFC 8446 section 4.2.11 attaches to a PSK offer.
+
+Phrased with `List.getLast?`, which is how "the PSK offer comes last" reads when
+the extension list is not already in `front ++ [psk]` form; `checkClientPsk_ok`
+below is the split-form corollary. -/
+private theorem checkClientPsk_ok_getLast {l : List Extension}
     {pskData pskModes : ByteArray}
-    (hdist : (front ++ [Extension.mk preSharedKeyExtension pskData]).Pairwise
-      (fun a b => (a.extensionType == b.extensionType) = false))
+    (hlast : l.getLast? = some (Extension.mk preSharedKeyExtension pskData))
+    (hdist : l.Pairwise (fun a b => (a.extensionType == b.extensionType) = false))
     (hmodes : Extension.mk pskKeyExchangeModesExtension
-        (ByteArray.empty.push (UInt8.ofNat pskModes.size) ++ pskModes) ∈
-      front ++ [Extension.mk preSharedKeyExtension pskData])
+        (ByteArray.empty.push (UInt8.ofNat pskModes.size) ++ pskModes) ∈ l)
     (hsz : pskModes.size < 2 ^ 8) (hne : pskModes.isEmpty = false) :
-    checkClientPsk (front ++ [Extension.mk preSharedKeyExtension pskData]).toArray =
-      .ok () := by
+    checkClientPsk l.toArray = .ok () := by
+  obtain ⟨front, rfl⟩ := List.getLast?_eq_some_iff.mp hlast
   have hpsk : findExtension?
       (front ++ [Extension.mk preSharedKeyExtension pskData]).toArray
       preSharedKeyExtension = some (Extension.mk preSharedKeyExtension pskData) :=
@@ -5099,6 +5102,21 @@ private theorem checkClientPsk_ok {front : List Extension}
       (context := "ClientHello psk_key_exchange_modes")
       (by rw [ByteArray.size_append]; rfl)]
   rw [if_neg (by rw [hne]; exact Bool.false_ne_true)]
+
+/-- The split-form corollary of `checkClientPsk_ok_getLast`, which is the shape
+`parseClientHello_clientHelloBody_psk` needs. -/
+private theorem checkClientPsk_ok {front : List Extension}
+    {pskData pskModes : ByteArray}
+    (hdist : (front ++ [Extension.mk preSharedKeyExtension pskData]).Pairwise
+      (fun a b => (a.extensionType == b.extensionType) = false))
+    (hmodes : Extension.mk pskKeyExchangeModesExtension
+        (ByteArray.empty.push (UInt8.ofNat pskModes.size) ++ pskModes) ∈
+      front ++ [Extension.mk preSharedKeyExtension pskData])
+    (hsz : pskModes.size < 2 ^ 8) (hne : pskModes.isEmpty = false) :
+    checkClientPsk (front ++ [Extension.mk preSharedKeyExtension pskData]).toArray =
+      .ok () :=
+  checkClientPsk_ok_getLast (List.getLast?_eq_some_iff.mpr ⟨front, rfl⟩) hdist
+    hmodes hsz hne
 
 /-- **ClientHello preservation with a PSK offer**: the same law for a
 ClientHello that resumes. RFC 8446 requires `pre_shared_key` to be the last
@@ -6101,6 +6119,202 @@ theorem encodeNewSessionTicket_decodeOne_parse {ticketLifetime ticketAgeAdd : UI
           ticketNonce := ticketNonce, ticket := ticket, extensions := #[],
           encoded := msg.encoded } :=
   ⟨encodeNewSessionTicket_decodeOne h rest, encodeNewSessionTicket_parse h⟩
+
+/-! ### Frame canonicity
+
+`decodeOne_frame` says the wire decoder accepts what `frame` produced. These are
+the converse: everything the decoder produces *is* a frame. Re-framing a decoded
+message's type and body reproduces the message, retained `encoded` bytes and
+all, so comparing two decoded messages' `msgType` and `body` is exactly as
+strong as comparing their wire bytes (`decodeOne_injective`) — the framing-layer
+analogue of `parseClientHello_canonical` and `parseClientHello_body_injective`.
+
+The missing ingredient was the converse of `uint24_recompose`: the three
+big-endian length bytes are recovered from the length they encode. -/
+
+private theorem uint24_value (b0 b1 b2 : UInt8) :
+    b0.toNat <<< 16 ||| b1.toNat <<< 8 ||| b2.toNat =
+      b0.toNat * 2 ^ 16 + b1.toNat * 2 ^ 8 + b2.toNat := by
+  have h2 := UInt8.toNat_lt b2
+  have h1 := UInt8.toNat_lt b1
+  have e1 : b0.toNat <<< 16 ||| b1.toNat <<< 8 =
+      (b0.toNat * 2 ^ 8 + b1.toNat) <<< 8 := by
+    rw [← Nat.shiftLeft_add_eq_or_of_lt (i := 16) (by rw [Nat.shiftLeft_eq]; omega),
+      Nat.shiftLeft_eq, Nat.shiftLeft_eq, Nat.shiftLeft_eq]
+    omega
+  rw [e1, ← Nat.shiftLeft_add_eq_or_of_lt (i := 8) (by omega), Nat.shiftLeft_eq]
+  omega
+
+private theorem uint24_lt (b0 b1 b2 : UInt8) :
+    (b0.toNat <<< 16 ||| b1.toNat <<< 8 ||| b2.toNat) < 2 ^ 24 := by
+  have h0 := UInt8.toNat_lt b0
+  have h1 := UInt8.toNat_lt b1
+  have h2 := UInt8.toNat_lt b2
+  rw [uint24_value]; omega
+
+private theorem uint24_decompose (b0 b1 b2 : UInt8) :
+    length24Bytes (b0.toNat <<< 16 ||| b1.toNat <<< 8 ||| b2.toNat) =
+      ((ByteArray.empty.push b0).push b1).push b2 := by
+  have h0 := UInt8.toNat_lt b0
+  have h1 := UInt8.toNat_lt b1
+  have h2 := UInt8.toNat_lt b2
+  unfold length24Bytes
+  rw [show UInt8.ofNat ((b0.toNat <<< 16 ||| b1.toNat <<< 8 ||| b2.toNat) >>> 16)
+        = b0 from by
+      rw [uint24_value, Nat.shiftRight_eq_div_pow,
+        show (b0.toNat * 2 ^ 16 + b1.toNat * 2 ^ 8 + b2.toNat) / 2 ^ 16
+          = b0.toNat from by omega, UInt8.ofNat_toNat],
+    show UInt8.ofNat ((b0.toNat <<< 16 ||| b1.toNat <<< 8 ||| b2.toNat) >>> 8)
+        = b1 from by
+      apply UInt8.toNat_inj.mp
+      rw [uint24_value, Nat.shiftRight_eq_div_pow, UInt8.toNat_ofNat']
+      omega,
+    show UInt8.ofNat (b0.toNat <<< 16 ||| b1.toNat <<< 8 ||| b2.toNat) = b2 from by
+      apply UInt8.toNat_inj.mp
+      rw [uint24_value, UInt8.toNat_ofNat']
+      omega]
+
+private theorem extract_three {W : ByteArray} {off e : Nat} (he : e = off + 3)
+    (h : off + 3 ≤ W.size) :
+    W.extract off e =
+      ((ByteArray.empty.push (W.get! off)).push (W.get! (off + 1))).push
+        (W.get! (off + 2)) := by
+  subst he
+  apply ByteArray.ext_getElem
+  · rw [ByteArray.size_extract, Nat.min_eq_left h]
+    show off + 3 - off = 3
+    omega
+  · intro i hi hi'
+    rw [ByteArray.size_extract, Nat.min_eq_left h] at hi
+    rw [ByteArray.getElem_extract]
+    match i, hi with
+    | 0, _ =>
+      rw [show (((ByteArray.empty.push (W.get! off)).push (W.get! (off + 1))).push
+          (W.get! (off + 2)))[0] = W.get! off from rfl,
+        get!_eq_getElem (show off < W.size by omega)]
+      simp
+    | 1, _ =>
+      rw [show (((ByteArray.empty.push (W.get! off)).push (W.get! (off + 1))).push
+          (W.get! (off + 2)))[1] = W.get! (off + 1) from rfl,
+        get!_eq_getElem (show off + 1 < W.size by omega)]
+    | 2, _ =>
+      rw [show (((ByteArray.empty.push (W.get! off)).push (W.get! (off + 1))).push
+          (W.get! (off + 2)))[2] = W.get! (off + 2) from rfl,
+        get!_eq_getElem (show off + 2 < W.size by omega)]
+
+private theorem length24Bytes_extract {W : ByteArray} {off : Nat}
+    (h : off + 3 ≤ W.size) :
+    length24Bytes ((W.get! off).toNat <<< 16 ||| (W.get! (off + 1)).toNat <<< 8 |||
+      (W.get! (off + 2)).toNat) = W.extract off (off + 3) := by
+  rw [uint24_decompose, extract_three rfl h]
+
+private theorem encodeLength24_eval {n : Nat} (h : n < 2 ^ 24) :
+    encodeLength24 n = .ok (length24Bytes n) := by
+  unfold encodeLength24
+  rw [if_neg (show ¬(n > 0xffffff) by omega)]
+  rfl
+
+private theorem length24Bytes_extract_one {W : ByteArray} (h : 4 ≤ W.size) :
+    length24Bytes ((W.get! 1).toNat <<< 16 ||| (W.get! 2).toNat <<< 8 |||
+      (W.get! 3).toNat) = W.extract 1 4 :=
+  length24Bytes_extract (W := W) (off := 1) (by omega)
+
+private theorem frame_of_header {W : ByteArray} {n : Nat}
+    (hn : (W.get! 1).toNat <<< 16 ||| (W.get! 2).toNat <<< 8 ||| (W.get! 3).toNat = n)
+    (hbnd : 4 + n ≤ W.size) :
+    frame (W.get! 0) (W.extract 4 (4 + n)) =
+      .ok { msgType := W.get! 0, body := W.extract 4 (4 + n),
+            encoded := W.extract 0 (4 + n) } := by
+  have hlt : n < 2 ^ 24 := hn ▸ uint24_lt (W.get! 1) (W.get! 2) (W.get! 3)
+  have hsz : (W.extract 4 (4 + n)).size = n := by
+    rw [ByteArray.size_extract, Nat.min_eq_left (by omega)]
+    omega
+  have henc : ByteArray.empty.push (W.get! 0) ++ length24Bytes n ++
+      W.extract 4 (4 + n) = W.extract 0 (4 + n) := by
+    rw [extract_split (W := W) (i := 0) (j := 4) (k := 4 + n) (by omega) (by omega),
+      extract_split (W := W) (i := 0) (j := 1) (k := 4) (by omega) (by omega),
+      show W.extract 0 1 = ByteArray.empty.push (W.get! 0) from
+        extract_one (by omega),
+      ← hn, length24Bytes_extract_one (by omega)]
+  unfold frame
+  rw [hsz, encodeLength24_eval hlt]
+  show Except.ok (Message.mk (W.get! 0) (W.extract 4 (4 + n))
+    (ByteArray.empty.push (W.get! 0) ++ length24Bytes n ++
+      W.extract 4 (4 + n))) = _
+  rw [henc]
+
+/-- **Frame canonicity**: every message the wire decoder produces *is* a frame.
+Re-framing a decoded message's type and body reproduces the message, retained
+`encoded` bytes and all — the converse of `decodeOne_frame`, and the
+framing-layer analogue of `parseClientHello_canonical`. -/
+theorem decodeOne_canonical {bytes : ByteArray} {msg : Message} {rest : ByteArray}
+    (h : decodeOne bytes = .ok (msg, rest)) :
+    frame msg.msgType msg.body = .ok msg := by
+  unfold decodeOne at h
+  split at h
+  · cases h
+  · rename_i msgType r0 h8
+    split at h
+    · cases h
+    · rename_i len r1 h24
+      split at h
+      · cases h
+      · rename_i body r2 htake
+        cases h
+        obtain ⟨-, ho0, hle0⟩ := readUInt8_ok h8
+        have hb1 : (1 : Nat) ≤ bytes.size := by
+          have h' : r0.offset ≤ bytes.size := hle0
+          omega
+        rw [show ({ bytes := bytes } : Reader) = Reader.mk bytes 0 from rfl,
+          readUInt8_eval (show 0 < bytes.size by omega)] at h8
+        simp only [Except.ok.injEq, Prod.mk.injEq] at h8
+        obtain ⟨rfl, rfl⟩ := h8
+        obtain ⟨-, ho1, hle1⟩ := readUInt24_ok h24
+        have hb4 : (4 : Nat) ≤ bytes.size := by
+          have h' : r1.offset ≤ bytes.size := hle1
+          omega
+        rw [readUInt24_eval (off := 0 + 1) (show 0 + 1 + 3 ≤ bytes.size by omega)] at h24
+        simp only [Except.ok.injEq, Prod.mk.injEq] at h24
+        obtain ⟨rfl, rfl⟩ := h24
+        obtain ⟨rfl, rfl, hbnd⟩ := take_extract htake
+        exact frame_of_header (W := bytes) rfl hbnd
+
+
+theorem decode_canonical {bytes : ByteArray} {msg : Message}
+    (h : decode bytes = .ok msg) : frame msg.msgType msg.body = .ok msg := by
+  unfold decode at h
+  split at h
+  · cases h
+  · rename_i m rest hd
+    obtain ⟨-, h⟩ | ⟨-, h⟩ := ite_ok_cases h
+    · cases h
+      exact decodeOne_canonical hd
+    · cases h
+
+theorem takeMessage?_canonical {buffered rest : ByteArray} {msg : Message}
+    (h : takeMessage? buffered = .ok (some (msg, rest))) :
+    frame msg.msgType msg.body = .ok msg := by
+  unfold takeMessage? at h
+  split at h
+  · cases h
+  · split at h
+    · cases h
+    · split at h
+      · cases h
+      · rename_i message hdec
+        simp only [Except.ok.injEq, Option.some.injEq, Prod.mk.injEq] at h
+        obtain ⟨rfl, -⟩ := h
+        exact decode_canonical hdec
+
+theorem decodeOne_injective {b₁ b₂ : ByteArray} {m₁ m₂ : Message}
+    {r₁ r₂ : ByteArray} (h₁ : decodeOne b₁ = .ok (m₁, r₁))
+    (h₂ : decodeOne b₂ = .ok (m₂, r₂)) (hty : m₁.msgType = m₂.msgType)
+    (hbody : m₁.body = m₂.body) : m₁ = m₂ := by
+  have e₁ := decodeOne_canonical h₁
+  have e₂ := decodeOne_canonical h₂
+  rw [hty, hbody] at e₁
+  rw [e₂] at e₁
+  exact (Except.ok.inj e₁).symm
 
 end Handshake
 end Tls

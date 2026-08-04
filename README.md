@@ -116,6 +116,13 @@ Four Bazel packages:
   as well — a `pre_shared_key` offer as the final extension with a non-empty
   `psk_key_exchange_modes` is accepted and retained verbatim (PSK is still not
   *negotiated*; see the scope list below).
+  Framing is canonical in both directions: `decodeOne_frame` says the decoder
+  accepts what `frame` produced, and `decodeOne_canonical` says the converse —
+  everything the decoder produces *is* a frame, so re-framing a decoded
+  message's type and body reproduces the message, retained `encoded` bytes and
+  all. Comparing two decoded messages' `msgType` and `body` is therefore exactly
+  as strong as comparing their wire bytes (`decodeOne_injective`), the
+  framing-layer analogue of `parseClientHello_body_injective`.
   `Tls.Handshake.takeMessage?` — the reassembly step both state machines run on
   the bytes the record layer hands up — is proved monotone and exact: every
   proper prefix of a framed message yields nothing rather than an error, the
@@ -342,7 +349,7 @@ test binary is built, so a violation is a red target, not a stale README:
 | --- | --- |
 | `//HaclStar:haclstar_assurance` | The trusted C boundary: the 16 `@[extern] opaque` bindings are accounted for and no proof hole exists in the FFI package |
 | `//TLS13:tls13_assurance` | 10 principal theorems — DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies` |
-| `//Tls:tls_assurance` | 42 principal theorems — nonce non-reuse (`WriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, nonce and sequence injectivity), record conservation and seal/open inversion, ClientHello canonicity and body injectivity, and the state-machine transition and invariant laws (including both directions of the connected-only application-data rule) |
+| `//Tls:tls_assurance` | 46 principal theorems — nonce non-reuse (`WriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, nonce and sequence injectivity), record conservation and seal/open inversion, ClientHello canonicity and body injectivity, and the state-machine transition and invariant laws (including both directions of the connected-only application-data rule) |
 
 Each target also scans every constant of the whole first-party closure
 (`HaclStar`, `TLS13`, `Tls` — 26 modules, ~4650 constants): nothing may reach
@@ -434,10 +441,10 @@ build because it compiles and links the HACL\* C shim.
     corollary (`Certificate.decode_tbs_encoded`, `checkIssuer_verifies`:
     the bytes the chain validator hands to signature verification are
     exactly the TBS slice parsed out of the certificate) and the handshake
-    wire-codec laws (`Tls.Handshake`: framing roundtrips with residual,
-    reassembly independence, per-message parse inversion, GREASE-tolerant
-    extension and `uint16`-vector roundtrips, HelloRetryRequest
-    discrimination) and the state-machine layer (`Tls.Client.Laws`,
+    wire-codec laws (`Tls.Handshake`: framing roundtrips with residual and
+    frame canonicity in the converse direction, reassembly independence,
+    per-message parse inversion, GREASE-tolerant extension and `uint16`-vector
+    roundtrips, HelloRetryRequest discrimination) and the state-machine layer (`Tls.Client.Laws`,
     `Tls.Server.Laws`: nonce non-reuse across a whole run of either engine,
     scoped by traffic-secret epoch and assuming only that the epochs' secrets
     differ; the `State.WellFormed` invariant established by `start` and
