@@ -12,12 +12,28 @@ supplies the machine-checked C crypto; Lean supplies explicit protocol state.
 No system crypto library (OpenSSL etc.) is introduced; HACL\* is fetched at a
 pinned commit and its portable C has no runtime dependency.
 
-**Verification status, stated precisely:** the machine-checked component is
-the imported HACL\* C code. The Lean protocol code in this repository is
-implemented and tested — known-answer vectors for every primitive, wire-level
-handshake tests, X.509 corpus tests, and an in-repo client↔server handshake —
-but it carries no formal proofs today, and no refinement theorem against
-RFC 8446 is claimed. Protocol-level proofs are a direction, not a result.
+**Verification status, stated precisely.** Two distinct things are
+machine-checked, and it matters which is which:
+
+- The imported **HACL\* C primitives** carry externally machine-verified
+  correctness and constant-time proofs. This repository does not re-prove
+  them; it binds them across an explicit FFI boundary and trusts them.
+- The **Lean protocol code** now carries kernel-checked laws about the
+  implementation itself — the record framer (byte conservation,
+  fragmentation independence, sequence/nonce injectivity, seal/open
+  inversion parametric over the opaque AEAD), the handshake codecs (wire
+  roundtrips with explicit residual, body inversion, GREASE-tolerant
+  extension preservation, HelloRetryRequest discrimination, no partial
+  frame ever accepted), and the DER decoder (exact-slice retention carried
+  through to the bytes certificate signatures are verified over). These are
+  proofs about the executable definitions, not a parallel model.
+
+What is **not** claimed: no refinement theorem against RFC 8446, no
+security proof of the handshake or state machines, no timing analysis of
+Lean control code, and nothing about the C shims beyond their length
+preconditions. The state-machine invariants (transcript consistency,
+key-schedule correctness, nonce non-reuse across a connection's lifetime)
+are a direction, not yet a result.
 
 ## Layout
 
