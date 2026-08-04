@@ -314,6 +314,49 @@ def validate
   (buildPath now maximumDepth maximumIssuerAttempts
     leaf leaf presented trustStore #[] maximumIssuerAttempts).result
 
+/-!
+## The signed-bytes corollary
+
+The message argument `checkIssuer` passes to `Signature.verifyX509` is,
+definitionally, `child.tbsCertificate.encoded` — which
+`Certificate.decode_tbs_encoded` proves is the byte-exact slice of the input
+DER that the TBS parser consumed. The theorem below makes the connection
+checkable from the outside: issuer vetting can only succeed if the signature
+verified over exactly those retained bytes. -/
+
+/-- Peel one `Except` bind off a successful computation. -/
+private theorem bind_ok_ex {ε α β : Type} {x : Except ε α}
+    {f : α → Except ε β} {b : β} (h : (x >>= f) = .ok b) :
+    ∃ a, x = .ok a ∧ f a = .ok b := by
+  cases x with
+  | error e => cases h
+  | ok a => exact ⟨a, rfl, h⟩
+
+/-- Case on the condition of a successful branching computation. -/
+private theorem ite_ok_cases {ε β : Type} {c : Prop} [Decidable c]
+    {t e : Except ε β} {b : β} (h : (if c then t else e) = .ok b) :
+    (c ∧ t = .ok b) ∨ (¬c ∧ e = .ok b) := by
+  split at h
+  · exact .inl ⟨‹_›, h⟩
+  · exact .inr ⟨‹_›, h⟩
+
+/-- Successful issuer vetting requires the cryptographic signature to have
+verified over exactly the retained `TBSCertificate.encoded` bytes of the
+child certificate. (`private` only because the module system does not allow a
+public statement about the private `checkIssuer`; it is still kernel-checked
+on every build.) -/
+private theorem checkIssuer_verifies {path : Array Certificate}
+    {issuer child : Certificate}
+    (h : checkIssuer path issuer child = .ok ()) :
+    Signature.verifyX509 child.signatureAlgorithm
+      issuer.tbsCertificate.subjectPublicKeyInfo
+      child.tbsCertificate.encoded child.signature = true := by
+  unfold checkIssuer at h
+  obtain ⟨hc, -⟩ | ⟨hc, h⟩ := ite_ok_cases h
+  · exact hc
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+
 end Chain
 end X509
 end TLS13

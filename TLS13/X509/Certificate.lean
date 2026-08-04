@@ -645,43 +645,43 @@ private def parseUniqueID (value : DER.TLV) (number : Nat) (context : String) :
   value.requireTag (contextTag number false) context
   parseBitStringContents value.contents context
 
+/-- Read the explicit `[0]` version field, when present, along with the TLV
+holding the serial number and the cursor after both. The do-chain in
+`parseTBSCertificate` is kept linear (no `mut`, branches factored into
+helpers) so `parseTBSCertificate_encoded` below can peel it one bind at a
+time. -/
+private def readVersionAndSerial (first : DER.TLV) (reader : DER.Reader) :
+    Except String (Version × DER.TLV × DER.Reader) := do
+  if first.tag == contextTag 0 true then
+    let version ← parseVersion first
+    let (serial, next) ← reader.readTLV
+    pure (version, serial, next)
+  else
+    pure (.v1, first, reader)
+
 private def parseTBSCertificate (value : DER.TLV) : Except String TBSCertificate := do
   value.requireTag DER.Tag.sequence "TBSCertificate"
   let (first, afterFirst) ← value.reader.readTLV
-  let mut reader := afterFirst
-  let mut current := first
-  let version ←
-    if first.tag == contextTag 0 true then
-      let version ← parseVersion first
-      let (serial, next) ← reader.readTLV
-      current := serial
-      reader := next
-      pure version
-    else
-      pure .v1
+  let (version, current, afterSerial) ← readVersionAndSerial first afterFirst
   let serialNumber ←
     parseNonnegativeInteger current "CertificateSerialNumber" 20
   if serialNumber == 0 then
     throw "CertificateSerialNumber must be positive"
 
-  let (signatureValue, next) ← reader.readTLV
+  let (signatureValue, afterSignature) ← afterSerial.readTLV
   let signatureAlgorithm ← parseAlgorithmIdentifier signatureValue
-  reader := next
-  let (issuerValue, next) ← reader.readTLV
+  let (issuerValue, afterIssuer) ← afterSignature.readTLV
   let issuer ← parseName issuerValue
   if issuer.rdns.isEmpty then
     throw "certificate issuer Name must not be empty"
-  reader := next
-  let (validityValue, next) ← reader.readTLV
+  let (validityValue, afterValidity) ← afterIssuer.readTLV
   let validity ← parseValidity validityValue
-  reader := next
-  let (subjectValue, next) ← reader.readTLV
+  let (subjectValue, afterSubject) ← afterValidity.readTLV
   let subject ← parseName subjectValue
-  reader := next
-  let (spkiValue, next) ← reader.readTLV
+  let (spkiValue, afterSPKI) ← afterSubject.readTLV
   let subjectPublicKeyInfo ← parseSubjectPublicKeyInfo spkiValue
-  reader := next
 
+  let mut reader := afterSPKI
   let mut issuerUniqueID : Option BitString := none
   let mut subjectUniqueID : Option BitString := none
   let mut extensions : Extensions := {}
@@ -762,6 +762,166 @@ def decode (bytes : ByteArray) : Except String Certificate := do
 def decodePEM (text : String) : Except String (Array Certificate) := do
   let certificates ← PEM.decodeCertificates text
   certificates.mapM decode
+
+/-!
+## The signed-bytes laws
+
+`TBSCertificate.encoded` is what `Chain.checkIssuer` passes to
+`Signature.verifyX509`. The theorems below pin down what that field is: the
+byte-exact slice of the input certificate that the TBS parser consumed —
+never a reconstruction. -/
+
+/-- Peel one `Except` bind off a successful computation. -/
+private theorem bind_ok_ex {α β : Type} {x : Except String α}
+    {f : α → Except String β} {b : β} (h : (x >>= f) = .ok b) :
+    ∃ a, x = .ok a ∧ f a = .ok b := by
+  cases x with
+  | error e => cases h
+  | ok a => exact ⟨a, rfl, h⟩
+
+/-- Extract the payload of a successful `pure`. -/
+private theorem pure_eq_ok {α : Type} {a b : α}
+    (h : (pure a : Except String α) = .ok b) : a = b := by
+  have h' : Except.ok a = Except.ok b := h
+  injection h'
+
+/-- Case on the condition of a successful branching computation. Applying
+this (and `bind_ok_ex`) by unification normalizes the head of the elaborated
+do-chain without rewriting the full term. -/
+private theorem ite_ok_cases {β : Type} {c : Prop} [Decidable c]
+    {t e : Except String β} {b : β} (h : (if c then t else e) = .ok b) :
+    (c ∧ t = .ok b) ∨ (¬c ∧ e = .ok b) := by
+  split at h
+  · exact .inl ⟨‹_›, h⟩
+  · exact .inr ⟨‹_›, h⟩
+
+/-- Every success of `parseTBSCertificate` copies `value.encoded` into the
+result unchanged. -/
+private theorem parseTBSCertificate_encoded {value : DER.TLV}
+    {tbs : TBSCertificate} (h : parseTBSCertificate value = .ok tbs) :
+    tbs.encoded = value.encoded := by
+  unfold parseTBSCertificate at h
+  obtain ⟨_, _, h⟩ := bind_ok_ex h
+  obtain ⟨p1, _, h⟩ := bind_ok_ex h
+  obtain ⟨first, afterFirst⟩ := p1
+  obtain ⟨p2, _, h⟩ := bind_ok_ex h
+  obtain ⟨version, current, afterSerial⟩ := p2
+  obtain ⟨serialNumber, _, h⟩ := bind_ok_ex h
+  obtain ⟨hc, h⟩ | ⟨hc, h⟩ := ite_ok_cases h
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+  obtain ⟨_, _, h⟩ := bind_ok_ex h
+  obtain ⟨p3, _, h⟩ := bind_ok_ex h
+  obtain ⟨signatureValue, afterSignature⟩ := p3
+  obtain ⟨signatureAlgorithm, _, h⟩ := bind_ok_ex h
+  obtain ⟨p4, _, h⟩ := bind_ok_ex h
+  obtain ⟨issuerValue, afterIssuer⟩ := p4
+  obtain ⟨issuer, _, h⟩ := bind_ok_ex h
+  obtain ⟨hc2, h⟩ | ⟨hc2, h⟩ := ite_ok_cases h
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+  obtain ⟨_, _, h⟩ := bind_ok_ex h
+  obtain ⟨p5, _, h⟩ := bind_ok_ex h
+  obtain ⟨validityValue, afterValidity⟩ := p5
+  obtain ⟨validity, _, h⟩ := bind_ok_ex h
+  obtain ⟨p6, _, h⟩ := bind_ok_ex h
+  obtain ⟨subjectValue, afterSubject⟩ := p6
+  obtain ⟨subject, _, h⟩ := bind_ok_ex h
+  obtain ⟨p7, _, h⟩ := bind_ok_ex h
+  obtain ⟨spkiValue, afterSPKI⟩ := p7
+  obtain ⟨subjectPublicKeyInfo, _, h⟩ := bind_ok_ex h
+  obtain ⟨r, _, h⟩ := bind_ok_ex h
+  obtain ⟨extensions, issuerUniqueID, lastOptionalTag, reader,
+    subjectUniqueID⟩ := r
+  obtain ⟨hc3, h⟩ | ⟨hc3, h⟩ := ite_ok_cases h
+  · cases hsan : extensions.subjectAltName with
+    | some san =>
+      rw [hsan] at h
+      obtain ⟨hc4, h⟩ | ⟨hc4, h⟩ := ite_ok_cases h
+      · obtain ⟨_, _, h⟩ := bind_ok_ex h
+        rw [← pure_eq_ok h]
+      · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+        cases hu
+    | none =>
+      rw [hsan] at h
+      obtain ⟨_, hu, _⟩ := bind_ok_ex h
+      cases hu
+  · obtain ⟨_, _, h⟩ := bind_ok_ex h
+    rw [← pure_eq_ok h]
+
+/-- Dissect a successful `Certificate.decode` down to the cursor step that
+framed the TBSCertificate. -/
+private theorem decode_spec {bytes : ByteArray} {cert : Certificate}
+    (h : decode bytes = .ok cert) :
+    ∃ (certificateValue tbsValue : DER.TLV) (reader : DER.Reader),
+      DER.decode bytes = .ok certificateValue ∧
+      certificateValue.reader.readTLV = .ok (tbsValue, reader) ∧
+      cert.encoded = certificateValue.encoded ∧
+      cert.tbsCertificate.encoded = tbsValue.encoded := by
+  unfold decode at h
+  obtain ⟨certificateValue, hdec, h⟩ := bind_ok_ex h
+  obtain ⟨_, _, h⟩ := bind_ok_ex h
+  obtain ⟨ptbs, hread, h⟩ := bind_ok_ex h
+  obtain ⟨tbsValue, reader1⟩ := ptbs
+  obtain ⟨tbsCertificate, htbs, h⟩ := bind_ok_ex h
+  obtain ⟨palg, _, h⟩ := bind_ok_ex h
+  obtain ⟨algorithmValue, reader2⟩ := palg
+  obtain ⟨signatureAlgorithm, _, h⟩ := bind_ok_ex h
+  obtain ⟨psig, _, h⟩ := bind_ok_ex h
+  obtain ⟨signatureValue, reader3⟩ := psig
+  obtain ⟨_, _, h⟩ := bind_ok_ex h
+  obtain ⟨hcalg, h⟩ | ⟨hcalg, h⟩ := ite_ok_cases h
+  · obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨_, _, h⟩ := bind_ok_ex h
+    obtain ⟨signatureBits, _, h⟩ := bind_ok_ex h
+    obtain ⟨signature, _, h⟩ := bind_ok_ex h
+    obtain ⟨hemp, h⟩ | ⟨hemp, h⟩ := ite_ok_cases h
+    · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+      cases hu
+    · obtain ⟨_, _, h⟩ := bind_ok_ex h
+      have hrec := pure_eq_ok h
+      refine ⟨certificateValue, tbsValue, reader1, hdec, hread, ?_, ?_⟩
+      · rw [← hrec]
+      · rw [← hrec]
+        exact parseTBSCertificate_encoded htbs
+  · obtain ⟨_, hu, _⟩ := bind_ok_ex h
+    cases hu
+
+/-- `Certificate.decode` retains its exact input in `Certificate.encoded`. -/
+theorem decode_encoded {bytes : ByteArray} {cert : Certificate}
+    (h : decode bytes = .ok cert) : cert.encoded = bytes := by
+  obtain ⟨certificateValue, tbsValue, reader, hdec, hread, henc, htbs⟩ :=
+    decode_spec h
+  rw [henc, DER.decode_encoded hdec]
+
+/-- **The signed-bytes theorem**: `TBSCertificate.encoded` — the exact bytes
+the chain validator hands to `Signature.verifyX509` — is the contiguous slice
+of the input certificate DER that the TBS parser consumed, and that slice is
+itself one complete DER value that re-decodes to the same framing. Nothing
+about it is reconstructed. -/
+theorem decode_tbs_encoded {bytes : ByteArray} {cert : Certificate}
+    (h : decode bytes = .ok cert) :
+    (∃ start stop, start ≤ stop ∧ stop ≤ bytes.size ∧
+      cert.tbsCertificate.encoded = bytes.extract start stop) ∧
+    ∃ tlv, DER.decode cert.tbsCertificate.encoded = .ok tlv ∧
+      tlv.encoded = cert.tbsCertificate.encoded := by
+  obtain ⟨certificateValue, tbsValue, reader, hdec, hread, henc, htbs⟩ :=
+    decode_spec h
+  have hcont := DER.decode_contents hdec
+  have hsz := DER.decode_size hdec
+  have hslice := (DER.Reader.readTLV_spec hread).2.2.2.2.2.2.1
+  rw [DER.TLV.reader_bytes, DER.TLV.reader_offset] at hslice
+  have hbound := (DER.Reader.readTLV_spec hread).2.2.2.1
+  rw [DER.TLV.reader_bytes] at hbound
+  constructor
+  · refine ⟨certificateValue.headerSize + 0,
+      min (certificateValue.headerSize + reader.offset) bytes.size,
+      by omega, by omega, ?_⟩
+    rw [htbs, hslice, hcont, ByteArray.extract_extract]
+  · refine ⟨{ tbsValue with offset := 0 }, ?_, ?_⟩
+    · rw [htbs]
+      exact DER.readTLV_encoded_decode hread
+    · rw [htbs]
 
 end Certificate
 end X509

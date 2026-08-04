@@ -256,6 +256,15 @@ def reader (tlv : TLV) : Reader :=
     origin := tlv.offset + tlv.headerSize
   }
 
+/-- `TLV.reader` cursors over exactly the retained contents. Exported as
+equations because other modules cannot unfold `reader` definitionally. -/
+theorem reader_bytes (tlv : TLV) : tlv.reader.bytes = tlv.contents := by rfl
+
+theorem reader_offset (tlv : TLV) : tlv.reader.offset = 0 := by rfl
+
+theorem reader_origin (tlv : TLV) :
+    tlv.reader.origin = tlv.offset + tlv.headerSize := by rfl
+
 /-- Require an exact identifier, useful for schema-directed X.509 parsing. -/
 def requireTag (tlv : TLV) (expected : Tag) (context : String := "DER value") :
     Except String Unit := do
@@ -1152,6 +1161,31 @@ theorem decode_size {bytes : ByteArray} {tlv : TLV}
   simp only [Except.ok.injEq] at h
   subst h
   rw [← henc, Reader.readTLV_sizes heq]
+
+/-- The root decoder's `contents` are everything after the header. -/
+theorem decode_contents {bytes : ByteArray} {tlv : TLV}
+    (h : decode bytes = .ok tlv) :
+    tlv.contents = bytes.extract tlv.headerSize bytes.size := by
+  unfold decode at h
+  split at h
+  · cases h
+  rename_i tlv₀ rest heq
+  split at h
+  · cases h
+  rename_i hend
+  simp only [Except.ok.injEq] at h
+  subst h
+  obtain ⟨hb, hg, h1, h2, h3, h4, h5, h6⟩ := Reader.readTLV_spec heq
+  have hoff := Reader.requireEnd_eq_ok hend
+  have hsz : rest.offset = bytes.size := by
+    rw [hoff]
+    show rest.bytes.size = bytes.size
+    rw [hb]
+    rfl
+  rw [h6]
+  show bytes.extract (0 + tlv₀.headerSize) rest.offset =
+    bytes.extract tlv₀.headerSize bytes.size
+  rw [Nat.zero_add, hsz]
 
 /-- **Re-decode identity**: the slice retained by any successful `readTLV` —
 even one taken mid-stream or from nested contents — is itself one complete
