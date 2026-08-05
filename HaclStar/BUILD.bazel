@@ -1,6 +1,7 @@
 package(default_visibility = ["//visibility:public"])
 
 load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_library")
+load("//:assurance.bzl", "TLS13_LEAN_ALLOWED_AXIOMS")
 load("//:lean_runtime_headers.bzl", "lean_runtime_headers")
 
 lean_runtime_headers(
@@ -41,15 +42,65 @@ lean_library(
     deps = [":hacl_shim"],
 )
 
-# The trusted C boundary, audited. These modules are the *only* place in the
-# repo where Lean constants are backed by native code, and this target is what
-# says so mechanically: every `@[extern] opaque` here is accepted, and the
-# sibling audits (//TLS13:tls13_assurance, //Tls:tls_assurance) scan the same
-# HaclStar modules with the same allowance, so an `@[extern]` appearing
-# anywhere else in the closure is a build failure. No principal theorems: there
+# The trusted C boundary, audited exactly. These modules are the *only* place
+# in the repo where Lean constants are backed by native code, and this target
+# is the sole auditor of the `HaclStar` prefix: the sixteen `@[extern] opaque`
+# FFI imports are pinned by name and symbol, so an extern or opaque appearing,
+# vanishing, or changing its C symbol is a build failure. The sibling audits
+# (//TLS13:tls13_assurance, //Tls:tls_assurance) declare `HaclStar` as
+# unaudited-there because this target owns it; together the three targets
+# partition the whole first-party import closure. No principal theorems: there
 # is nothing to prove about an opaque FFI import — the point is the boundary.
 lean_assurance_test(
     name = "haclstar_assurance",
-    allowed_extern_modules = ["HaclStar"],
+    allowed_axioms = TLS13_LEAN_ALLOWED_AXIOMS,
+    module_prefixes = ["HaclStar"],
+    policy_mode = "exact",
+    principal_theorems = [],
+    principal_theorem_types = {},
+    expected_unsafe_constants = [],
+    expected_partial_definitions = [],
+    expected_opaque_constants = [
+        "HaclStar.ChaCha20Poly1305.encrypt",
+        "HaclStar.ChaCha20Poly1305.decrypt",
+        "HaclStar.X25519.ecdh",
+        "HaclStar.X25519.base",
+        "HaclStar.Hkdf.expandSha256",
+        "HaclStar.Hkdf.extractSha256",
+        "HaclStar.hmacSha256",
+        "HaclStar.P256.ecdh",
+        "HaclStar.P256.publicKey",
+        "HaclStar.sha256",
+        "HaclStar.sha512",
+        "HaclStar.sha384",
+        "HaclStar.Signature.ecdsaP256Sha256",
+        "HaclStar.Signature.ed25519Sign",
+        "HaclStar.Signature.ecdsaP256Sha256Sign",
+        "HaclStar.Signature.ed25519",
+    ],
+    expected_implemented_by = {},
+    expected_extern_declarations = {
+        "HaclStar.ChaCha20Poly1305.encrypt": "all:standard:tls13_hacl_chachapoly_encrypt",
+        "HaclStar.ChaCha20Poly1305.decrypt": "all:standard:tls13_hacl_chachapoly_decrypt",
+        "HaclStar.X25519.ecdh": "all:standard:tls13_hacl_x25519_ecdh",
+        "HaclStar.X25519.base": "all:standard:tls13_hacl_x25519_base",
+        "HaclStar.Hkdf.expandSha256": "all:standard:tls13_hacl_hkdf_expand_sha256",
+        "HaclStar.Hkdf.extractSha256": "all:standard:tls13_hacl_hkdf_extract_sha256",
+        "HaclStar.hmacSha256": "all:standard:tls13_hacl_hmac_sha256",
+        "HaclStar.P256.ecdh": "all:standard:tls13_hacl_p256_ecdh",
+        "HaclStar.P256.publicKey": "all:standard:tls13_hacl_p256_public_key",
+        "HaclStar.sha256": "all:standard:tls13_hacl_sha256",
+        "HaclStar.sha512": "all:standard:tls13_hacl_sha512",
+        "HaclStar.sha384": "all:standard:tls13_hacl_sha384",
+        "HaclStar.Signature.ecdsaP256Sha256": "all:standard:tls13_hacl_p256_ecdsa_sha256_verify",
+        "HaclStar.Signature.ed25519Sign": "all:standard:tls13_hacl_ed25519_sign",
+        "HaclStar.Signature.ecdsaP256Sha256Sign": "all:standard:tls13_hacl_p256_ecdsa_sha256_sign",
+        "HaclStar.Signature.ed25519": "all:standard:tls13_hacl_ed25519_verify",
+    },
+    expected_native_targets = [
+        "//HaclStar:hacl_shim",
+        "//HaclStar:lean_runtime_headers",
+        "@+_repo_rules+hacl//:hacl",
+    ],
     deps = [":haclstar"],
 )

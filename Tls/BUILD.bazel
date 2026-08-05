@@ -1,6 +1,8 @@
 package(default_visibility = ["//visibility:public"])
 
 load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_library")
+load("//:assurance.bzl", "TLS13_LEAN_ALLOWED_AXIOMS")
+load("//:assurance_types.bzl", "TLS_PRINCIPAL_TYPES")
 
 # Reusable sans-I/O TLS 1.3 protocol core (record layer, handshake codecs, and
 # client + server state machines) over the verified HACL* crypto and X.509 in
@@ -23,11 +25,15 @@ lean_library(
 )
 
 # Compile-time audit of the protocol core: the headline theorems must exist, be
-# theorems, and close over nothing beyond the three standard axioms; no constant
-# anywhere in the scanned closure may reach `sorryAx`; and no `@[extern]` may
-# appear outside the HaclStar FFI package. `module_prefixes` covers the whole
-# first-party closure (Tls, TLS13, HaclStar) so that last check is a statement
-# about the repository, not just this library.
+# theorems, match their statements pinned in //:assurance_types.bzl, and close
+# over nothing beyond the three standard axioms in //:assurance.bzl; no
+# constant anywhere in the scanned closure may reach `sorryAx`; and the `Tls`
+# trust surface is pinned to nothing — no unsafe, no partial, no opaque, no
+# `@[implemented_by]`, no `@[extern]`. The imported `TLS13` and `HaclStar`
+# modules are declared unaudited here because //TLS13:tls13_assurance and
+# //HaclStar:haclstar_assurance own those prefixes (the latter pins the only
+# native boundary in the repo); the three targets together cover the whole
+# first-party import closure, so the repository-level statement survives.
 #
 # `allowed_axioms` is deliberately the bare standard three. The byte
 # (de)composition identities in `Tls.Record.Laws` and `Tls.Handshake` are proved
@@ -37,16 +43,12 @@ lean_library(
 # this audit immediately, which is the point.
 lean_assurance_test(
     name = "tls_assurance",
-    allowed_axioms = [
-        "propext",
-        "Classical.choice",
-        "Quot.sound",
-    ],
-    allowed_extern_modules = ["HaclStar"],
-    module_prefixes = [
+    allowed_axioms = TLS13_LEAN_ALLOWED_AXIOMS,
+    module_prefixes = ["Tls"],
+    policy_mode = "exact",
+    unaudited_module_prefixes = [
         "HaclStar",
         "TLS13",
-        "Tls",
     ],
     principal_theorems = [
         # Finite executable write traces. WriteRun retains the key-schedule's
@@ -154,6 +156,17 @@ lean_assurance_test(
         "Tls.Server.closeNotify_connected",
         "Tls.Server.feedWithFailure_peerClosed_ignored",
         "Tls.Server.run_wellFormed",
+    ],
+    principal_theorem_types = TLS_PRINCIPAL_TYPES,
+    expected_unsafe_constants = [],
+    expected_partial_definitions = [],
+    expected_opaque_constants = [],
+    expected_implemented_by = {},
+    expected_extern_declarations = {},
+    expected_native_targets = [
+        "//HaclStar:hacl_shim",
+        "//HaclStar:lean_runtime_headers",
+        "@+_repo_rules+hacl//:hacl",
     ],
     deps = [":tls"],
 )

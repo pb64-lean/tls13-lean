@@ -1,6 +1,8 @@
 package(default_visibility = ["//visibility:public"])
 
 load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_library")
+load("//:assurance.bzl", "TLS13_LEAN_ALLOWED_AXIOMS")
+load("//:assurance_types.bzl", "TLS13_PRINCIPAL_TYPES")
 
 # Pure-Lean TLS 1.3 key-schedule specification/refinement and X.509 stack,
 # built on the HaclStar crypto bindings. The record layer, handshake codecs,
@@ -36,17 +38,19 @@ lean_library(
 # and issuer vetting verified the signature over exactly them; and (c) the
 # successful-validation policy that a present TLS leaf KeyUsage permits digital
 # signatures.
-# `module_prefixes` deliberately reaches past this library into HaclStar so the
-# `@[extern]` allowance is exercised here too: the audit fails if native code
-# appears anywhere but the FFI package. `allowed_axioms` is left at the rule
-# default, which is exactly `propext`, `Classical.choice`, `Quot.sound`.
+#
+# Exact policy: every theorem statement is pinned in //:assurance_types.bzl,
+# and this library's own trust surface is pinned to nothing — no unsafe, no
+# partial, no opaque, no `@[implemented_by]`, no `@[extern]` anywhere under
+# `TLS13`, so native code appearing outside the FFI package fails the build.
+# The imported `HaclStar` modules are declared unaudited here because
+# //HaclStar:haclstar_assurance owns that prefix and pins its extern boundary.
 lean_assurance_test(
     name = "tls13_assurance",
-    allowed_extern_modules = ["HaclStar"],
-    module_prefixes = [
-        "HaclStar",
-        "TLS13",
-    ],
+    allowed_axioms = TLS13_LEAN_ALLOWED_AXIOMS,
+    module_prefixes = ["TLS13"],
+    policy_mode = "exact",
+    unaudited_module_prefixes = ["HaclStar"],
     principal_theorems = [
         # Key schedule: the RFC 8446 §7.1 derivation tree, as data.
         "TLS13.KeySchedule.Spec.Label.text_rfc8446",
@@ -77,6 +81,17 @@ lean_assurance_test(
         # successful TLS leaf validation satisfies RFC 9846 KeyUsage policy.
         "TLS13.X509.Chain.checkIssuer_verifies",
         "TLS13.X509.Chain.validate_leaf_keyUsage",
+    ],
+    principal_theorem_types = TLS13_PRINCIPAL_TYPES,
+    expected_unsafe_constants = [],
+    expected_partial_definitions = [],
+    expected_opaque_constants = [],
+    expected_implemented_by = {},
+    expected_extern_declarations = {},
+    expected_native_targets = [
+        "//HaclStar:hacl_shim",
+        "//HaclStar:lean_runtime_headers",
+        "@+_repo_rules+hacl//:hacl",
     ],
     deps = [":tls13"],
 )
