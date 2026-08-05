@@ -11,6 +11,7 @@
  */
 
 #include <lean/lean.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "Hacl_Hash_SHA2.h"
@@ -32,29 +33,53 @@ static inline lean_object *tls13_some(lean_object *value) {
   return o;
 }
 
+/* Non-Option bindings use an empty ByteArray as their misuse sentinel, which
+ * preserves their existing Lean APIs. It is distinguishable from successful
+ * fixed-output and AEAD operations; HKDF-Expand at the valid length zero is
+ * itself empty, so callers that need to distinguish that case must preflight. */
+static inline lean_object *tls13_empty_bytes(void) {
+  return tls13_alloc_bytes(0);
+}
+
+static inline bool tls13_fits_u32(size_t n) {
+  return n <= UINT32_MAX;
+}
+
 /* ---- SHA-2 ----------------------------------------------------------- */
 
 LEAN_EXPORT lean_object *tls13_hacl_sha256(b_lean_obj_arg data) {
+  size_t data_len = lean_sarray_size(data);
+  if (!tls13_fits_u32(data_len)) {
+    return tls13_empty_bytes();
+  }
   lean_object *out = tls13_alloc_bytes(32);
   Hacl_Hash_SHA2_hash_256(lean_sarray_cptr(out),
                           lean_sarray_cptr(data),
-                          (uint32_t)lean_sarray_size(data));
+                          (uint32_t)data_len);
   return out;
 }
 
 LEAN_EXPORT lean_object *tls13_hacl_sha384(b_lean_obj_arg data) {
+  size_t data_len = lean_sarray_size(data);
+  if (!tls13_fits_u32(data_len)) {
+    return tls13_empty_bytes();
+  }
   lean_object *out = tls13_alloc_bytes(48);
   Hacl_Hash_SHA2_hash_384(lean_sarray_cptr(out),
                           lean_sarray_cptr(data),
-                          (uint32_t)lean_sarray_size(data));
+                          (uint32_t)data_len);
   return out;
 }
 
 LEAN_EXPORT lean_object *tls13_hacl_sha512(b_lean_obj_arg data) {
+  size_t data_len = lean_sarray_size(data);
+  if (!tls13_fits_u32(data_len)) {
+    return tls13_empty_bytes();
+  }
   lean_object *out = tls13_alloc_bytes(64);
   Hacl_Hash_SHA2_hash_512(lean_sarray_cptr(out),
                           lean_sarray_cptr(data),
-                          (uint32_t)lean_sarray_size(data));
+                          (uint32_t)data_len);
   return out;
 }
 
@@ -62,12 +87,17 @@ LEAN_EXPORT lean_object *tls13_hacl_sha512(b_lean_obj_arg data) {
 
 LEAN_EXPORT lean_object *tls13_hacl_hmac_sha256(b_lean_obj_arg key,
                                                 b_lean_obj_arg data) {
+  size_t key_len = lean_sarray_size(key);
+  size_t data_len = lean_sarray_size(data);
+  if (!tls13_fits_u32(key_len) || !tls13_fits_u32(data_len)) {
+    return tls13_empty_bytes();
+  }
   lean_object *out = tls13_alloc_bytes(32);
   Hacl_HMAC_compute_sha2_256(lean_sarray_cptr(out),
                              lean_sarray_cptr(key),
-                             (uint32_t)lean_sarray_size(key),
+                             (uint32_t)key_len,
                              lean_sarray_cptr(data),
-                             (uint32_t)lean_sarray_size(data));
+                             (uint32_t)data_len);
   return out;
 }
 
@@ -75,34 +105,48 @@ LEAN_EXPORT lean_object *tls13_hacl_hmac_sha256(b_lean_obj_arg key,
 
 LEAN_EXPORT lean_object *tls13_hacl_hkdf_extract_sha256(b_lean_obj_arg salt,
                                                         b_lean_obj_arg ikm) {
+  size_t salt_len = lean_sarray_size(salt);
+  size_t ikm_len = lean_sarray_size(ikm);
+  if (!tls13_fits_u32(salt_len) || !tls13_fits_u32(ikm_len)) {
+    return tls13_empty_bytes();
+  }
   lean_object *out = tls13_alloc_bytes(32);
   Hacl_HKDF_extract_sha2_256(lean_sarray_cptr(out),
                              lean_sarray_cptr(salt),
-                             (uint32_t)lean_sarray_size(salt),
+                             (uint32_t)salt_len,
                              lean_sarray_cptr(ikm),
-                             (uint32_t)lean_sarray_size(ikm));
+                             (uint32_t)ikm_len);
   return out;
 }
 
-/* `len` is the desired output length; RFC 5869 caps it at 255*HashLen but the
- * Lean caller is responsible for respecting that. */
+/* `len` is the desired output length; RFC 5869 caps it at 255*HashLen. */
 LEAN_EXPORT lean_object *tls13_hacl_hkdf_expand_sha256(b_lean_obj_arg prk,
                                                        b_lean_obj_arg info,
                                                        uint32_t len) {
+  size_t prk_len = lean_sarray_size(prk);
+  size_t info_len = lean_sarray_size(info);
+  if (!tls13_fits_u32(prk_len) || !tls13_fits_u32(info_len) ||
+      len > 255U * 32U) {
+    return tls13_empty_bytes();
+  }
   lean_object *out = tls13_alloc_bytes(len);
   Hacl_HKDF_expand_sha2_256(lean_sarray_cptr(out),
                             lean_sarray_cptr(prk),
-                            (uint32_t)lean_sarray_size(prk),
+                            (uint32_t)prk_len,
                             lean_sarray_cptr(info),
-                            (uint32_t)lean_sarray_size(info),
+                            (uint32_t)info_len,
                             len);
   return out;
 }
 
 /* ---- X25519 ---------------------------------------------------------- */
 
-/* Derive the public value from a 32-byte scalar: X25519(priv, 9). */
+/* Derive the public value from a 32-byte scalar: X25519(priv, 9). A malformed
+ * scalar length returns the empty-ByteArray misuse sentinel. */
 LEAN_EXPORT lean_object *tls13_hacl_x25519_base(b_lean_obj_arg priv) {
+  if (lean_sarray_size(priv) != 32) {
+    return tls13_empty_bytes();
+  }
   lean_object *out = tls13_alloc_bytes(32);
   Hacl_Curve25519_51_secret_to_public(lean_sarray_cptr(out),
                                        lean_sarray_cptr(priv));
@@ -113,6 +157,9 @@ LEAN_EXPORT lean_object *tls13_hacl_x25519_base(b_lean_obj_arg priv) {
  * which RFC 7748 §6.1 / RFC 8446 §7.4.2 require callers to reject. */
 LEAN_EXPORT lean_object *tls13_hacl_x25519_ecdh(b_lean_obj_arg priv,
                                                 b_lean_obj_arg pub) {
+  if (lean_sarray_size(priv) != 32 || lean_sarray_size(pub) != 32) {
+    return lean_box(0); /* Option.none */
+  }
   lean_object *out = tls13_alloc_bytes(32);
   bool ok = Hacl_Curve25519_51_ecdh(lean_sarray_cptr(out),
                                      lean_sarray_cptr(priv),
@@ -178,19 +225,27 @@ LEAN_EXPORT lean_object *tls13_hacl_p256_ecdh(b_lean_obj_arg priv,
 /* ---- ChaCha20-Poly1305 AEAD ------------------------------------------ */
 
 /* Returns ciphertext ‖ tag (plaintext length + 16). `key` is 32 bytes, `nonce`
- * 12 bytes; `aad` may be empty. */
+ * 12 bytes; `aad` may be empty. Invalid dimensions or lengths that cannot be
+ * represented by HACL's uint32_t API return the empty-ByteArray sentinel. */
 LEAN_EXPORT lean_object *tls13_hacl_chachapoly_encrypt(b_lean_obj_arg key,
                                                        b_lean_obj_arg nonce,
                                                        b_lean_obj_arg aad,
                                                        b_lean_obj_arg plaintext) {
-  uint32_t mlen = (uint32_t)lean_sarray_size(plaintext);
-  lean_object *out = tls13_alloc_bytes((size_t)mlen + 16);
+  size_t aad_len = lean_sarray_size(aad);
+  size_t plaintext_len = lean_sarray_size(plaintext);
+  if (lean_sarray_size(key) != 32 || lean_sarray_size(nonce) != 12 ||
+      !tls13_fits_u32(aad_len) || !tls13_fits_u32(plaintext_len) ||
+      plaintext_len > SIZE_MAX - 16) {
+    return tls13_empty_bytes();
+  }
+  uint32_t mlen = (uint32_t)plaintext_len;
+  lean_object *out = tls13_alloc_bytes(plaintext_len + 16);
   uint8_t *o = lean_sarray_cptr(out);
   Hacl_AEAD_Chacha20Poly1305_encrypt(o,          /* ciphertext */
                                      o + mlen,   /* 16-byte tag */
                                      lean_sarray_cptr(plaintext), mlen,
                                      lean_sarray_cptr(aad),
-                                     (uint32_t)lean_sarray_size(aad),
+                                     (uint32_t)aad_len,
                                      lean_sarray_cptr(key),
                                      lean_sarray_cptr(nonce));
   return out;
@@ -203,16 +258,22 @@ LEAN_EXPORT lean_object *tls13_hacl_chachapoly_decrypt(b_lean_obj_arg key,
                                                        b_lean_obj_arg aad,
                                                        b_lean_obj_arg ct_and_tag) {
   size_t total = lean_sarray_size(ct_and_tag);
-  if (total < 16) {
+  size_t aad_len = lean_sarray_size(aad);
+  if (lean_sarray_size(key) != 32 || lean_sarray_size(nonce) != 12 ||
+      !tls13_fits_u32(aad_len) || total < 16) {
     return lean_box(0); /* Option.none */
   }
-  uint32_t clen = (uint32_t)(total - 16);
+  size_t ciphertext_len = total - 16;
+  if (!tls13_fits_u32(ciphertext_len)) {
+    return lean_box(0); /* Option.none */
+  }
+  uint32_t clen = (uint32_t)ciphertext_len;
   uint8_t *ct = lean_sarray_cptr(ct_and_tag);
-  lean_object *out = tls13_alloc_bytes(clen);
+  lean_object *out = tls13_alloc_bytes(ciphertext_len);
   uint32_t r = Hacl_AEAD_Chacha20Poly1305_decrypt(lean_sarray_cptr(out),
                                                   ct, clen,
                                                   lean_sarray_cptr(aad),
-                                                  (uint32_t)lean_sarray_size(aad),
+                                                  (uint32_t)aad_len,
                                                   lean_sarray_cptr(key),
                                                   lean_sarray_cptr(nonce),
                                                   ct + clen); /* tag */

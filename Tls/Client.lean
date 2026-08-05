@@ -26,12 +26,16 @@ complete. Certificate-chain and hostname validation remain separate policy
 steps for verification modes.
 -/
 
-/-- Fresh values and policy used to construct a TLS connection. -/
+/-- Fresh values and policy used to construct a TLS connection. The X25519
+and optional P-256 scalars must be independently generated for this connection
+and must never be reused across connections; the pure API cannot enforce that
+RFC 9846 §4.3.8 caller obligation. -/
 structure Config where
   clientRandom : ByteArray
   x25519Private : ByteArray
-  /-- An independent P-256 private scalar. When present, the ClientHello sends
-  both X25519 and P-256 shares so pre-18 PostgreSQL defaults need no HRR. -/
+  /-- An independently generated, connection-unique P-256 private scalar. When
+  present, the ClientHello sends both X25519 and P-256 shares so pre-18
+  PostgreSQL defaults need no HRR. -/
   p256Private : Option ByteArray := none
   legacySessionId : ByteArray := ByteArray.empty
   serverName : Option String := none
@@ -144,12 +148,22 @@ def fatalAlertDescription? : Error → Option UInt8
   | .finishedMismatch => some 51
   | .handshakeCodec _ => some 50
   | .unexpectedHandshake _ _ => some 10
+  | .unexpectedRecord _ _ => some 10
+  | .interleavedHandshake => some 10
+  | .trailingHandshakeAfterFinished => some 10
+  | .invalidAlertLength 0 => some 10
+  | .invalidAlertLength _ => some 50
   | .keyExchangeFailed => some 47
   | _ => none
 
 end Error
 
 instance : ToString Error := ⟨Error.render⟩
+
+/-- RFC 9846 §4.7.3's upper bound on sending traffic-secret generations.
+Once this many KeyUpdates have been sent, requests for another reciprocal
+update are still honored on the read side but no response is emitted. -/
+def maxSendingKeyUpdates : Nat := (2 ^ 48) - 1
 
 /--
 Pure connection state. Traffic keys and ephemeral private values are kept
@@ -177,6 +191,9 @@ structure State where
   serverHandshakeTrafficSecret? : Option ByteArray := none
   readKeys? : Option Record.TrafficKeys := none
   writeKeys? : Option Record.TrafficKeys := none
+  /-- Number of application write-key generations installed by KeyUpdate.
+  The initial application traffic secret is generation zero. -/
+  sendingKeyUpdates : Nat := 0
   leafCertificate? : Option ByteArray := none
   /-- The peer's Certificate-list entries, strict-parsed once from the exact
   handshake bytes and retained in wire order (leaf first). Post-handshake
@@ -448,6 +465,8 @@ def acceptServerHello (state : State) (message : Handshake.Message) :
 
 private def feedPlaintextHandshake (state : State) (fragment : ByteArray) :
     Except Error State := do
+  if fragment.isEmpty then
+    throw (.unexpectedRecord state.phase .handshake)
   let buffered := state.handshakeBuffered ++ fragment
   let some (message, rest) ← takeHandshake? buffered
     | pure { state with handshakeBuffered := buffered }
@@ -512,12 +531,15 @@ def completeServerHandshake (state : State) (message : Handshake.Message) :
     serverHandshakeTrafficSecret? := none
     readKeys? := some serverApplicationKeys
     writeKeys? := some clientApplicationKeys
+    sendingKeyUpdates := 0
   }, wireBytes)
 
 /-- Seal a fatal, level-2 TLS alert under the current write traffic keys.
 Callers must discard the connection after sending the returned bytes. -/
 def sealFatalAlert (state : State) (description : UInt8) :
     Except Error Output := do
+  if state.localClosed then
+    throw .connectionClosed
   let writeKeys ← requireWriteKeys state
   let fragment := ByteArray.mk #[2, description]
   let (writeKeys, wireBytes) ←
@@ -528,23 +550,47 @@ def sealFatalAlert (state : State) (description : UInt8) :
   }
 
 private def sendKeyUpdateResponse (state : State) : Except Error (State × ByteArray) := do
-  let message ← liftHandshake <|
-    Handshake.encodeKeyUpdate .updateNotRequested
-  let writeKeys ← requireWriteKeys state
-  let (advancedKeys, wireBytes) ←
-    liftRecord (Record.«seal» writeKeys .handshake message.encoded)
-  let updatedKeys ← liftRecord advancedKeys.update
-  pure ({ state with writeKeys? := some updatedKeys }, wireBytes)
+  if state.sendingKeyUpdates < maxSendingKeyUpdates then
+    let message ← liftHandshake <|
+      Handshake.encodeKeyUpdate .updateNotRequested
+    let writeKeys ← requireWriteKeys state
+    let (advancedKeys, wireBytes) ←
+      liftRecord (Record.«seal» writeKeys .handshake message.encoded)
+    let updatedKeys ← liftRecord advancedKeys.update
+    pure ({ state with
+      writeKeys? := some updatedKeys
+      sendingKeyUpdates := state.sendingKeyUpdates + 1
+    }, wireBytes)
+  else
+    pure (state, ByteArray.empty)
+
+private def parseKeyUpdateForClient (message : Handshake.Message) :
+    Except Error Handshake.KeyUpdate :=
+  if message.msgType == Handshake.keyUpdateType && message.body.size == 1 then
+    match Handshake.KeyUpdateRequest.ofUInt8? (message.body.get! 0) with
+    | none => .error (.illegalParameter
+        s!"invalid KeyUpdate request value {message.body.get! 0}")
+    | some _ => liftHandshake (Handshake.parseKeyUpdate message)
+  else
+    -- Wrong type or body length is a handshake syntax/decode error. Only a
+    -- well-framed one-byte request with an unknown value is illegal_parameter.
+    liftHandshake (Handshake.parseKeyUpdate message)
 
 def acceptKeyUpdate (state : State) (message : Handshake.Message) :
     Except Error (State × ByteArray) := do
-  let update ← liftHandshake (Handshake.parseKeyUpdate message)
+  let update ← parseKeyUpdateForClient message
   let readKeys ← requireReadKeys state
   let updatedReadKeys ← liftRecord readKeys.update
   let state := { state with readKeys? := some updatedReadKeys }
   match update.request with
   | .updateNotRequested => pure (state, ByteArray.empty)
-  | .updateRequested => sendKeyUpdateResponse state
+  | .updateRequested =>
+      if state.localClosed then
+        -- A crossing request advances the read epoch above, but close_notify
+        -- promised that this write direction sends no more.
+        pure (state, ByteArray.empty)
+      else
+        sendKeyUpdateResponse state
 
 /-! Reduction lemmas used to prove that key updates and transcript appends
 leave the handshake buffer untouched, which bounds the
@@ -566,37 +612,42 @@ private theorem appendTranscript_buffered (state : State)
 private theorem sendKeyUpdateResponse_buffered {state next : State}
     {wireBytes : ByteArray}
     (h : sendKeyUpdateResponse state = .ok (next, wireBytes)) :
-    next.handshakeBuffered = state.handshakeBuffered := by
+  next.handshakeBuffered = state.handshakeBuffered := by
   unfold sendKeyUpdateResponse at h
-  cases h1 : liftHandshake (Handshake.encodeKeyUpdate .updateNotRequested) with
-  | error e => rw [h1, except_bind_error] at h; cases h
-  | ok message =>
-      rw [h1, except_bind_ok] at h
-      cases h2 : requireWriteKeys state with
-      | error e => rw [h2, except_bind_error] at h; cases h
-      | ok writeKeys =>
-          rw [h2, except_bind_ok] at h
-          cases h3 : liftRecord
-              (Record.«seal» writeKeys .handshake message.encoded) with
-          | error e => rw [h3, except_bind_error] at h; cases h
-          | ok sealed =>
-              obtain ⟨advancedKeys, sealedBytes⟩ := sealed
-              rw [h3, except_bind_ok] at h
-              cases h4 : liftRecord advancedKeys.update with
-              | error e =>
-                  simp only [h4, except_bind_error] at h
-                  cases h
-              | ok updatedKeys =>
-                  simp only [h4, except_bind_ok, except_pure,
-                    Except.ok.injEq, Prod.mk.injEq] at h
-                  rw [← h.1]
+  split at h
+  case isFalse =>
+    cases h
+    rfl
+  case isTrue =>
+    cases h1 : liftHandshake (Handshake.encodeKeyUpdate .updateNotRequested) with
+    | error e => rw [h1, except_bind_error] at h; cases h
+    | ok message =>
+        rw [h1, except_bind_ok] at h
+        cases h2 : requireWriteKeys state with
+        | error e => rw [h2, except_bind_error] at h; cases h
+        | ok writeKeys =>
+            rw [h2, except_bind_ok] at h
+            cases h3 : liftRecord
+                (Record.«seal» writeKeys .handshake message.encoded) with
+            | error e => rw [h3, except_bind_error] at h; cases h
+            | ok sealed =>
+                obtain ⟨advancedKeys, sealedBytes⟩ := sealed
+                rw [h3, except_bind_ok] at h
+                cases h4 : liftRecord advancedKeys.update with
+                | error e =>
+                    simp only [h4, except_bind_error] at h
+                    cases h
+                | ok updatedKeys =>
+                    simp only [h4, except_bind_ok, except_pure,
+                      Except.ok.injEq, Prod.mk.injEq] at h
+                    rw [← h.1]
 
 private theorem acceptKeyUpdate_buffered {state next : State}
     {message : Handshake.Message} {wireBytes : ByteArray}
     (h : acceptKeyUpdate state message = .ok (next, wireBytes)) :
-    next.handshakeBuffered = state.handshakeBuffered := by
+  next.handshakeBuffered = state.handshakeBuffered := by
   unfold acceptKeyUpdate at h
-  cases h1 : liftHandshake (Handshake.parseKeyUpdate message) with
+  cases h1 : parseKeyUpdateForClient message with
   | error e => rw [h1, except_bind_error] at h; cases h
   | ok update =>
       rw [h1, except_bind_ok] at h
@@ -615,7 +666,10 @@ private theorem acceptKeyUpdate_buffered {state next : State}
                   rw [← h.1]
               | updateRequested =>
                   simp only [hreq] at h
-                  rw [sendKeyUpdateResponse_buffered h]
+                  split at h
+                  · cases h
+                    rfl
+                  · rw [sendKeyUpdateResponse_buffered h]
 
 /-- Consume every complete handshake message the buffer holds, in phase order:
 EncryptedExtensions, Certificate, CertificateVerify, then the server Finished
@@ -685,10 +739,15 @@ def processHandshakeBuffer (state : State) :
           throw .trailingHandshakeAfterFinished
         completeServerHandshake state' message
     | .connected =>
-        if message.msgType == Handshake.newSessionTicketType then do
-          let _ ← liftHandshake (Handshake.parseNewSessionTicket message)
+        if message.msgType == Handshake.newSessionTicketType then
+          -- This profile does not implement resumption. RFC 9846 §4.7.1
+          -- requires such a client to silently ignore NewSessionTicket.
           processHandshakeBuffer state'
-        else if message.msgType == Handshake.keyUpdateType then
+        else if message.msgType == Handshake.keyUpdateType then do
+          unless rest.isEmpty do
+            -- A KeyUpdate changes the record-protection epoch, so it must end
+            -- the protected record in which it appears (RFC 9846 §5.1).
+            throw .interleavedHandshake
           match hacc : acceptKeyUpdate state' message with
           | .error e => .error e
           | .ok (stateK, wireBytes) =>
@@ -728,14 +787,16 @@ private def processAlert (state : State) (fragment : ByteArray) (duringHandshake
     throw (.invalidAlertLength fragment.size)
   let level := fragment.get! 0
   let description := fragment.get! 1
-  unless level == 1 || level == 2 do
-    throw (.invalidAlertLevel level)
   if description == 0 then
     if duringHandshake then
       throw .peerClosedDuringHandshake
     else
-      let state := { state with peerClosed := true }
-      emitCloseNotify state
+      -- close_notify closes only the peer's write direction; it does not
+      -- require an immediate reciprocal close in TLS 1.3.
+      pure ({ state with peerClosed := true }, ByteArray.empty)
+  else if description == 90 then
+    -- user_canceled is informational and must be followed by close_notify.
+    pure (state, ByteArray.empty)
   else
     throw (.peerAlert level description)
 
@@ -746,28 +807,34 @@ private def processProtectedRecord (state : State) (record : Record.RawRecord) :
   let state := { state with readKeys? := some readKeys }
   if state.phase == .connected then
     if state.peerClosed then
-      throw .connectionClosed
-    match plaintext.contentType with
-    | .applicationData =>
-        unless state.handshakeBuffered.isEmpty do
-          throw .interleavedHandshake
-        pure (state, plaintext.fragment, ByteArray.empty)
-    | .handshake =>
-        let state := {
-          state with handshakeBuffered := state.handshakeBuffered ++ plaintext.fragment
-        }
-        let (state, wireBytes) ← processHandshakeBuffer state
-        pure (state, ByteArray.empty, wireBytes)
-    | .alert =>
-        unless state.handshakeBuffered.isEmpty do
-          throw .interleavedHandshake
-        let (state, wireBytes) ← processAlert state plaintext.fragment false
-        pure (state, ByteArray.empty, wireBytes)
-    | .changeCipherSpec =>
-        throw (.unexpectedRecord state.phase plaintext.contentType)
+      -- RFC 9846 §6.1: data received after close_notify is ignored.
+      pure (state, ByteArray.empty, ByteArray.empty)
+    else
+      match plaintext.contentType with
+      | .applicationData =>
+          unless state.handshakeBuffered.isEmpty do
+            throw .interleavedHandshake
+          pure (state, plaintext.fragment, ByteArray.empty)
+      | .handshake =>
+          if plaintext.fragment.isEmpty then
+            throw (.unexpectedRecord state.phase .handshake)
+          let state := {
+            state with handshakeBuffered := state.handshakeBuffered ++ plaintext.fragment
+          }
+          let (state, wireBytes) ← processHandshakeBuffer state
+          pure (state, ByteArray.empty, wireBytes)
+      | .alert =>
+          unless state.handshakeBuffered.isEmpty do
+            throw .interleavedHandshake
+          let (state, wireBytes) ← processAlert state plaintext.fragment false
+          pure (state, ByteArray.empty, wireBytes)
+      | .changeCipherSpec =>
+          throw (.unexpectedRecord state.phase plaintext.contentType)
   else
     match plaintext.contentType with
     | .handshake =>
+        if plaintext.fragment.isEmpty then
+          throw (.unexpectedRecord state.phase .handshake)
         let state := {
           state with handshakeBuffered := state.handshakeBuffered ++ plaintext.fragment
         }
@@ -825,17 +892,20 @@ private def processRecords (state : State) (records : List Record.RawRecord)
   match records with
   | [] => .ok { state, wireBytes, plaintext }
   | record :: rest =>
-    match processRecord state record with
-    | .error error => .error { state, error }
-    | .ok (next, cleartext, outbound) =>
-        processRecords next rest (plaintext ++ cleartext) (wireBytes ++ outbound)
+    if state.peerClosed then
+      .ok { state, wireBytes, plaintext }
+    else
+      match processRecord state record with
+      | .error error => .error { state, error }
+      | .ok (next, cleartext, outbound) =>
+          processRecords next rest (plaintext ++ cleartext) (wireBytes ++ outbound)
 
 /-- Incrementally consume arbitrary transport bytes, retaining the latest
 successfully advanced state on failure for fatal-alert emission. -/
 def feedWithFailure (initial : State) (chunk : ByteArray) :
     Except Failure Output :=
-  if initial.closed && !chunk.isEmpty then
-    .error { state := initial, error := .connectionClosed }
+  if initial.peerClosed then
+    .ok { state := initial }
   else
     match liftRecord (initial.decoder.feed chunk) with
     | .error error => .error { state := initial, error }
@@ -846,8 +916,10 @@ def feedWithFailure (initial : State) (chunk : ByteArray) :
 /--
 Incrementally consume arbitrary transport bytes. The returned plaintext is
 the concatenation of application-data records in wire order; `wireBytes`
-contains any generated client Finished, reciprocal KeyUpdate, or close_notify.
-Use `feedWithFailure` when the caller can emit protocol-fatal alerts.
+contains any generated client Finished or reciprocal KeyUpdate. Receiving
+`close_notify` only closes the peer's write direction; call `closeNotify`
+explicitly when the local write direction should close. Use `feedWithFailure`
+when the caller can emit protocol-fatal alerts.
 -/
 def feed (state : State) (chunk : ByteArray) : Except Error Output :=
   match feedWithFailure state chunk with
@@ -883,7 +955,7 @@ private def sealChunks (keys : Record.TrafficKeys) (plaintext : ByteArray)
 def sealApplication (state : State) (plaintext : ByteArray) : Except Error Output := do
   unless state.phase == .connected do
     throw (.notConnected state.phase)
-  if state.localClosed || state.peerClosed then
+  if state.localClosed then
     throw .connectionClosed
   if plaintext.isEmpty then
     pure { state }

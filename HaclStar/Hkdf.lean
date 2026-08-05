@@ -12,13 +12,16 @@ namespace HaclStar
 namespace Hkdf
 
 /-- HKDF-Extract: derive a 32-byte pseudorandom key from input keying material
-`ikm` and a `salt`. -/
+`ikm` and a `salt`. An input too large for HACL's `uint32_t` length API returns
+the empty `ByteArray` misuse sentinel. -/
 @[extern "tls13_hacl_hkdf_extract_sha256"]
 opaque extractSha256 (salt ikm : ByteArray) : ByteArray
 
 /-- HKDF-Expand: stretch a pseudorandom key `prk` to `len` bytes bound to
-`info`. `len` must not exceed 255·32 = 8160 (RFC 5869); the caller is
-responsible for that bound. -/
+`info`. A length above 255·32 = 8160 (RFC 5869), or an input too large for
+HACL's `uint32_t` length API, returns the empty `ByteArray` misuse sentinel.
+That is also the valid result for `len = 0`, so a caller that needs to
+distinguish misuse must validate the requested length first. -/
 @[extern "tls13_hacl_hkdf_expand_sha256"]
 opaque expandSha256 (prk info : ByteArray) (len : UInt32) : ByteArray
 

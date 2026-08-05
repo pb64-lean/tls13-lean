@@ -4697,10 +4697,13 @@ private theorem parseKeyShareEntriesLoop_image : ∀ (n : Nat) (W : ByteArray)
               rfl
             · exact hshares
 
-/-- **Wire → list converse**: every key_share block the parser accepts is
-exactly the wire image of the entry list it produced — every offered group
-identifier in order, each with the exact bytes of its key share — so
-re-encoding a parsed key_share list reproduces the bytes it came from. -/
+/-- **Wire decomposition**: every key_share block the parser accepts is the
+wire image of some full entry list whose identifiers are exactly the returned
+identifiers and whose known-group entries are exactly the returned shares.
+
+The full list is an existential witness, not parser output: unknown/GREASE key
+bytes are deliberately discarded. Consequently this theorem does not support
+re-encoding from the parse result or an injectivity corollary. -/
 theorem parseKeyShareEntries_image {E : ByteArray} {ids : Array UInt16}
     {shares : Array ClientKeyShare}
     (h : parseKeyShareEntries E = .ok (ids, shares)) :

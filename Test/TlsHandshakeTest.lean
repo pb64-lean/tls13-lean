@@ -187,6 +187,12 @@ private def testRequiredExtensionAndEmptyRecordFailures
 
 set_option maxRecDepth 2048 in
 def main : IO Unit := do
+  let certificatePem ← IO.FS.readFile "Test/Fixtures/Tls/server_cert.pem"
+  let certificates ← unwrap "decode server certificate fixture"
+    (TLS13.X509.PEM.decodeCertificates certificatePem)
+  let certificateDer ← match certificates[0]? with
+    | some der => pure der
+    | none => throw (IO.userError "server certificate fixture was empty")
   let richMessage ← unwrap "frame rich ClientHello" (makeClientHello (some richExtensions))
   let hello ← unwrap "parse rich ClientHello" (Handshake.parseClientHello richMessage)
   check "rich ClientHello did not offer TLS 1.3" hello.offersTls13
@@ -227,7 +233,7 @@ def main : IO Unit := do
   let richServerConfig : Server.Config := {
     serverRandom := repeated 32 0x71
     x25519Private := repeated 32 0x72
-    certificateChain := #[ByteArray.empty.push 0x30]
+    certificateChain := #[certificateDer]
     signingKey := repeated 32 0x73
     alpnProtocols := ["http/1.1", "h2"]
   }

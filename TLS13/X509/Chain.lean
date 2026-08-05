@@ -41,6 +41,7 @@ inductive Failure where
   | notYetValid (serial : Nat) (notBefore now : Int)
   | expired (serial : Nat) (notAfter now : Int)
   | badSignature (childSerial issuerSerial : Nat)
+  | leafDigitalSignatureMissing (leafSerial : Nat)
   | notCA (issuerSerial : Nat)
   | keyCertSignMissing (issuerSerial : Nat)
   | pathLenExceeded (issuerSerial limit actual : Nat)
@@ -61,6 +62,8 @@ def render : Failure → String
       s!"certificate {serial} expired at {notAfter} (now {now})"
   | .badSignature childSerial issuerSerial =>
       s!"certificate {childSerial} has an invalid signature from issuer {issuerSerial}"
+  | .leafDigitalSignatureMissing leafSerial =>
+      s!"leaf certificate {leafSerial} KeyUsage does not permit TLS digital signatures"
   | .notCA issuerSerial =>
       s!"issuer certificate {issuerSerial} is not a CA"
   | .keyCertSignMissing issuerSerial =>
@@ -117,6 +120,21 @@ private def checkCertificate (now : Int) (certificate : Certificate) :
   for extension in certificate.tbsCertificate.extensions.unhandled do
     if extension.critical then
       throw (.unhandledCriticalExtension serial extension.oid)
+
+/-- RFC 9846's TLS policy for the target certificate: absence of KeyUsage is
+permitted, but when the extension is present it must authorize the signature
+made in CertificateVerify. This is deliberately a leaf/target check; issuer
+certificates are governed separately by `keyCertSign` in `checkIssuer`. -/
+def leafKeyUsagePermitsDigitalSignature (leaf : Certificate) : Bool :=
+  match leaf.tbsCertificate.extensions.keyUsage with
+  | none => true
+  | some usage => usage.value.digitalSignature
+
+private def checkLeafKeyUsage (leaf : Certificate) : Except Failure Unit :=
+  if leafKeyUsagePermitsDigitalSignature leaf then
+    .ok ()
+  else
+    .error (.leafDigitalSignatureMissing leaf.tbsCertificate.serialNumber)
 
 /-- Count non-self-issued intermediate CAs strictly between the target leaf and
 an issuer candidate. RFC 5280 excludes self-issued certificates from this
@@ -305,7 +323,9 @@ end
 /-- Build and validate a path from `leaf` to an exact trust-store anchor.
 
 `presented` should contain the remaining certificates sent by the peer, in any
-order. Validity is inclusive at both endpoints. Every path certificate,
+order. When the leaf has a KeyUsage extension, its `digitalSignature` bit must
+be set, as required for the TLS CertificateVerify signing certificate.
+Validity is inclusive at both endpoints. Every path certificate,
 including the anchor, is checked for validity and unhandled critical
 extensions. Every parent is checked for signature authority, CA constraints,
 KeyUsage, and pathLenConstraint before it may issue its child. Both path depth
@@ -315,7 +335,8 @@ def validate
     (trustStore : TrustStore)
     (maximumDepth : Nat := defaultMaximumDepth)
     (maximumIssuerAttempts : Nat := defaultMaximumIssuerAttempts) :
-    Except Failure VerifiedChain :=
+    Except Failure VerifiedChain := do
+  checkLeafKeyUsage leaf
   (buildPath now maximumDepth maximumIssuerAttempts
     leaf leaf presented trustStore #[] maximumIssuerAttempts).result
 
@@ -361,6 +382,23 @@ theorem checkIssuer_verifies {path : Array Certificate}
   · exact hc
   · obtain ⟨_, hu, _⟩ := bind_ok_ex h
     cases hu
+
+/-- Successful TLS path validation implies the RFC 9846 KeyUsage condition on
+the target certificate. In particular, a present KeyUsage extension has its
+`digitalSignature` bit set. -/
+theorem validate_leaf_keyUsage {now : Int} {leaf : Certificate}
+    {presented : Array Certificate} {trustStore : TrustStore}
+    {maximumDepth maximumIssuerAttempts : Nat} {verified : VerifiedChain}
+    (h : validate now leaf presented trustStore maximumDepth
+      maximumIssuerAttempts = .ok verified) :
+    leafKeyUsagePermitsDigitalSignature leaf = true := by
+  unfold validate at h
+  obtain ⟨checked, hcheck, -⟩ := bind_ok_ex h
+  cases checked
+  unfold checkLeafKeyUsage at hcheck
+  split at hcheck
+  · assumption
+  · cases hcheck
 
 end Chain
 end X509

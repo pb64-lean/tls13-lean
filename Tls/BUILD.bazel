@@ -49,28 +49,31 @@ lean_assurance_test(
         "Tls",
     ],
     principal_theorems = [
-        # Nonce non-reuse: no (traffic secret, nonce) pair is ever repeated by
-        # the write side of a run, for either engine.
+        # Finite executable write traces. WriteRun retains the key-schedule's
+        # traffic-secret bookkeeping; AeadWriteRun records the cryptographically
+        # relevant concrete `(AEAD key, nonce)` pairs. The latter's explicit
+        # sufficient condition is finite-run AEAD-key distinctness.
         "Tls.Record.WriteRun.nodup",
+        "Tls.Record.AeadWriteRun.nodup",
         "Tls.Client.run_nonce_nodup",
         "Tls.Client.feed_nonce_nodup",
         "Tls.Server.run_nonce_nodup",
         "Tls.Server.feed_nonce_nodup",
         "Tls.Record.nonceOf_inj",
-        # Nonce non-reuse with the epoch-freshness hypothesis discharged: the
-        # epochs a client run installs are strictly increasing nodes of the
-        # RFC 8446 key schedule, so distinctness follows from the injectivity
-        # of HKDF-Expand-Label alone.
-        "Tls.Record.EpochsFrom.nodup",
-        "Tls.Record.SpecExtends.nonce_nodup",
+        # Finite write traces refined by the RFC 8446 key schedule. The engines
+        # prove which strictly increasing derivation histories they traverse
+        # and connect that bookkeeping to the actual AEAD trace. Concrete
+        # AEAD-key distinctness remains the explicit sufficient finite-run
+        # condition for key--nonce pair distinctness.
+        "Tls.Record.SpecExtends.finite_nonce_trace",
         "Tls.Client.run_epochs",
-        "Tls.Client.run_nonce_nodup_spec",
-        "Tls.Client.feed_nonce_nodup_spec",
-        "Tls.Client.start_run_nonce_nodup",
+        "Tls.Client.run_nonce_trace_spec",
+        "Tls.Client.feed_nonce_trace_spec",
+        "Tls.Client.start_run_nonce_trace_spec",
         "Tls.Server.run_epochs",
-        "Tls.Server.run_nonce_nodup_spec",
-        "Tls.Server.feed_nonce_nodup_spec",
-        "Tls.Server.start_run_nonce_nodup",
+        "Tls.Server.run_nonce_trace_spec",
+        "Tls.Server.feed_nonce_trace_spec",
+        "Tls.Server.start_run_nonce_trace_spec",
         "Tls.Record.TrafficKeys.nonce_inj",
         "Tls.Record.sequenceBytes_inj",
         # Record layer: framing conserves bytes, and open inverts seal.
@@ -79,6 +82,9 @@ lean_assurance_test(
         "Tls.Record.Decoder.feed_conservation",
         "Tls.Record.Decoder.feed_residual",
         "Tls.Record.Decoder.feed_append",
+        "Tls.Record.maxInnerPlaintextLength_eq",
+        "Tls.Record.seal_innerPlaintext_size_le",
+        "Tls.Record.open_innerPlaintext_size_le",
         "Tls.Record.open_seal",
         "Tls.Record.decodeStep_seal_open",
         "Tls.Record.seal_nonce",
@@ -115,17 +121,29 @@ lean_assurance_test(
         "Tls.Client.completeServerHandshake_verified",
         "Tls.Client.acceptServerHello_transcript",
         "Tls.Client.acceptKeyUpdate_epoch",
+        "Tls.Client.acceptKeyUpdate_invalid_request_illegalParameter",
+        "Tls.Client.acceptKeyUpdate_sendingKeyUpdates_le",
+        "Tls.Client.acceptKeyUpdate_response_suppressed_at_limit",
+        "Tls.Client.acceptKeyUpdate_response_increments",
+        "Tls.Client.acceptKeyUpdate_localClosed_suppresses_response",
+        "Tls.Client.sealFatalAlert_localClosed",
         "Tls.Client.sealApplication_connected",
         "Tls.Client.feed_plaintext_connected",
         "Tls.Client.run_plaintext_connected",
         "Tls.Client.closeNotify_connected",
-        "Tls.Client.feedWithFailure_closed",
+        "Tls.Client.feedWithFailure_peerClosed_ignored",
         "Tls.Client.State.WellFormed.noReadKeys",
         "Tls.Client.State.WellFormed.noWriteKeys",
         "Tls.Client.run_wellFormed",
         "Tls.Server.acceptClientFinished_verified",
         "Tls.Server.sendHelloRetryRequest_messageHash",
         "Tls.Server.acceptKeyUpdate_epoch",
+        "Tls.Server.acceptKeyUpdate_invalid_request",
+        "Tls.Server.acceptKeyUpdate_sendingKeyUpdates_le",
+        "Tls.Server.acceptKeyUpdate_at_sending_limit",
+        "Tls.Server.acceptKeyUpdate_response_increments",
+        "Tls.Server.acceptKeyUpdate_localClosed_suppresses_response",
+        "Tls.Server.sealFatalAlert_localClosed",
         "Tls.Server.checkRetryClientHello_body_eq",
         "Tls.Server.sealApplication_connected",
         "Tls.Server.feed_plaintext_connected",
@@ -134,7 +152,7 @@ lean_assurance_test(
         "Tls.Server.State.WellFormed.noReadKeys",
         "Tls.Server.State.WellFormed.noWriteKeys",
         "Tls.Server.closeNotify_connected",
-        "Tls.Server.feedWithFailure_closed",
+        "Tls.Server.feedWithFailure_peerClosed_ignored",
         "Tls.Server.run_wellFormed",
     ],
     deps = [":tls"],

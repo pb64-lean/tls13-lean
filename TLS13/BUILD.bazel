@@ -2,9 +2,9 @@ package(default_visibility = ["//visibility:public"])
 
 load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_library")
 
-# Pure-Lean TLS 1.3 protocol layer, built on the HaclStar crypto bindings.
-# Currently: the RFC 8446 §7.1 key schedule. The record layer, handshake
-# messages, and state machine land here as they are implemented.
+# Pure-Lean TLS 1.3 key-schedule specification/refinement and X.509 stack,
+# built on the HaclStar crypto bindings. The record layer, handshake codecs,
+# and client/server state machines live in //Tls.
 lean_library(
     name = "tls13",
     srcs = [
@@ -30,10 +30,12 @@ lean_library(
 # theorems are (a) the RFC 8446 §7.1 refinement chain — the derivation tree
 # transcribed as data, the `HkdfLabel` wire image byte for byte, and each
 # implementation function shown to compute its specification counterpart for
-# *any* HKDF the HACL\* bindings implement — and (b) the retention chain that
+# *any* HKDF the HACL\* bindings implement; (b) the retention chain that
 # makes certificate verification mean anything: the DER decoder hands back the
 # exact substring it consumed, a decoded `TBSCertificate` retains those bytes,
-# and issuer vetting verified the signature over exactly them.
+# and issuer vetting verified the signature over exactly them; and (c) the
+# successful-validation policy that a present TLS leaf KeyUsage permits digital
+# signatures.
 # `module_prefixes` deliberately reaches past this library into HaclStar so the
 # `@[extern]` allowance is exercised here too: the audit fails if native code
 # appears anywhere but the FFI package. `allowed_axioms` is left at the rule
@@ -51,10 +53,6 @@ lean_assurance_test(
         "TLS13.KeySchedule.Spec.Derived.tree_rfc8446",
         "TLS13.KeySchedule.Spec.HkdfLabel.encode_bytes",
         "TLS13.KeySchedule.Spec.emptyContext_rfc8446",
-        # Key schedule: distinct nodes of the diagram — including a key-update
-        # chain of any length — have distinct traffic secrets, given only that
-        # HKDF-Expand-Label is injective.
-        "TLS13.KeySchedule.Spec.Epoch.eq_of_secret_eq",
         # Key schedule: the implementation refines it.
         "TLS13.KeySchedule.hkdfLabel_encode",
         "TLS13.KeySchedule.hkdfLabel_bytes",
@@ -75,8 +73,10 @@ lean_assurance_test(
         # Certificate: the retained TBS bytes are the signed bytes.
         "TLS13.X509.Certificate.decode_encoded",
         "TLS13.X509.Certificate.decode_tbs_encoded",
-        # Chain: a vetted issuer link verified over exactly those bytes.
+        # Chain: a vetted issuer link verified over exactly those bytes, and a
+        # successful TLS leaf validation satisfies RFC 9846 KeyUsage policy.
         "TLS13.X509.Chain.checkIssuer_verifies",
+        "TLS13.X509.Chain.validate_leaf_keyUsage",
     ],
     deps = [":tls13"],
 )

@@ -66,8 +66,9 @@ checked by `open` because its header is AEAD additional data. -/
 
 @[expose] def aeadTagLength : Nat := 16
 
-/-- The largest encoded `TLSInnerPlaintext` accepted by this implementation. -/
-@[expose] def maxInnerPlaintextLength : Nat := maxCiphertextLength - aeadTagLength
+/-- RFC 9846 §5.2: `TLSInnerPlaintext.content` plus zero padding is at most
+`2^14` bytes; the encoded value has one additional content-type byte. -/
+@[expose] def maxInnerPlaintextLength : Nat := (1 <<< 14) + 1
 
 inductive Error where
   | unsupportedContentType (value : UInt8)

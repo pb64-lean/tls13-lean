@@ -982,6 +982,12 @@ the binding inverts on identical key, nonce, and additional data, `open`
 recovers exactly what `seal` protected, and both directions advance the
 sequence number identically. -/
 
+/-- RFC 9846 §5.2 permits `2^14` content-and-padding bytes followed by the
+single inner content-type byte. This limit is intentionally independent of the
+larger `TLSCiphertext` expansion allowance. -/
+theorem maxInnerPlaintextLength_eq :
+    maxInnerPlaintextLength = maxPlaintextLength + 1 := rfl
+
 /-- No TLS content-type byte is zero, so the inner content type is never
 mistaken for padding. -/
 theorem ContentType.toUInt8_ne_zero (ct : ContentType) : ct.toUInt8 ≠ 0 := by
@@ -1010,6 +1016,58 @@ theorem size_innerPlaintext (ct : ContentType) (fragment : ByteArray)
       fragment.size + 1 + paddingLength := by
   simp [innerPlaintext, ByteArray.size_append, ByteArray.size_push,
     size_zeroBytes]
+
+/-- Every successful `seal` respected the RFC 9846 `TLSInnerPlaintext` bound. -/
+theorem seal_innerPlaintext_size_le {keys next : TrafficKeys}
+    {contentType : ContentType} {fragment wire : ByteArray} {paddingLength : Nat}
+    (h : «seal» keys contentType fragment paddingLength = .ok (next, wire)) :
+    (innerPlaintext contentType fragment paddingLength).size ≤
+      maxInnerPlaintextLength := by
+  unfold «seal» at h
+  split at h
+  · cases h
+  · split at h
+    · cases h
+    · split at h
+      · cases h
+      · rename_i hinner
+        rw [size_innerPlaintext]
+        omega
+
+/-- Every successful `open` authenticated and decrypted an inner plaintext no
+larger than the RFC 9846 limit. The subtraction removes the AEAD tag from the
+wire fragment length. -/
+theorem open_innerPlaintext_size_le {keys next : TrafficKeys} {record : RawRecord}
+    {plaintext : Plaintext} (h : «open» keys record = .ok (next, plaintext)) :
+    record.fragment.size - aeadTagLength ≤ maxInnerPlaintextLength := by
+  unfold «open» at h
+  split at h
+  · cases h
+  · split at h
+    · cases h
+    · split at h
+      · cases h
+      · split at h
+        · cases h
+        · split at h
+          · cases h
+          · split at h
+            · cases h
+            · split at h
+              · cases h
+              · split at h
+                · cases h
+                · rename_i inner hdecrypt
+                  split at h
+                  · cases h
+                  · rename_i hsize
+                    split at h
+                    · cases h
+                    · rename_i hinner
+                      have heq : inner.size =
+                          record.fragment.size - aeadTagLength :=
+                        Decidable.of_not_not hsize
+                      omega
 
 private theorem get!_append_right {a b : ByteArray} {i : Nat}
     (h1 : a.size ≤ i) (h2 : i < a.size + b.size) :
@@ -1346,10 +1404,10 @@ nonce it consumed, and the traffic-secret epoch that consumed it. Sequence
 numbers restart at zero on every KeyUpdate (`TrafficKeys.seq_update`), so nonces
 *do* repeat across epochs; the trace is therefore tagged by epoch secret and the
 theorem is scoped accordingly. `WriteRun.nodup` is the result: the tagged trace
-of any run has no repeats, assuming only that the epochs' traffic secrets are
-distinct (`secrets.Nodup`) — which is a property of HKDF, an opaque HACL\*
-binding here, and so is a hypothesis exactly like the AEAD round trip in
-`open_seal`. -/
+of any run has no repeats if the concrete traffic-secret byte strings in that
+finite run are distinct (`secrets.Nodup`). This is intentionally a trace-local
+condition. A fixed-size KDF cannot be globally injective, so the key schedule's
+structural order does not discharge it deterministically. -/
 
 /-- A write-side run of one connection direction.
 `WriteRun before after secrets nonces` holds when a state machine starting from
@@ -1381,8 +1439,9 @@ inductive WriteRun : Option TrafficKeys → Option TrafficKeys → List ByteArra
       WriteRun (some keys) dst secrets ((keys.secret, nonce) :: nonces)
   /-- The current epoch is abandoned for a fresh one: `TrafficKeys.update` after
   a KeyUpdate, or the key schedule's handshake → application transition. The new
-  epoch is unconstrained here; that distinct epochs really do have distinct
-  secrets is exactly the `secrets.Nodup` hypothesis of `WriteRun.nodup`. -/
+  epoch is unconstrained here; distinctness of the concrete secret byte strings
+  used by this finite run is exactly the `secrets.Nodup` hypothesis of
+  `WriteRun.nodup`. -/
   | rekey {keys next : TrafficKeys} {dst : Option TrafficKeys}
       {secrets : List ByteArray} {nonces : List (ByteArray × ByteArray)}
       (hrest : WriteRun (some next) dst secrets nonces) :
@@ -1466,9 +1525,11 @@ the current sequence number and returns the state with that number advanced
 without wrapping (`seal_seq_succ`), and for a fixed static IV the nonce
 determines the sequence number (`nonceOf_inj`, from `sequenceBytes` injectivity).
 Across epochs it rests on the single hypothesis `hfresh`: the traffic secrets the
-connection used are distinct. TLS derives each of them with HKDF-Expand-Label,
-which is an opaque HACL\* binding here, so that step is assumed rather than
-proved — as with the AEAD round trip in `open_seal`. -/
+connection used in this finite trace are distinct. This is not derived from a
+global injectivity property of HKDF: no fixed-size KDF has such a property.
+Cryptographic collision resistance justifies treating `hfresh` as overwhelmingly
+likely for a feasible connection, but it is not a deterministic Lean theorem
+about the opaque HACL\* binding. -/
 theorem WriteRun.nodup {src dst : Option TrafficKeys}
     {secrets : List ByteArray} {nonces : List (ByteArray × ByteArray)}
     (h : WriteRun src dst secrets nonces) (hfresh : secrets.Nodup) :
@@ -1482,6 +1543,161 @@ theorem WriteRun.nodup {src dst : Option TrafficKeys}
       intro hmem
       obtain ⟨s, hle, heq⟩ :=
         WriteRun.mem_epoch hrest hfresh _ hmem (seal_secret_eq hseal).symm
+      have hnonce' : nonce = nonceOf keys.iv keys.seq :=
+        TrafficKeys.nonce_eq hnonce
+      rw [seal_iv_eq hseal] at heq
+      have hseq : keys.seq = s := nonceOf_inj (by rw [← hnonce', ← heq])
+      rw [seal_seq_succ hseal, ← hseq] at hle
+      omega
+  | rekey hrest ih => exact ih (List.nodup_cons.mp hfresh).2
+  | install hrest ih => exact ih hfresh
+
+/-! ### The actual AEAD key--nonce trace
+
+`WriteRun` deliberately tags each consumed nonce with its traffic secret because
+that is the identity refined by the TLS key schedule.  AEAD nonce-misuse safety,
+however, is scoped by the concrete AEAD key rather than by the secret from which
+that key was derived.  `AeadWriteRun` records the same executable `seal` steps
+with `(keys.key, nonce)` pairs and therefore exposes the cryptographically
+relevant trace directly.
+
+Distinct traffic secrets do not deterministically imply distinct derived AEAD
+keys.  Accordingly, `AeadWriteRun.nodup` uses its own finite, explicit
+sufficient condition: the concrete AEAD keys of the epochs in this run are
+pairwise distinct. -/
+
+/-- A write-side run whose trace is tagged by the actual AEAD key used for each
+record. `aeadKeys` lists the concrete AEAD key of every epoch, oldest first;
+`keyNonces` lists the `(AEAD key, nonce)` pair consumed by each successful
+`seal`, in wire order. -/
+inductive AeadWriteRun : Option TrafficKeys → Option TrafficKeys →
+    List ByteArray → List (ByteArray × ByteArray) → Prop where
+  | idle : AeadWriteRun none none [] []
+  | done (keys : TrafficKeys) :
+      AeadWriteRun (some keys) (some keys) [keys.key] []
+  | protect {keys next : TrafficKeys} {dst : Option TrafficKeys}
+      {contentType : ContentType} {fragment wire nonce : ByteArray}
+      {paddingLength : Nat} {aeadKeys : List ByteArray}
+      {keyNonces : List (ByteArray × ByteArray)}
+      (hnonce : keys.nonce = .ok nonce)
+      (hseal : «seal» keys contentType fragment paddingLength = .ok (next, wire))
+      (hrest : AeadWriteRun (some next) dst aeadKeys keyNonces) :
+      AeadWriteRun (some keys) dst aeadKeys ((keys.key, nonce) :: keyNonces)
+  | rekey {keys next : TrafficKeys} {dst : Option TrafficKeys}
+      {aeadKeys : List ByteArray} {keyNonces : List (ByteArray × ByteArray)}
+      (hrest : AeadWriteRun (some next) dst aeadKeys keyNonces) :
+      AeadWriteRun (some keys) dst (keys.key :: aeadKeys) keyNonces
+  | install {keys : TrafficKeys} {dst : Option TrafficKeys}
+      {aeadKeys : List ByteArray} {keyNonces : List (ByteArray × ByteArray)}
+      (hrest : AeadWriteRun (some keys) dst aeadKeys keyNonces) :
+      AeadWriteRun none dst aeadKeys keyNonces
+
+/-- Forget the key-schedule tag of a `WriteRun` and recover the trace of actual
+AEAD key--nonce pairs for the same successful `seal` steps.  The final equality
+makes explicit that this conversion preserves the nonce sequence exactly; only
+the first component of each trace entry changes. -/
+theorem WriteRun.toAeadWriteRun {src dst : Option TrafficKeys}
+    {secrets : List ByteArray} {nonces : List (ByteArray × ByteArray)}
+    (h : WriteRun src dst secrets nonces) :
+    ∃ aeadKeys keyNonces,
+      AeadWriteRun src dst aeadKeys keyNonces ∧
+        keyNonces.map Prod.snd = nonces.map Prod.snd := by
+  induction h with
+  | idle => exact ⟨[], [], AeadWriteRun.idle, rfl⟩
+  | done keys => exact ⟨[keys.key], [], AeadWriteRun.done keys, rfl⟩
+  | protect hnonce hseal hrest ih =>
+      obtain ⟨aeadKeys, keyNonces, haead, hnonces⟩ := ih
+      exact ⟨aeadKeys, (_, _) :: keyNonces,
+        AeadWriteRun.protect hnonce hseal haead, by simp [hnonces]⟩
+  | rekey hrest ih =>
+      obtain ⟨aeadKeys, keyNonces, haead, hnonces⟩ := ih
+      exact ⟨_ :: aeadKeys, keyNonces, AeadWriteRun.rekey haead, hnonces⟩
+  | install hrest ih =>
+      obtain ⟨aeadKeys, keyNonces, haead, hnonces⟩ := ih
+      exact ⟨aeadKeys, keyNonces, AeadWriteRun.install haead, hnonces⟩
+
+private theorem AeadWriteRun.keys_head {keys : TrafficKeys}
+    {dst : Option TrafficKeys} {aeadKeys : List ByteArray}
+    {keyNonces : List (ByteArray × ByteArray)}
+    (h : AeadWriteRun (some keys) dst aeadKeys keyNonces) :
+    ∃ rest, aeadKeys = keys.key :: rest := by
+  generalize hsrc : (some keys : Option TrafficKeys) = src at h
+  induction h generalizing keys with
+  | idle => cases hsrc
+  | done k => cases hsrc; exact ⟨[], rfl⟩
+  | protect hnonce hseal hrest ih =>
+      cases hsrc
+      obtain ⟨rest, hrest'⟩ := ih rfl
+      exact ⟨rest, by rw [hrest', seal_key_eq hseal]⟩
+  | rekey hrest ih => cases hsrc; exact ⟨_, rfl⟩
+  | install hrest ih => cases hsrc
+
+private theorem AeadWriteRun.mem_keys {src dst : Option TrafficKeys}
+    {aeadKeys : List ByteArray} {keyNonces : List (ByteArray × ByteArray)}
+    (h : AeadWriteRun src dst aeadKeys keyNonces) :
+    ∀ p ∈ keyNonces, p.1 ∈ aeadKeys := by
+  induction h with
+  | idle => intro p hp; cases hp
+  | done keys => intro p hp; cases hp
+  | protect hnonce hseal hrest ih =>
+      intro p hp
+      cases hp with
+      | head =>
+          obtain ⟨rest, hrest'⟩ := AeadWriteRun.keys_head hrest
+          rw [hrest', seal_key_eq hseal]
+          exact List.mem_cons_self
+      | tail _ hp => exact ih p hp
+  | rekey hrest ih => intro p hp; exact List.mem_cons_of_mem _ (ih p hp)
+  | install hrest ih => exact ih
+
+private theorem AeadWriteRun.mem_epoch {keys : TrafficKeys}
+    {dst : Option TrafficKeys} {aeadKeys : List ByteArray}
+    {keyNonces : List (ByteArray × ByteArray)}
+    (h : AeadWriteRun (some keys) dst aeadKeys keyNonces)
+    (hfresh : aeadKeys.Nodup) :
+    ∀ p ∈ keyNonces, p.1 = keys.key →
+      ∃ s : UInt64, keys.seq.toNat ≤ s.toNat ∧
+        p.2 = nonceOf keys.iv s := by
+  generalize hsrc : (some keys : Option TrafficKeys) = src at h
+  induction h generalizing keys with
+  | idle => cases hsrc
+  | done k => intro p hp; cases hp
+  | protect hnonce hseal hrest ih =>
+      cases hsrc
+      intro p hp _
+      cases hp with
+      | head => exact ⟨_, Nat.le_refl _, TrafficKeys.nonce_eq hnonce⟩
+      | tail _ hp =>
+          obtain ⟨s, hle, heq⟩ :=
+            ih hfresh rfl p hp (by rw [seal_key_eq hseal]; assumption)
+          refine ⟨s, ?_, ?_⟩
+          · rw [seal_seq_succ hseal] at hle; omega
+          · rw [heq, seal_iv_eq hseal]
+  | rekey hrest ih =>
+      cases hsrc
+      intro p hp hp1
+      exact absurd (hp1 ▸ AeadWriteRun.mem_keys hrest p hp)
+        (List.nodup_cons.mp hfresh).1
+  | install hrest ih => cases hsrc
+
+/-- **AEAD key--nonce non-reuse.** If the concrete AEAD keys installed by the
+epochs of a finite executable write run are pairwise distinct, no two records
+in that run use the same `(AEAD key, nonce)` pair.  Within an epoch this follows
+unconditionally from sequence advancement and nonce injectivity; `hfresh` is
+the explicit sufficient collision condition across epochs. -/
+theorem AeadWriteRun.nodup {src dst : Option TrafficKeys}
+    {aeadKeys : List ByteArray} {keyNonces : List (ByteArray × ByteArray)}
+    (h : AeadWriteRun src dst aeadKeys keyNonces)
+    (hfresh : aeadKeys.Nodup) : keyNonces.Nodup := by
+  induction h with
+  | idle => exact List.nodup_nil
+  | done keys => exact List.nodup_nil
+  | protect hnonce hseal hrest ih =>
+      rename_i keys next _ _ _ _ nonce _ _ _
+      refine List.nodup_cons.mpr ⟨?_, ih hfresh⟩
+      intro hmem
+      obtain ⟨s, hle, heq⟩ :=
+        AeadWriteRun.mem_epoch hrest hfresh _ hmem (seal_key_eq hseal).symm
       have hnonce' : nonce = nonceOf keys.iv keys.seq :=
         TrafficKeys.nonce_eq hnonce
       rw [seal_iv_eq hseal] at heq
@@ -1546,21 +1762,19 @@ theorem Extends.run {before after : Option TrafficKeys} (h : Extends before afte
       obtain ⟨o, e, h'⟩ := h (some k) _ _ (WriteRun.done k)
       exact ⟨_, _, h'⟩
 
-/-! ## Discharging `secrets.Nodup` from the key schedule
+/-! ## Refining a finite trace by the key schedule
 
-`WriteRun.nodup` takes the distinctness of the run's traffic secrets as a
-hypothesis. It need not: TLS does not pick those secrets arbitrarily, it derives
-each one with `HKDF-Expand-Label` at a specific label over a specific context
-(RFC 8446 §7.1) and rolls it forward with `"traffic upd"` (§7.2). If that
-primitive is injective — `TLS13.KeySchedule.Spec.ExpandLabelInjective`, the one
-named assumption — then an epoch's traffic secret determines the whole
-derivation, and a run whose epochs are *strictly increasing in the schedule's
-own order* automatically has distinct secrets.
+`EpochsFrom` states that the traffic-secret list of a run is the evaluation of a
+strictly increasing list of RFC 8446 §7.1 / §7.2 derivation histories, and
+`SpecExtends` is the `Extends` transformer refined to carry that fact. The
+engines prove `SpecExtends` step by step exactly as they prove `Extends`; the
+extra obligation appears only where an epoch is installed.
 
-`EpochsFrom` is that "strictly increasing" property of a run's secret list, and
-`SpecExtends` is the `Extends` transformer refined to carry it. The engines
-prove `SpecExtends` step by step exactly as they prove `Extends`; the extra
-obligation appears only where an epoch is actually installed. -/
+This structural refinement does not turn distinct derivation histories into
+distinct byte strings. `SpecExtends.finite_nonce_trace` therefore returns both
+the traffic-secret schedule bookkeeping and the actual `(AEAD key, nonce)`
+trace. Its non-repetition result uses the explicit, satisfiable finite-run
+condition that the concrete AEAD keys installed in that trace are distinct. -/
 
 open TLS13.KeySchedule
 
@@ -1612,26 +1826,6 @@ theorem EpochsFrom.mono {H : Spec.Hkdf} {o o' : Option Spec.Epoch}
     (h : EpochsFrom H o' secrets) : EpochsFrom H o secrets := by
   obtain ⟨epochs, hmap, hchain, hmem⟩ := h
   exact ⟨epochs, hmap, hchain, fun e he => ⟨(hmem e he).1, hle e (hmem e he).2⟩⟩
-
-/-- **A run whose epochs strictly increase never repeats a traffic secret.**
-The distinctness `WriteRun.nodup` asks for is a *consequence* of the schedule
-once `HKDF-Expand-Label` is injective, because the secret of an epoch determines
-that epoch (`Spec.Epoch.eq_of_secret_eq`). -/
-theorem EpochsFrom.nodup {H : Spec.Hkdf} (hinj : Spec.ExpandLabelInjective H)
-    {o : Option Spec.Epoch} {secrets : List ByteArray} (h : EpochsFrom H o secrets) :
-    secrets.Nodup := by
-  obtain ⟨epochs, hmap, hchain, hmem⟩ := h
-  subst hmap
-  induction epochs with
-  | nil => exact List.nodup_nil
-  | cons e rest ih =>
-      obtain ⟨hhead, htail⟩ := List.pairwise_cons.mp hchain
-      refine List.nodup_cons.mpr ⟨?_, ih htail (fun x hx => hmem x (List.mem_cons_of_mem _ hx))⟩
-      intro hcontra
-      obtain ⟨x, hx, hxe⟩ := List.mem_map.mp hcontra
-      exact (hhead x hx).ne
-        (Spec.Epoch.eq_of_secret_eq hinj (hmem e List.mem_cons_self).1
-          (hmem x (List.mem_cons_of_mem _ hx)).1 hxe.symm)
 
 /-- `Extends`, refined by the key schedule: a step from a write state in epoch
 `o` to one in epoch `o'`, which extends any strictly-increasing-epoch run of the
@@ -1720,7 +1914,7 @@ theorem WithinEpoch.of_seal {H : Spec.Hkdf} {keys next : TrafficKeys}
   exact ⟨EpochOf.intro (by rw [seal_secret_eq h]; exact hsec), SpecExtends.of_seal h⟩
 
 /-- Read back the run a chain of refined steps certifies, together with the
-strictly increasing epoch list that makes its traffic secrets distinct. -/
+strictly increasing list of key-schedule derivation histories it traversed. -/
 theorem SpecExtends.run {H : Spec.Hkdf} {o o' : Option Spec.Epoch}
     {before after : Option TrafficKeys} (h : SpecExtends H o o' before after)
     (hafter : EpochOf H o' after) (hvalid : ∀ e, o' = some e → e.Valid) :
@@ -1746,18 +1940,29 @@ theorem SpecExtends.run {H : Spec.Hkdf} {o o' : Option Spec.Epoch}
                 | tail _ hx => exact absurd hx (List.not_mem_nil)⟩
           exact ⟨_, _, h', hl⟩
 
-/-- **Nonce non-reuse with the epoch hypothesis discharged.** Given a refined run
-— one whose every epoch change is accounted for by the key schedule — and the
-injectivity of `HKDF-Expand-Label`, no (traffic secret, nonce) pair repeats. The
-`secrets.Nodup` hypothesis of `WriteRun.nodup` is *proved* here rather than
-assumed; what remains assumed is `hinj`, a property of the primitive. -/
-theorem SpecExtends.nonce_nodup {H : Spec.Hkdf} (hinj : Spec.ExpandLabelInjective H)
+/-- **A finite, schedule-refined AEAD key--nonce trace.** A refined run yields
+both the traffic-secret tags used to connect the executable path to its strictly
+increasing key-schedule nodes and the actual `(AEAD key, nonce)` pairs consumed
+by that path. The two traces have exactly the same nonce sequence.
+
+Within an epoch, key--nonce non-repetition is unconditional. Across epochs, the
+explicit sufficient condition is that the concrete AEAD keys in this finite
+trace are distinct. This keeps the relevant collision boundary visible instead
+of replacing it with an impossible global injectivity premise. -/
+theorem SpecExtends.finite_nonce_trace {H : Spec.Hkdf}
     {o o' : Option Spec.Epoch} {before after : Option TrafficKeys}
     (h : SpecExtends H o o' before after) (hafter : EpochOf H o' after)
     (hvalid : ∀ e, o' = some e → e.Valid) :
-    ∃ secrets nonces, WriteRun before after secrets nonces ∧ nonces.Nodup := by
-  obtain ⟨secrets, nonces, hrun, hl⟩ := h.run hafter hvalid
-  exact ⟨secrets, nonces, hrun, hrun.nodup (hl.nodup hinj)⟩
+    ∃ secrets taggedNonces aeadKeys keyNonces,
+      WriteRun before after secrets taggedNonces ∧
+        EpochsFrom H o secrets ∧
+        AeadWriteRun before after aeadKeys keyNonces ∧
+        keyNonces.map Prod.snd = taggedNonces.map Prod.snd ∧
+        (aeadKeys.Nodup → keyNonces.Nodup) := by
+  obtain ⟨secrets, taggedNonces, hrun, hepochs⟩ := h.run hafter hvalid
+  obtain ⟨aeadKeys, keyNonces, haead, hsame⟩ := hrun.toAeadWriteRun
+  exact ⟨secrets, taggedNonces, aeadKeys, keyNonces, hrun, hepochs,
+    haead, hsame, fun hfresh => haead.nodup hfresh⟩
 
 /-! ## Rolling an epoch forward
 

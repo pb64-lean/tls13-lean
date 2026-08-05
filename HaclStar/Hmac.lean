@@ -10,7 +10,8 @@ building block of HKDF and of the Finished message MAC in TLS 1.3.
 
 namespace HaclStar
 
-/-- HMAC-SHA256 of `data` under `key` (32-byte tag). -/
+/-- HMAC-SHA256 of `data` under `key` (32-byte tag). An input too large for
+HACL's `uint32_t` length API returns the empty `ByteArray` misuse sentinel. -/
 @[extern "tls13_hacl_hmac_sha256"]
 opaque hmacSha256 (key data : ByteArray) : ByteArray
 

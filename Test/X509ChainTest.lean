@@ -64,6 +64,20 @@ private def withKeyCertSign
     { certificate with
       tbsCertificate := { certificate.tbsCertificate with extensions } }
 
+private def withDigitalSignature
+    (certificate : Certificate) (enabled : Bool) : Certificate :=
+  match certificate.tbsCertificate.extensions.keyUsage with
+  | none => certificate
+  | some usage =>
+    let extensions := {
+      certificate.tbsCertificate.extensions with
+      keyUsage := some {
+        usage with value := { usage.value with digitalSignature := enabled }
+      }
+    }
+    { certificate with
+      tbsCertificate := { certificate.tbsCertificate with extensions } }
+
 private def withPathLen
     (certificate : Certificate) (pathLen : Option Nat) : Certificate :=
   match certificate.tbsCertificate.extensions.basicConstraints with
@@ -149,12 +163,16 @@ private def testValidPath
 
   -- A self-signed certificate terminates only when the exact certificate is
   -- an anchor. Its self-signature is not treated as another path link.
-  let direct ← expectVerified "direct self-signed anchor"
-    (Chain.validate now root #[] trust)
+  let signingRoot := withDigitalSignature root true
+  let direct ← expectVerified "direct self-signed TLS target anchor"
+    (Chain.validate now signingRoot #[] { anchors := #[signingRoot] })
   check "direct anchor path" (direct.path.size == 1)
-  expectFailure "untrusted self-signed certificate"
-    (Chain.validate now root #[] { anchors := #[] })
-    (.unknownIssuer root.tbsCertificate.serialNumber)
+  expectFailure "self-signed target KeyUsage lacks digitalSignature"
+    (Chain.validate now root #[] trust)
+    (.leafDigitalSignatureMissing root.tbsCertificate.serialNumber)
+  expectFailure "untrusted self-signed TLS target"
+    (Chain.validate now signingRoot #[] { anchors := #[] })
+    (.unknownIssuer signingRoot.tbsCertificate.serialNumber)
 
 private def testBacktracking
     (now : Int) (leaf intermediate root wrongIssuer : Certificate) : IO Unit := do
@@ -207,6 +225,12 @@ private def testFailures
     (Chain.validate now validLeaf #[noCertificateSigning]
       { anchors := #[validRoot] })
     (.keyCertSignMissing validIntermediate.tbsCertificate.serialNumber)
+
+  let noDigitalSignature := withDigitalSignature validLeaf false
+  expectFailure "leaf KeyUsage lacks digitalSignature"
+    (Chain.validate now noDigitalSignature #[validIntermediate]
+      { anchors := #[validRoot] })
+    (.leafDigitalSignatureMissing validLeaf.tbsCertificate.serialNumber)
 
   let rootWithoutCertificateSigning := withKeyCertSign validRoot false
   expectFailure "anchor KeyUsage lacks keyCertSign"

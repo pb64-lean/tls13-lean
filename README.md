@@ -2,10 +2,17 @@
 
 [![CI](https://github.com/pb64-lean/tls13-lean/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/pb64-lean/tls13-lean/actions/workflows/ci.yml) [![Assurance](https://github.com/pb64-lean/tls13-lean/actions/workflows/assurance.yml/badge.svg?branch=main)](https://github.com/pb64-lean/tls13-lean/actions/workflows/assurance.yml)
 
-TLS 1.3 for Lean 4: pure-Lean protocol machinery — record layer, handshake
+TLS 1.3 for Lean 4, targeting the current RFC 9846 specification: pure-Lean protocol machinery — record layer, handshake
 codecs, sans-I/O **client and server** state machines, and X.509 path
 validation — over **formally verified, constant-time crypto primitives** bound
 from [HACL\*](https://github.com/hacl-star/hacl-star) via an explicit C FFI.
+
+RFC 9846 obsoletes RFC 8446. Historical theorem/API names such as `rfc8446`
+and `masterSecret` remain for compatibility where they identify inherited
+key-schedule structure, unchanged wire labels, or historical test vectors.
+Applicable RFC 9846 behavior in this implemented profile is described below;
+unsupported features and caller obligations remain explicit under
+[Protocol scope](#protocol-scope).
 
 This is the "own the protocol logic, borrow the primitives" design. HACL\*
 supplies the machine-checked C crypto; Lean supplies explicit protocol state.
@@ -26,80 +33,61 @@ machine-checked, and it matters which is which:
   extension preservation, ClientHello canonicity — a parsed ClientHello
   re-encodes to exactly the bytes it came from — HelloRetryRequest
   discrimination, no partial frame ever accepted), the **state machines**
-  (nonce non-reuse across a whole connection, plus handshake state
-  invariants and transition laws), the **key schedule** (structural
-  refinement against RFC 8446 §7.1's derivation tree — see below), and the
-  DER decoder (exact-slice retention carried through to the bytes
-  certificate signatures are verified over). These are proofs about the
-  executable definitions, not a parallel model.
+  (finite write traces over the actual `(AEAD key, nonce)` pairs, with
+  unconditional within-epoch non-repetition and an explicit finite-run
+  derived-key distinctness condition across epochs, plus handshake state
+  invariants and transition laws), the
+  **key schedule** (structural refinement against RFC 8446 §7.1's derivation
+  tree — see below), and the DER decoder (exact-slice retention carried through
+  to the bytes certificate signatures are verified over). These are proofs
+  about the executable definitions, not a parallel model.
 
-**Nonce non-reuse, stated exactly.** `Tls.Client.Laws.run_nonce_nodup` and
-`Tls.Server.Laws.run_nonce_nodup` say: for any successful run of the engine
-there is an explicit `Tls.Record.Laws.WriteRun` — the list of records the run
-protected, each tagged with the traffic secret of the epoch that protected it —
-leading from the connection's initial write state to its final one, in which no
-(secret, nonce) pair repeats. Read the fine print:
+**AEAD write-trace distinctness, stated exactly.**
+`Tls.Client.run_nonce_nodup` and `Tls.Server.run_nonce_nodup` say: for any
+successful engine run there is an explicit finite `Tls.Record.AeadWriteRun` —
+the list of records the run protected, each tagged with the concrete AEAD key
+that protected it — leading from the connection's initial write state to its
+final one. If the concrete epoch keys in that run are distinct, no
+`(AEAD key, nonce)` pair repeats. This is the cryptographically relevant nonce
+misuse claim, with derived-key collision freedom left as a visible sufficient
+condition on the finite execution. Read the fine print:
 
 - It is about *this engine's own emissions along one chain of states*. A caller
   who clones a `State` and drives two connections from the same keys is outside
   its reach — Lean values are duplicable, and no theorem about a pure function
   can forbid copying one. Single-threading the state is the caller's obligation.
-- It covers the **write** direction only. Nonce reuse is a sender property; the
-  read-side nonces are the peer's.
-- Sequence numbers restart at zero on every KeyUpdate, so the trace is *scoped
-  by traffic-secret epoch*. Within one epoch nothing is assumed: `seal` uses the
-  nonce of the current sequence number and returns the state with that number
-  advanced without wrapping, and for a fixed IV the nonce determines the
-  sequence number. Distinctness *across* epochs is a hypothesis
-  (`secrets.Nodup`) in `run_nonce_nodup` — and a **theorem** in
-  `run_nonce_nodup_spec`, which is the stronger form described next.
+- It covers the **write** direction only. The tracked records are this engine's
+  emissions; read-side nonces are the peer's.
+- Sequence numbers restart at zero on every KeyUpdate, so the trace is scoped
+  by concrete AEAD key. Within one epoch no freshness hypothesis is needed:
+  `seal` uses the nonce of the current sequence number and returns the state
+  with that number advanced without wrapping, and for a fixed IV the nonce
+  determines the sequence number. Pair distinctness *across* epochs uses the
+  hypothesis `aeadKeys.Nodup` on this finite trace.
 
-**Nonce non-reuse from one named assumption about HKDF.**
-`Tls.Client.Laws.run_nonce_nodup_spec` and `Tls.Server.Laws.run_nonce_nodup_spec`
-(and `start_run_nonce_nodup`, the form a caller sees: begin with `start`, drive
-with `run`) drop the `secrets.Nodup` hypothesis and conclude `nonces.Nodup`
-outright. What replaces it is one named, visible property of the primitive:
+**The key schedule refines the trace; it does not discharge collisions.**
+`Tls.Client.run_nonce_trace_spec` and
+`Tls.Server.run_nonce_trace_spec` (plus the corresponding `feed` and
+`start_run_nonce_trace_spec` forms) return both traces: a `WriteRun` whose
+traffic secrets are evaluations of strictly increasing RFC 8446 §7.1 / §7.2
+epoch descriptors, and an `AeadWriteRun` over the actual keys, with an equality
+showing that they record the same nonce sequence. `c hs traffic` precedes
+`c ap traffic`, and every KeyUpdate moves one structural `"traffic upd"` step
+forward. Distinct derivation histories need not produce distinct bytes: a
+fixed-size KDF cannot be globally injective, and an unbounded fixed-size
+KeyUpdate chain must eventually collide. Consequently:
 
-```lean
-structure ExpandLabelInjective (H : Hkdf) : Prop where
-  eq_of_expandLabel : ∀ {s₁ s₂ c₁ c₂ : ByteArray} {l₁ l₂ : Label} {n₁ n₂ : Nat},
-    expandLabel H s₁ l₁ c₁ n₁ = expandLabel H s₂ l₂ c₂ n₂ →
-    s₁ = s₂ ∧ l₁ = l₂ ∧ c₁ = c₂ ∧ n₁ = n₂
-```
-
-— `HKDF-Expand-Label` never maps two different argument tuples to the same
-bytes. It is a hypothesis of the theorems, in the same style as `LawfulAead` and
-`Implements`, not something buried in a proof. Read the fine print here too:
-
-- **It is still an assumption about HACL\*'s HKDF, and it is not proved.**
-  `H.expand` is an opaque `@[extern]` binding; nothing in this repository can
-  say what it computes. This is not a security proof, and injectivity is not
-  pseudorandomness. What changed is the *size* of what must be trusted: from
-  "the particular byte strings this run produced happen to differ" to a
-  standard, reviewable property of a KDF — one an auditor can weigh against
-  HACL\*'s HKDF once, rather than per run.
-- What the repository proves is the other half: that the epochs a run installs
-  really are distinct *nodes* of the schedule. `Spec.Epoch` names an epoch by
-  the derivation that produced it (parent secret, label, context, number of §7.2
-  KeyUpdates since); `Spec.Epoch.eq_of_secret_eq` says injectivity makes an
-  epoch's traffic secret determine that node; and `Tls.Client.run_epochs` /
-  `Tls.Server.run_epochs` say every epoch an engine installs is a **strictly
-  later** node than the one it replaces — `c hs traffic` before `c ap traffic`
-  (RFC 8446 §7.1 stage order), and each KeyUpdate one `"traffic upd"` further
-  along. `Tls.Record.EpochsFrom.nodup` turns "strictly increasing" into
-  "pairwise distinct".
-- **The KeyUpdate chain is covered without a bound.** `Spec.Epoch.updates` is an
-  unbounded `Nat` and the induction in `eq_of_secret_eq` peels one
-  `"traffic upd"` at a time, so the guarantee holds for a connection that
-  rekeys any number of times. No fixed-point or acyclicity assumption is needed:
-  a §7.2 successor carries the label `"traffic upd"` and a §7.1 traffic secret
-  does not, so injectivity alone separates the chain from its own root.
-- The theorems are conditional on the connection *starting* before its first
-  epoch — a client waiting for the ServerHello, a server waiting for a
-  ClientHello, which is what `start` produces and what
-  `State.WellFormed.noWriteKeys` maintains. That is exactly what rules out a
-  hand-built `State` whose write keys are already the epoch a later transition
-  will install. The caller's single-threading obligation is unchanged.
+- `aeadKeys.Nodup → keyNonces.Nodup` remains visible in the theorem. It is a
+  satisfiable condition on the particular finite run, and collision resistance
+  makes it overwhelmingly likely for feasible executions; it is not a
+  deterministic theorem about the opaque HACL\* binding.
+- `Spec.Epoch.updates` is still an unbounded `Nat`, so the structural result
+  covers any number of KeyUpdates without pretending that their evaluated
+  byte strings are forever unique.
+- The schedule-refined forms start before the first epoch — a client waiting
+  for ServerHello or a server waiting for ClientHello, as produced by `start`
+  and maintained by `State.WellFormed.noWriteKeys`. The caller's
+  single-threading obligation is unchanged.
 
 **Key-schedule refinement, stated exactly.** `TLS13/KeySchedule/Spec.lean` is a
 declarative transcription of RFC 8446 §7.1: the `HkdfLabel` wire structure,
@@ -122,7 +110,7 @@ laws then prove the implementation computes it. Read the fine print:
   RFC's labels, the RFC's contexts, the RFC's parent secrets, the RFC's output
   lengths, in the RFC's order. That is precisely the class real TLS
   key-schedule bugs fall into — a mistyped label, the wrong transcript at a
-  `Derive-Secret`, the handshake secret used where the master secret belongs, a
+  `Derive-Secret`, the handshake secret used where the main secret belongs, a
   derivation step omitted.
 - One theorem *is* unconditionally about bytes: `hkdfLabel_bytes`. The
   `HkdfLabel` serialization is pure Lean, so its wire image is pinned outright
@@ -135,8 +123,9 @@ laws then prove the implementation computes it. Read the fine print:
   `acceptServerHello_transcript` identifies), and
   `completeServerHandshake_keySchedule` says that at the moment the client
   becomes `connected` its write epoch is `c ap traffic` and its read epoch
-  `s ap traffic`, each `Derive-Secret` of the **Master** Secret over
-  ClientHello…server Finished, with their §7.3 key/IV/sequence state.
+  `s ap traffic`, each `Derive-Secret` of the **Main** Secret (the API's
+  historical `masterSecret`) over ClientHello…server Finished, with their §7.3
+  key/IV/sequence state.
   `Tls.Server.completeClientHello_keySchedule` is the server's mirror, and also
   pins the client Finished it will demand to §4.4.4's `finished_key` of the
   client handshake traffic secret. `processHandshakeBuffer_keySchedule` carries
@@ -183,7 +172,8 @@ Four Bazel packages:
   declarations over two small C shims.
 - **`TLS13/`** — the RFC 8446 §7.1 key schedule, its specification, and the
   X.509 stack. `TLS13.KeySchedule` is the executable schedule
-  (`HKDF-Expand-Label`, `Derive-Secret`, Early/Handshake/Master);
+  (`HKDF-Expand-Label`, `Derive-Secret`, Early/Handshake/Main, with the
+  historical API name `masterSecret`);
   `TLS13.KeySchedule.Spec` is §7.1 transcribed declaratively over an abstract
   HKDF interface, with the derivation diagram encoded as data (`Derived.parent`
   / `Derived.label` / `Derived.context`, certified against the RFC by
@@ -216,10 +206,13 @@ Four Bazel packages:
   `seal`, wire bytes and all. It also defines `WriteRun`, the explicit trace
   of the `seal` calls a state machine performs — every step pinned to a real
   successful `seal` of the state the previous one returned — and proves
-  `WriteRun.nodup`, the nonce non-reuse theorem the engines' laws instantiate,
-  together with the refinement of that trace by the key schedule (`EpochsFrom`,
-  `SpecExtends`) that lets the engines discharge its epoch-distinctness
-  hypothesis rather than assume it.
+  `WriteRun.nodup`, the traffic-secret/nonce bookkeeping result. It also defines
+  `AeadWriteRun`, converts every `WriteRun` to the corresponding trace over the
+  concrete AEAD keys, and proves `AeadWriteRun.nodup`; that is the
+  cryptographically relevant theorem the engines instantiate. The schedule
+  refinement (`EpochsFrom`, `SpecExtends`) identifies the strictly increasing
+  derivation histories behind the traffic-secret trace while retaining
+  concrete AEAD-key distinctness as an explicit finite-run condition.
   The handshake layer mirrors framing
   conservation: a decoded message's retained `encoded` bytes plus the
   remainder reproduce the input buffer exactly. `Tls.Handshake` also ends in
@@ -230,14 +223,14 @@ Four Bazel packages:
   CertificateVerify/Finished/NewSessionTicket/KeyUpdate bodies invert
   semantically, extension lists, `uint16` vectors and client key-share lists
   roundtrip for arbitrary (including unknown and GREASE) types and values, and
-  HelloRetryRequest is discriminated from ServerHello by the RFC 8446 sentinel
+  HelloRetryRequest is discriminated from ServerHello by the RFC 9846 sentinel
   random. `parseClientHello_clientHelloBody_mem` lifts that to a whole
   ClientHello: the cipher suites, offered versions, supported groups, key-share
   groups, signature schemes and the entire extension list — unknown and GREASE
   entries included — are returned in wire order with nothing dropped or
   reordered, with the four interpreted extensions allowed anywhere in the list
   in any interleaving (the only structural hypothesis left is that no two
-  extensions share a type, which RFC 8446 forbids and `parseExtensions`
+  extensions share a type, which RFC 9846 forbids and `parseExtensions`
   rejects). `parseClientHello_clientHelloBody_psk` covers the resumption shape
   as well — a `pre_shared_key` offer as the final extension with a non-empty
   `psk_key_exchange_modes` is accepted and retained verbatim (PSK is still not
@@ -257,10 +250,13 @@ Four Bazel packages:
   is already complete never change what is delivered (`takeMessage?_append`,
   for an arbitrary buffer). The list codecs are proved lossless in the other
   direction too: `parseExtensions_image`, `parseUInt16List_image` and
-  `parseKeyShareEntries_image` show that every block the parser accepts *is*
-  the wire image of the list it produced, so re-encoding a parsed list
-  reproduces the original bytes (and for extension blocks and `uint16` vectors
-  distinct buffers never parse alike). `parseClientHello_canonical` composes
+  `parseKeyShareEntries_image` show that every block the parser accepts has a
+  lossless existential wire decomposition consistent with the identifiers and
+  known-group shares it returned. Unlike extension blocks and `uint16`
+  vectors, a parsed key-share result cannot itself be re-encoded to recover the
+  input: unknown/GREASE groups retain their identifiers but deliberately drop
+  their opaque key bytes, so no parser-injectivity theorem is possible.
+  `parseClientHello_canonical` composes
   those into ClientHello canonicity: a ClientHello that parsed re-encodes to
   exactly the body it came from, so comparing the parsed fields of a retry
   ClientHello against the original is as strong as comparing the bytes
@@ -268,19 +264,21 @@ Four Bazel packages:
   flow needs, and now what it *runs*: the server keeps the first ClientHello as
   parsed and compares the second with one named check,
   `Tls.Server.checkRetryClientHello`, whose
-  `Tls.Server.Laws.checkRetryClientHello_body_eq` derives byte equality of the
+  `Tls.Server.checkRetryClientHello_body_eq` derives byte equality of the
   two message bodies from the canonicity law.
 
   `Tls.Client.Laws` and `Tls.Server.Laws` carry that discipline into the state
   machines. Every write path of both engines is proved to advance the write
-  traffic state along `Tls.Record.Laws.Extends` — records are protected with the
+  traffic state along `Tls.Record.Extends` — records are protected with the
   keys the engine's own state carries and the advanced state is stored straight
-  back — which composes into the nonce non-reuse theorem quoted above
+  back — which composes into the write-trace distinctness theorem quoted above
   (`run_nonce_nodup`, and `feed_nonce_nodup` for a single feed, which for a
   server covers the whole encrypted handshake flight). The same walk is done a
   second time carrying the *identity* of each epoch as a key-schedule node
-  (`run_epochs`), which is what makes `run_nonce_nodup_spec` unconditional on
-  epoch freshness. Alongside it,
+  (`run_epochs`); `run_nonce_trace_spec` returns that structural witness beside
+  both the traffic-secret bookkeeping trace and the actual AEAD key--nonce
+  trace, without conflating distinct nodes with distinct derived-key bytes.
+  Alongside it,
   `State.WellFormed` is a structural invariant of an established connection —
   the client has both application epochs and has dropped the handshake secrets
   and transcript; the server has the client application epoch installed and has
@@ -292,8 +290,10 @@ Four Bazel packages:
   be phase-indexed rather than a bare `connected → …` because the server
   installs its write keys one transition earlier than the client does — in
   `completeClientHello`, since the flight it emits right there is already
-  encrypted — and it is what makes `sealApplication`, `closeNotify`,
-  `sealFatalAlert` and a KeyUpdate response total on an established connection.
+  encrypted — and it rules out a missing-write-keys failure for
+  `sealApplication`, `closeNotify`, `sealFatalAlert`, and a KeyUpdate response
+  on an established connection. Record-layer failures such as sequence
+  exhaustion remain possible.
   The client's (`WellFormed.noReadKeys`) is the inbound mirror, and the
   state-only half of the application-data rule below: while the client is still
   waiting for the ServerHello it holds *no* read epoch, so it cannot decrypt a
@@ -303,9 +303,9 @@ Four Bazel packages:
   (`WellFormed.noReadKeys`, over `waitingClientHello` and
   `waitingSecondClientHello`, so the HelloRetryRequest detour is covered), and
   both engines also carry its write-side half (`WellFormed.noWriteKeys`): before
-  the connection's first epoch is installed there is none to replace, which is
-  what `run_nonce_nodup_spec` needs in order to know no epoch is ever
-  revisited. The transition laws
+  the connection's first epoch is installed there is none to replace, which
+  anchors `run_nonce_trace_spec` at the beginning of the schedule. The
+  transition laws
   cover the rest of the state-machine list: a connection becomes established
   only by verifying the peer `Finished` (`completeServerHandshake_verified`,
   `acceptClientFinished_verified`), application data is protected only by an
@@ -314,11 +314,15 @@ Four Bazel packages:
   caller alongside an established connection, for a single feed and for a whole
   run (`feed_plaintext_connected`, `run_plaintext_connected`; both rest on
   `connected` being absorbing, which is proved as `feed_connected` /
-  `run_connected`), a closed
-  connection is terminal (`feedWithFailure_closed`; every other failure is an
-  `Except` error carrying no successor state, so failure is terminal by
-  construction), HelloRetryRequest installs the RFC 8446 synthetic
-  `message_hash` transcript (`sendHelloRetryRequest_messageHash`), a KeyUpdate
+  `run_connected`), receiving `close_notify` half-closes only the peer's write
+  direction and later peer data is ignored
+  (`feedWithFailure_peerClosed_ignored`); after the local direction closes, a
+  crossing requested KeyUpdate still advances the read epoch but emits nothing,
+  and even fatal alerts are suppressed
+  (`acceptKeyUpdate_localClosed_suppresses_response`,
+  `sealFatalAlert_localClosed`). HelloRetryRequest installs the RFC
+  9846 synthetic `message_hash` transcript
+  (`sendHelloRetryRequest_messageHash`), a KeyUpdate
   moves to the successor traffic secret and restarts its sequence number
   (`acceptKeyUpdate_epoch`), and accepting the ServerHello extends the
   transcript by exactly the message consumed (`acceptServerHello_transcript`).
@@ -327,7 +331,7 @@ Four Bazel packages:
   public but not `@[expose]`d: nameable, so the laws are public statements the
   assurance audit can cite, but not unfoldable outside their own modules.
   Laws about the remaining `private` helpers stay `private`.
-- **`Test/`** — nine hermetic test binaries, a one-shot loopback server
+- **`Test/`** — ten hermetic test binaries, a one-shot loopback server
   harness, and a scripted (manual-tag) interoperability gate that drives the
   harness with real OpenSSL, curl, and Go `crypto/tls` clients. Each of the
   three library packages also carries a `lean_assurance_test` that audits the
@@ -345,27 +349,51 @@ Implemented and negotiated today:
   with a raw Ed25519 key). Clients accept CertificateVerify signatures with
   `ecdsa_secp256r1_sha256`, `ed25519`, `rsa_pss_rsae_sha256`, and
   `rsa_pss_pss_sha256`; PKCS#1 v1.5 is advertised for certificate-*chain*
-  selection only, as RFC 8446 requires.
+  selection only, as RFC 9846 requires.
 - **Extensions**: server_name, supported_groups, signature_algorithms, ALPN,
   supported_versions, key_share; the server performs HelloRetryRequest with
   the synthetic `message_hash` transcript and strict second-ClientHello
   checks.
+- **Post-handshake core**: both roles receive KeyUpdate, advance the read
+  epoch, and, while the local write side remains open, answer
+  `update_requested` under the old write epoch before advancing it. Responses
+  stop at RFC 9846's `2^48 - 1` sending-epoch limit;
+  the receiving direction is intentionally not capped. Key-changing messages
+  must finish their protected record. The API does not currently initiate a
+  proactive `update_requested` KeyUpdate, so there is no outstanding-request
+  state to manage. It also responds per requested record while processing a
+  feed; a batch containing several requested KeyUpdates is not collapsed into
+  one deferred response.
+- **Orderly closure**: `close_notify` is a directional half-close. It produces
+  no automatic echo, leaves the local write direction usable, and causes
+  already-framed later records and later input chunks to be ignored. Once the
+  local direction has sent its own `close_notify`, it emits no more records:
+  a crossing requested KeyUpdate advances only the read epoch, and
+  `sealFatalAlert` returns `connectionClosed`.
 
 Explicitly not yet supported (a candid list): PSK and session resumption
-(NewSessionTicket is parsed and discarded; the server never issues tickets),
-0-RTT, the exporter and resumption master secrets, client certificates,
+(NewSessionTicket is silently ignored without semantically parsing its body;
+the server never issues tickets),
+0-RTT, the exporter and resumption secrets, client certificates,
 AES-GCM suites, client-side HelloRetryRequest processing, and post-quantum
 hybrid groups (a hybrid key share in a
 ClientHello is tolerated and skipped, not negotiated). The server's
 *negotiated* surface stays deliberately narrow (ChaCha20-Poly1305 +
-X25519/P-256 + Ed25519 — algorithms every modern client implements), but
-its *acceptance* follows RFC 8446's select-from-overlap rule: unknown cipher
-suites, groups, signature schemes, GREASE values, and extensions are
-tolerated wherever the RFC permits. Mainstream clients interoperate with
-the server today — OpenSSL `s_client`, curl, and Go `crypto/tls` all
+X25519/P-256 + Ed25519 — algorithms implemented by the clients in the interop
+gate), but its *acceptance* follows RFC 9846's select-from-overlap rule:
+unknown cipher suites, groups, signature schemes, GREASE values, and
+extensions are tolerated wherever the RFC permits. Mainstream clients
+interoperate with the server today — OpenSSL `s_client`, curl, and Go `crypto/tls` all
 complete handshakes and fetch a page over the loopback harness, including
 the HelloRetryRequest path when their first flight carries only key shares
 this server does not implement (see the interop gate under Tests).
+
+One closure edge remains explicit: `Record.Decoder.feed` frames a whole input
+chunk before the state machine processes its records. Consequently, a malformed
+record header trailing a valid `close_notify` in the *same* `feed` call can
+still make framing fail before the alert is observed; the same bytes in a later
+call are ignored. Removing that chunk-boundary distinction requires a
+decode-one/process-one driver rather than the current batch decoder.
 
 ## X.509
 
@@ -373,11 +401,17 @@ this server does not implement (see the interop gate under Tests).
 full certificate parsing with byte-exact retention of the signed structures,
 path building with backtracking and bounded work
 (depth ≤ 10, ≤ 128 issuer attempts by default), expiry, CA / `keyCertSign` /
-`pathLenConstraint` enforcement, rejection of unhandled critical extensions,
+`pathLenConstraint` enforcement, the RFC 9846 leaf `digitalSignature` KeyUsage
+condition, rejection of unhandled critical extensions,
 libpq-style hostname verification (SAN dNSName wildcards, IPv4/IPv6
 literals, CN fallback only without SAN; IDNA names must be given in A-label
 form), and channel-binding digests. Chain signature algorithms:
 ECDSA-P256-SHA256, Ed25519, RSA PKCS#1 v1.5 SHA-256, RSA-PSS SHA-256.
+
+The server applies the relevant leaf policy on the sending side as well:
+before constructing its certificate flight it strict-decodes the configured
+leaf, rejects a present KeyUsage without `digitalSignature`, and requires an
+Ed25519-compatible SPKI for its CertificateVerify scheme.
 
 Deliberately out of scope, matching libpq's default behavior: CRL and OCSP
 revocation. Also not interpreted: extendedKeyUsage, nameConstraints, policy
@@ -389,13 +423,19 @@ critical extensions are rejected).
 The engines perform no I/O, read no clock, and generate no entropy:
 
 - `Tls.Client.Config` / `Tls.Server.Config` take caller-supplied randoms,
-  ephemeral key-exchange scalars, and session ids; callers are responsible
-  for sourcing them from a CSPRNG (downstream shells use Lean's
-  `IO.getRandomBytes`). The ECDSA signing binding likewise takes an explicit
-  per-message nonce — nonce hygiene is the caller's responsibility.
+  ephemeral key-exchange scalars, and session ids. Each key share must be
+  generated independently and used for exactly one connection, as RFC 9846
+  requires; drawing a Config from a CSPRNG once and then reusing that Config is
+  still invalid. Downstream shells generate fresh values per connection with
+  Lean's `IO.getRandomBytes`. This cross-connection freshness property cannot
+  be enforced by a pure API whose values are freely duplicable. The ECDSA
+  signing binding likewise takes an explicit per-message nonce — nonce hygiene
+  is the caller's responsibility.
 - `feed` consumes wire bytes and returns produced wire bytes + plaintext;
-  failures come back as a `Failure` carrying the alert to seal and send
-  before discarding the connection.
+  failures from `feedWithFailure` carry the latest state solely so the caller
+  can seal an alert under the correct epoch. That state and every alias of the
+  pre-error state must then be discarded. This is a caller contract, not
+  linearity enforced by Lean's pure value semantics.
 - Chain validation takes `now` as an argument; trust anchors are supplied
   parsed.
 - Certificate-chain and hostname validation are separate, caller-invoked
@@ -428,8 +468,9 @@ TLS13 / Tls / Test                    pure Lean
   karamel-extracted `dist/gcc-compatible` tree. Fifteen portable-C
   translation units are compiled; Vale assembly, EverCrypt CPU
   autodetection, bignum, and SIMD variants are deliberately excluded.
-- The shims (`HaclStar/shim/hacl_shim.c`, `shim/signature_shim.c`, ~340
-  lines total) are the only hand-written C: they marshal Lean `ByteArray`s
+- The shims (`HaclStar/shim/hacl_shim.c`,
+  `HaclStar/shim/signature_shim.c`, about 400 lines total) are the only
+  hand-written C: they marshal Lean `ByteArray`s
   to flat buffers, enforce length preconditions before entering HACL\*, and
   zero transient signature buffers. `<lean/lean.h>` comes from a
   `lean_runtime_headers` adapter that reads the registered `rules_lean`
@@ -462,7 +503,8 @@ on `sorryAx`, on `Lean.ofReduceBool`/`ofReduceNat`, or on a generated axiom of
 any kind.
 
 This used to be untrue in one narrow place. The byte-(de)composition identities
-that record framing, nonce non-reuse and ClientHello canonicity rest on —
+that record framing, write-trace tag distinctness and ClientHello canonicity
+rest on —
 `hi_lo_recompose`, `recompose_hi`, `recompose_lo`, `sequenceBytes_inj` and
 `nonceOf_inj` in `Tls.Record.Laws`, `uint16_recompose`, `uint32_recompose`,
 `uint16_hi` and `uint16_lo` in `Tls.Handshake` — were discharged by `bv_decide`,
@@ -497,11 +539,11 @@ test binary is built, so a violation is a red target, not a stale README:
 | Target | What it certifies |
 | --- | --- |
 | `//HaclStar:haclstar_assurance` | The trusted C boundary: the 16 `@[extern] opaque` bindings are accounted for and no proof hole exists in the FFI package |
-| `//TLS13:tls13_assurance` | 23 principal theorems — the RFC 8446 §7.1 derivation tree as data (`Derived.tree_rfc8446`, `Label.text_rfc8446`), the `HkdfLabel` wire image byte for byte, the refinement of `expandLabel`/`deriveSecret`/Early/Handshake/Master/`Derive-Secret`, and epoch distinctness from `HKDF-Expand-Label` injectivity (`Spec.Epoch.eq_of_secret_eq`, unbounded in the number of key updates); plus DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies` |
-| `//Tls:tls_assurance` | 74 principal theorems — nonce non-reuse (`WriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, and the stronger `run_nonce_nodup_spec`/`start_run_nonce_nodup` that assume only `HKDF-Expand-Label` injectivity, plus `run_epochs`, `EpochsFrom.nodup`, nonce and sequence injectivity), record conservation and seal/open inversion, ClientHello canonicity and body injectivity, the §7.3/§7.2/§4.4.4 record-layer and Finished derivations and the engines' §7.1 epoch installations (including `Tls.Client.feed_keySchedule`, the linkage stated at the `feed` boundary), and the state-machine transition and invariant laws (including both directions of the connected-only application-data rule and both engines' no-epoch-before-the-first-flight clauses) |
+| `//TLS13:tls13_assurance` | 23 principal theorems — the RFC 8446 §7.1 derivation tree as data (`Derived.tree_rfc8446`, `Label.text_rfc8446`), the `HkdfLabel` wire image byte for byte, and the refinement of `expandLabel`/`deriveSecret`/Early/Handshake/Main (historical theorem name `masterSecret_spec`)/`Derive-Secret`; plus DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies`, and `Chain.validate_leaf_keyUsage` |
+| `//Tls:tls_assurance` | 88 principal theorems — finite write traces (`WriteRun.nodup`, `AeadWriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, the schedule-refined `run_nonce_trace_spec`/`start_run_nonce_trace_spec`, `run_epochs`, and nonce/sequence injectivity), record conservation, the exact `TLSInnerPlaintext` bound, and seal/open inversion; ClientHello canonicity and body injectivity; the §7.3/§7.2/§4.4.4 record-layer and Finished derivations and the engines' §7.1 epoch installations (including `Tls.Client.feed_keySchedule`, the linkage stated at the `feed` boundary); and the state-machine transition and invariant laws, including KeyUpdate limit/error behavior, no output after local closure, directional peer closure, both directions of the connected-only application-data rule, and both engines' no-epoch-before-the-first-flight clauses |
 
-Each target also scans every constant of the whole first-party closure
-(`HaclStar`, `TLS13`, `Tls` — 28 modules, ~5080 constants): nothing may reach
+Each target also scans every constant of the full 28-module first-party closure
+(`HaclStar`, `TLS13`, `Tls`): nothing may reach
 `sorryAx`, no axiom may be declared outside the allowed set, and **no
 `@[extern]` constant may live outside the `HaclStar` modules**. That last check
 is what makes the FFI-boundary claim in the previous section mechanical: native
@@ -512,15 +554,16 @@ reaching a principal theorem fails the audit the moment it is introduced.
 
 ## Tests
 
-`bazel test //...` runs nine hermetic, offline suites plus the three assurance
+`bazel test //...` runs ten hermetic, offline suites plus the three assurance
 audits above:
 
 | Target | Coverage |
 | --- | --- |
-| `hacl_kat_test` | Known-answer vectors for every binding: SHA-2 (FIPS 180), HMAC (RFC 4231), HKDF (RFC 5869), X25519 (RFC 7748), P-256 ECDH (RFC 5903), ChaCha20-Poly1305 (RFC 8439) + tamper detection, Ed25519 (RFC 8032), ECDSA roundtrip, and the key schedule against RFC 8448 plus a hand-encoded `HkdfLabel` — the empirical counterpart to the §7.1 refinement proofs |
+| `hacl_kat_test` | Coverage for every binding, using published vectors where available: SHA-2 (FIPS 180), HMAC (RFC 4231), HKDF (RFC 5869), X25519 (RFC 7748), P-256 ECDH (RFC 5903), ChaCha20-Poly1305 (RFC 8439) + tamper detection, Ed25519 (RFC 8032), ECDSA roundtrip, and broad RFC 8448 key-schedule checkpoints plus a hand-encoded `HkdfLabel`; it also exercises HKDF's expansion ceiling and rejects malformed X25519/AEAD dimensions at the FFI boundary |
 | `tls_handshake_test` | Wire codecs against a GREASE-laden, fragmented, reordered ClientHello; record reassembly across TCP boundaries; missing-extension and duplicate-extension alerts; the full HelloRetryRequest flow |
-| `tls_server_interop_test` | Authenticated handshake between this repo's client and server engines (no sockets): negotiation, three-record server flight, application data both ways, 50-certificate fragmentation |
-| `x509_der_test`, `x509_certificate_test`, `x509_chain_test`, `x509_signature_test`, `x509_hostname_test`, `x509_channel_binding_test` | DER/PEM strictness corpus; OpenSSL-generated RSA/P-256/Ed25519 fixtures; chain validation success and eleven failure classes; RSA/ECDSA/PSS signature vectors and boundary rejections; hostname and channel-binding rules |
+| `tls_record_test` | RFC 9846's exact `TLSInnerPlaintext` boundary for both seal and open, plus rejection one byte above it |
+| `tls_server_interop_test` | Authenticated handshake between this repo's client and server engines (no sockets): negotiation, sender-side leaf policy, three-record server flight, application data both ways, 50-certificate fragmentation, KeyUpdate ordering/limits/errors (including crossing requests after local close), unsupported-ticket handling, alert classification, and directional closure behavior |
+| `x509_der_test`, `x509_certificate_test`, `x509_chain_test`, `x509_signature_test`, `x509_hostname_test`, `x509_channel_binding_test` | DER/PEM strictness corpus; OpenSSL-generated RSA/P-256/Ed25519 fixtures; chain validation success and eleven exercised failure classes (including leaf `digitalSignature` KeyUsage); RSA/ECDSA/PSS signature vectors and boundary rejections; hostname and channel-binding rules |
 
 Honest interop note: the hermetic "interop" test pairs this repo's own
 client and server. Interop against *independent* clients is a separate,
@@ -568,8 +611,10 @@ build because it compiles and links the HACL\* C shim.
 ## Roadmap
 
 1. ✅ Verified crypto primitives via HACL\* FFI
-2. ✅ Key schedule (HKDF-Expand-Label, Derive-Secret, Early/Handshake/Master)
-3. ✅ Record layer: framing, nonces, AEAD, KeyUpdate
+2. ✅ Key schedule (HKDF-Expand-Label, Derive-Secret, Early/Handshake/Main;
+   historical API name `masterSecret`)
+3. ✅ Record layer: framing, nonces, AEAD, and bounded peer-driven KeyUpdate
+   receive/respond (proactive update requests remain out of scope)
 4. ✅ Handshake codecs for both roles, including HelloRetryRequest, ALPN, SNI
 5. ✅ Sans-I/O client and server state machines
 6. ✅ X.509: strict DER/PEM, chain validation, hostname, channel binding
@@ -587,22 +632,28 @@ build because it compiles and links the HACL\* C shim.
     field is byte-identical to the consumed input slice — plus the
     re-decode identity, encoding uniqueness, trailing-data rejection, and
     canonical length/identifier form lemmas) and their signed-bytes
-    corollary (`Certificate.decode_tbs_encoded`, `checkIssuer_verifies`:
+    corollaries (`Certificate.decode_tbs_encoded`, `checkIssuer_verifies`:
     the bytes the chain validator hands to signature verification are
-    exactly the TBS slice parsed out of the certificate) and the handshake
+    exactly the TBS slice parsed out of the certificate;
+    `validate_leaf_keyUsage`: successful TLS path validation implies that a
+    present leaf KeyUsage permits digital signatures) and the handshake
     wire-codec laws (`Tls.Handshake`: framing roundtrips with residual and
     frame canonicity in the converse direction, reassembly independence,
     per-message parse inversion, GREASE-tolerant extension and `uint16`-vector
     roundtrips, HelloRetryRequest discrimination) and the state-machine layer (`Tls.Client.Laws`,
-    `Tls.Server.Laws`: nonce non-reuse across a whole run of either engine,
-    scoped by traffic-secret epoch — and, in `run_nonce_nodup_spec`, resting on
-    nothing beyond the injectivity of `HKDF-Expand-Label`, since the epochs a
-    run installs are proved to be strictly increasing nodes of the §7.1/§7.2
-    schedule; the `State.WellFormed` invariant established by `start` and
-    preserved by every operation; and the transition laws — peer `Finished`
+    `Tls.Server.Laws`: finite write traces for either engine, with unconditional
+    within-epoch nonce non-repetition and the explicit finite-run condition that
+    concrete AEAD keys do not collide across epochs, yielding actual
+    `(AEAD key, nonce)` pair distinctness;
+    `run_nonce_trace_spec` additionally connects the parallel traffic-secret
+    bookkeeping trace to strictly increasing nodes of the §7.1/§7.2 schedule
+    and proves that both traces carry the same nonce sequence; the
+    `State.WellFormed` invariant established by `start` and
+    preserved by every successful operation; and the transition laws — peer `Finished`
     verified before a connection is established, application data protected
-    only when established, closed connections terminal, the HelloRetryRequest
-    synthetic `message_hash` transcript, KeyUpdate epoch change) and the
+    only when established, graceful directional half-close and peer-input
+    suppression, no output after local closure, the HelloRetryRequest synthetic
+    `message_hash` transcript, and bounded KeyUpdate epoch change) and the
     key-schedule refinement against RFC 8446 §7.1 (`TLS13.KeySchedule.Spec`
     transcribes the derivation tree as data; `TLS13.KeySchedule.Refinement`
     and the engines' laws prove the implementation computes it, parametrically
@@ -610,8 +661,8 @@ build because it compiles and links the HACL\* C shim.
     boundary). What remains: the server has no `feed`-level key-schedule
     statement yet, and the client's does not join with
     `acceptServerHello_keySchedule` into a single whole-handshake law; the §7.1 branches this implementation
-    does not compute (PSK binders, early data, exporter and resumption master
+    does not compute (PSK binders, early data, exporter and resumption
     secrets) have a specification but no refinement, since there is no code to
     refine; and there is still no security argument — no proof about
     confidentiality, authentication, or the handshake as a cryptographic
-    protocol
+    protocol.

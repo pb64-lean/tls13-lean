@@ -48,6 +48,11 @@ def main : IO Unit := do
     "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
   check "hkdf-expand" (Hkdf.expandSha256 prk (h "f0f1f2f3f4f5f6f7f8f9") 42)
     "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+  -- The native boundary enforces RFC 5869's 255*HashLen expansion limit.
+  unless (Hkdf.expandSha256 prk ByteArray.empty 8160).size == 8160 do
+    throw (IO.userError "hkdf-expand: rejected the RFC 5869 maximum length")
+  unless (Hkdf.expandSha256 prk ByteArray.empty 8161).isEmpty do
+    throw (IO.userError "hkdf-expand: accepted a length above the RFC 5869 maximum")
 
   -- X25519 — RFC 7748 §6.1
   let alicePriv := h "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"
@@ -59,6 +64,19 @@ def main : IO Unit := do
     | none => throw (IO.userError "x25519-ecdh: unexpected none")
   check "x25519-ecdh" ss
     "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
+  -- Fixed-width guards reject malformed arrays before HACL can read 32 bytes.
+  unless (X25519.base ByteArray.empty).isEmpty do
+    throw (IO.userError "x25519-base: accepted a short private key")
+  unless (X25519.base (alicePriv.push 0)).isEmpty do
+    throw (IO.userError "x25519-base: accepted a long private key")
+  unless (X25519.ecdh ByteArray.empty bobPub).isNone do
+    throw (IO.userError "x25519-ecdh: accepted a short private key")
+  unless (X25519.ecdh (alicePriv.push 0) bobPub).isNone do
+    throw (IO.userError "x25519-ecdh: accepted a long private key")
+  unless (X25519.ecdh alicePriv ByteArray.empty).isNone do
+    throw (IO.userError "x25519-ecdh: accepted a short public key")
+  unless (X25519.ecdh alicePriv (bobPub.push 0)).isNone do
+    throw (IO.userError "x25519-ecdh: accepted a long public key")
 
   -- P-256 ECDH — RFC 5903 §8.1. Public keys in that RFC are raw x || y;
   -- TLS carries the same points in SEC1 uncompressed form (04 || x || y).
@@ -130,6 +148,27 @@ def main : IO Unit := do
   match ChaCha20Poly1305.decrypt key nonce aad tampered with
   | some _ => throw (IO.userError "chachapoly: tampered ciphertext authenticated!")
   | none => pure ()
+  -- Boundary misuse is rejected before HACL sees a short key or nonce. Encrypt
+  -- preserves its historical ByteArray API with an empty sentinel; decrypt is
+  -- already fallible and returns none.
+  unless (ChaCha20Poly1305.encrypt ByteArray.empty nonce aad pt).isEmpty do
+    throw (IO.userError "chachapoly-seal: accepted a short key")
+  unless (ChaCha20Poly1305.encrypt (key.push 0) nonce aad pt).isEmpty do
+    throw (IO.userError "chachapoly-seal: accepted a long key")
+  unless (ChaCha20Poly1305.encrypt key ByteArray.empty aad pt).isEmpty do
+    throw (IO.userError "chachapoly-seal: accepted a short nonce")
+  unless (ChaCha20Poly1305.encrypt key (nonce.push 0) aad pt).isEmpty do
+    throw (IO.userError "chachapoly-seal: accepted a long nonce")
+  unless (ChaCha20Poly1305.decrypt ByteArray.empty nonce aad sealed).isNone do
+    throw (IO.userError "chachapoly-open: accepted a short key")
+  unless (ChaCha20Poly1305.decrypt (key.push 0) nonce aad sealed).isNone do
+    throw (IO.userError "chachapoly-open: accepted a long key")
+  unless (ChaCha20Poly1305.decrypt key ByteArray.empty aad sealed).isNone do
+    throw (IO.userError "chachapoly-open: accepted a short nonce")
+  unless (ChaCha20Poly1305.decrypt key (nonce.push 0) aad sealed).isNone do
+    throw (IO.userError "chachapoly-open: accepted a long nonce")
+  unless (ChaCha20Poly1305.encrypt key nonce aad ByteArray.empty).size == 16 do
+    throw (IO.userError "chachapoly-seal: empty plaintext did not produce a tag")
 
   -- TLS 1.3 key schedule — RFC 8448 (no PSK, empty transcript).
   --
@@ -154,6 +193,89 @@ def main : IO Unit := do
   check "tls13-hkdf-label"
     (TLS13.KeySchedule.hkdfLabel 32 "derived".toUTF8 ByteArray.empty)
     "00200d746c733133206465726976656400"
+
+  -- RFC 8448 §3's complete 1-RTT schedule checkpoints. Transcript hashes are
+  -- the published values at ClientHello..ServerHello, ..server Finished, and
+  -- ..client Finished respectively. This covers both extraction stages, both
+  -- directions' handshake/application secrets, key/IV/Finished derivations,
+  -- and the exporter/resumption branches rather than only the Early Secret.
+  let sharedSecret :=
+    h "8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d"
+  let handshake := TLS13.KeySchedule.handshakeSecret early sharedSecret emptyHash
+  check "tls13-handshake-secret" handshake
+    "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"
+
+  let serverHelloHash :=
+    h "860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8"
+  let clientHandshake :=
+    TLS13.KeySchedule.deriveSecret handshake "c hs traffic" serverHelloHash
+  let serverHandshake :=
+    TLS13.KeySchedule.deriveSecret handshake "s hs traffic" serverHelloHash
+  check "tls13-client-handshake-traffic-secret" clientHandshake
+    "b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"
+  check "tls13-server-handshake-traffic-secret" serverHandshake
+    "b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"
+  check "tls13-client-handshake-key"
+    (TLS13.KeySchedule.expandLabel clientHandshake "key" ByteArray.empty 16)
+    "dbfaa693d1762c5b666af5d950258d01"
+  check "tls13-client-handshake-iv"
+    (TLS13.KeySchedule.expandLabel clientHandshake "iv" ByteArray.empty 12)
+    "5bd3c71b836e0b76bb73265f"
+  check "tls13-client-finished-key"
+    (TLS13.KeySchedule.expandLabel clientHandshake "finished" ByteArray.empty 32)
+    "b80ad01015fb2f0bd65ff7d4da5d6bf83f84821d1f87fdc7d3c75b5a7b42d9c4"
+  check "tls13-server-handshake-key"
+    (TLS13.KeySchedule.expandLabel serverHandshake "key" ByteArray.empty 16)
+    "3fce516009c21727d0f2e4e86ee403bc"
+  check "tls13-server-handshake-iv"
+    (TLS13.KeySchedule.expandLabel serverHandshake "iv" ByteArray.empty 12)
+    "5d313eb2671276ee13000b30"
+  check "tls13-server-finished-key"
+    (TLS13.KeySchedule.expandLabel serverHandshake "finished" ByteArray.empty 32)
+    "008d3b66f816ea559f96b537e885c31fc068bf492c652f01f288a1d8cdc19fc8"
+
+  check "tls13-handshake-derived-secret"
+    (TLS13.KeySchedule.deriveSecret handshake "derived" emptyHash)
+    "43de77e0c77713859a944db9db2590b53190a65b3ee2e4f12dd7a0bb7ce254b4"
+  let master := TLS13.KeySchedule.masterSecret handshake emptyHash
+  check "tls13-master-secret" master
+    "18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"
+
+  let serverFinishedHash :=
+    h "9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13"
+  let clientApplication :=
+    TLS13.KeySchedule.deriveSecret master "c ap traffic" serverFinishedHash
+  let serverApplication :=
+    TLS13.KeySchedule.deriveSecret master "s ap traffic" serverFinishedHash
+  check "tls13-client-application-traffic-secret" clientApplication
+    "9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5"
+  check "tls13-server-application-traffic-secret" serverApplication
+    "a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"
+  check "tls13-exporter-master-secret"
+    (TLS13.KeySchedule.deriveSecret master "exp master" serverFinishedHash)
+    "fe22f881176eda18eb8f44529e6792c50c9a3f89452f68d8ae311b4309d3cf50"
+  check "tls13-client-application-key"
+    (TLS13.KeySchedule.expandLabel clientApplication "key" ByteArray.empty 16)
+    "17422dda596ed5d9acd890e3c63f5051"
+  check "tls13-client-application-iv"
+    (TLS13.KeySchedule.expandLabel clientApplication "iv" ByteArray.empty 12)
+    "5b78923dee08579033e523d9"
+  check "tls13-server-application-key"
+    (TLS13.KeySchedule.expandLabel serverApplication "key" ByteArray.empty 16)
+    "9f02283b6c9c07efc26bb9f2ac92e356"
+  check "tls13-server-application-iv"
+    (TLS13.KeySchedule.expandLabel serverApplication "iv" ByteArray.empty 12)
+    "cf782b88dd83549aadf1e984"
+
+  let clientFinishedHash :=
+    h "209145a96ee8e2a122ff810047cc952684658d6049e86429426db87c54ad143d"
+  let resumptionMaster :=
+    TLS13.KeySchedule.deriveSecret master "res master" clientFinishedHash
+  check "tls13-resumption-master-secret" resumptionMaster
+    "7df235f2031d2a051287d02b0241b0bfdaf86cc856231f2d5aba46c434ec196c"
+  check "tls13-resumption-secret"
+    (TLS13.KeySchedule.expandLabel resumptionMaster "resumption" (h "0000") 32)
+    "4ecd0eb6ec3b4d87f5d6028f922ca4c5851a277fd41311c9e62d2c9492e1c4f3"
 
   -- Ed25519 signing — RFC 8032 §7.1, TEST 1 (empty message).
   let edSecret := h "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"

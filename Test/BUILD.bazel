@@ -2,10 +2,11 @@ package(default_visibility = ["//visibility:public"])
 
 load("@rules_lean//lean:defs.bzl", "lean_binary", "lean_test")
 
-# End-to-end validation of the FFI pipeline: exercises every HACL* binding
-# against published RFC known-answer vectors, and the TLS 1.3 key schedule
-# against RFC 8448. Passing this proves the http_archive -> cc_library -> shim
-# -> lean_library (@[extern]) chain links and runs correctly.
+# End-to-end validation of the FFI pipeline: exercises every HACL* binding with
+# published RFC vectors where available, plus sign/verify roundtrips, tamper
+# checks, and boundary rejection; it checks the TLS 1.3 key schedule against
+# RFC 8448. Passing this proves the http_archive -> cc_library -> shim ->
+# lean_library (@[extern]) chain links and runs correctly.
 lean_test(
     name = "hacl_kat_test",
     srcs = ["HaclKat.lean"],
@@ -19,14 +20,29 @@ lean_test(
 lean_test(
     name = "tls_handshake_test",
     srcs = ["TlsHandshakeTest.lean"],
+    data = ["Fixtures/Tls/server_cert.pem"],
     deps = ["//Tls:tls"],
 )
 
-# Full sans-I/O authenticated handshake and server-flight record ordering.
+# RFC 9846 §5.2 boundary checks for seal/open at the exact
+# TLSInnerPlaintext maximum and one byte above it.
+lean_test(
+    name = "tls_record_test",
+    srcs = ["TlsRecordTest.lean"],
+    deps = ["//Tls:tls"],
+)
+
+# Full sans-I/O authenticated handshake, server-flight ordering, RFC 9846
+# KeyUpdate limits/errors/order, unsupported-ticket handling, and directional
+# alert/half-close behavior.
 lean_test(
     name = "tls_server_interop_test",
     srcs = ["TlsServerInteropTest.lean"],
-    data = ["Fixtures/Tls/server_cert.pem"],
+    data = [
+        "Fixtures/Chain/valid-leaf.pem",
+        "Fixtures/Chain/valid-root.pem",
+        "Fixtures/Tls/server_cert.pem",
+    ],
     deps = ["//Tls:tls"],
 )
 

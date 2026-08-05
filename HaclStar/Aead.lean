@@ -15,12 +15,16 @@ The key is 32 bytes and the nonce 12 bytes. To keep the boundary a single
 namespace HaclStar
 namespace ChaCha20Poly1305
 
-/-- AEAD-Encrypt. Returns `ciphertext ‖ tag` (`plaintext.size + 16` bytes). -/
+/-- AEAD-Encrypt. Returns `ciphertext ‖ tag` (`plaintext.size + 16` bytes).
+A key not exactly 32 bytes, a nonce not exactly 12 bytes, or an input too large
+for HACL's `uint32_t` length API returns the empty `ByteArray` misuse sentinel;
+a successful result is always at least the 16-byte tag. -/
 @[extern "tls13_hacl_chachapoly_encrypt"]
 opaque encrypt (key nonce aad plaintext : ByteArray) : ByteArray
 
-/-- AEAD-Decrypt of `ciphertext ‖ tag`. Returns `none` on tag mismatch (or input
-shorter than the 16-byte tag). -/
+/-- AEAD-Decrypt of `ciphertext ‖ tag`. Returns `none` on tag mismatch, invalid
+key/nonce dimensions, an input too large for HACL's `uint32_t` length API, or an
+input shorter than the 16-byte tag. -/
 @[extern "tls13_hacl_chachapoly_decrypt"]
 opaque decrypt (key nonce aad ctAndTag : ByteArray) : Option ByteArray
 
