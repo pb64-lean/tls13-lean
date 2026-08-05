@@ -982,9 +982,10 @@ the binding inverts on identical key, nonce, and additional data, `open`
 recovers exactly what `seal` protected, and both directions advance the
 sequence number identically. -/
 
-/-- RFC 9846 §5.2 permits `2^14` content-and-padding bytes followed by the
-single inner content-type byte. This limit is intentionally independent of the
-larger `TLSCiphertext` expansion allowance. -/
+/-- RFC 9846 §5.4 (Record Padding) permits `2^14` content-and-padding bytes
+followed by the single inner content-type byte: the full encoded
+`TLSInnerPlaintext` must not exceed `2^14 + 1` octets. This limit is
+intentionally independent of the larger `TLSCiphertext` expansion allowance. -/
 theorem maxInnerPlaintextLength_eq :
     maxInnerPlaintextLength = maxPlaintextLength + 1 := rfl
 

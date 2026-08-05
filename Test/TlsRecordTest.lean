@@ -1,7 +1,8 @@
 import Tls.Record
 
 /-!
-Focused RFC 9846 §5.2 boundary checks for `TLSInnerPlaintext`. The outer
+Focused RFC 9846 §5.4 boundary checks for the encoded `TLSInnerPlaintext`
+(which must not exceed `2^14 + 1` octets). The outer
 `TLSCiphertext` allowance is deliberately larger, so the oversized `open` case
 constructs an authenticated record directly and verifies that the inner limit,
 not outer framing or authentication, rejects it.
