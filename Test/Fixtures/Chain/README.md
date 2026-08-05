@@ -5,8 +5,7 @@ building and validation. All keys are RSA-2048 and all certificate signatures
 are RSA PKCS#1 v1.5 with SHA-256. Key generation is intentionally random, so
 the committed PEM files—not a rerun—are the byte-exact fixtures.
 
-Only public certificates are committed. The temporary private keys and CSRs
-were deleted after generation.
+Only public certificates are committed; no private keys or CSRs are retained.
 
 ## Fixture matrix
 

@@ -3609,9 +3609,9 @@ and read epochs are `client_application_traffic_secret_0` and
 KeyUpdates arrived in the same chunk, which is none in the usual case.
 
 This is the `feed`-level form of `processHandshakeBuffer_keySchedule`: the
-transport plumbing between the two (record framing, decryption and dispatch)
-moves bytes and touches no key state, and is now threaded through. As
-everywhere, the statement is parametric in the HKDF the HACL\* bindings
+statement carries the relation through transport framing, decryption, and
+dispatch, which move bytes without touching key state. As everywhere, the
+statement is parametric in the HKDF the HACL\* bindings
 implement, so it constrains the derivation structure and assumes nothing about
 what the primitive computes.
 

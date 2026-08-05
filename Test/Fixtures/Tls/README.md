@@ -1,15 +1,15 @@
 # TLS server test identity
 
 `server_cert.pem` is the Ed25519 localhost certificate used by the pure
-client/server handshake regression. It was copied from
-`grpc-lean/Test/Fixtures/Tls` so the reusable TLS core and its first consumer
-exercise the same identity.
+client/server handshake regression. It matches
+`grpc-lean/Test/Fixtures/Tls/server_cert.pem`, so the reusable TLS core and its
+gRPC consumer exercise the same identity.
 
 The matching 32-byte Ed25519 test seed is intentionally embedded in
 `Test/TlsServerInteropTest.lean`; it is public test data and must never be used
 outside tests.
 
-The fixture was generated with OpenSSL 3 using the equivalent of:
+The equivalent OpenSSL 3 construction is:
 
 ```sh
 openssl genpkey -algorithm ED25519 -out server_key.pem

@@ -4,15 +4,15 @@ The RSA-PSS certificate is a stable OpenSSL 3.6.2 known-answer vector. Its
 SubjectPublicKeyInfo uses `rsaEncryption`; its self-signature uses
 RSASSA-PSS with SHA-256, MGF1-SHA256, a 32-byte salt, and trailer field 1.
 
-The RSA PKCS#1 v1.5, P-256 ECDSA, and Ed25519 positive vectors are the
-OpenSSL self-signatures already carried by `../X509/rsa2048.pem`,
+The RSA PKCS#1 v1.5, P-256 ECDSA, and Ed25519 positive vectors use the
+OpenSSL self-signatures in `../X509/rsa2048.pem`,
 `../X509/p256.pem`, and `../X509/ed25519.pem`. Tests verify each signature over
 the byte-exact retained TBSCertificate, so the fixture's signed message is
 stable and no test private key is required.
 
-The committed certificate was generated as follows. Key generation and the
-PSS salt are intentionally random, so the committed PEM—not a rerun—is the
-byte-exact vector. The private key was deleted.
+The following procedure describes the committed certificate. Key generation
+and the PSS salt are intentionally random, so the committed PEM—not a rerun—is
+the byte-exact vector. The private key is not retained.
 
 ```sh
 umask 077

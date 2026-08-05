@@ -5,8 +5,7 @@ serial numbers, subjects, validity windows, and extensions are fixed; key
 generation is intentionally random, so the committed PEM files are the stable
 known-answer vectors.
 
-Only the public certificates are committed. The temporary private keys were
-deleted after generation.
+Only the public certificates are committed; no private keys are retained.
 
 ```sh
 umask 077

@@ -261,7 +261,7 @@ def certificateVerifySchemeCompatible
 
 /-- RFC 8446 server CertificateVerify input:
 64 spaces, the server context string, one zero separator, and the negotiated
-transcript hash. This stack currently negotiates SHA-256 only. -/
+transcript hash. This stack negotiates SHA-256 only. -/
 def serverCertificateVerifyContent (transcriptHash : ByteArray) :
     Except String ByteArray := do
   unless transcriptHash.size == HaclStar.sha256DigestLen do

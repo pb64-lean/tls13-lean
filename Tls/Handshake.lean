@@ -1080,8 +1080,8 @@ structure ClientHello where
   serverName : Option String := none
   /-- Offered ALPN protocol names in client preference order (empty if absent). -/
   alpnProtocols : Array String := #[]
-  /-- All extensions in exact wire order. Unknown bodies remain opaque. This is
-  used to enforce the restricted set of changes permitted in a retry
+  /-- All extensions in exact wire order. Unknown bodies remain opaque. This
+  supports enforcement of the restricted set of changes permitted in a retry
   ClientHello without reconstructing or normalizing the original message. -/
   extensions : Array Extension
   offersTls13 : Bool
@@ -1589,7 +1589,7 @@ def parseClientHello (msg : Message) : Except String ClientHello :=
 
 /-- Build a ServerHello selecting TLS 1.3, a caller-selected cipher suite, and
 one key-share group. `legacySessionIdEcho` must echo the ClientHello's
-legacy_session_id. The trailing default preserves the original ChaCha-only API. -/
+legacy_session_id. Omitting `cipherSuite` selects ChaCha20-Poly1305. -/
 def encodeServerHello (random legacySessionIdEcho : ByteArray)
     (group : NamedGroup) (keyExchange : ByteArray)
     (cipherSuite : UInt16 := tlsChaCha20Poly1305Sha256) : Except String Message := do
@@ -6185,7 +6185,7 @@ all, so comparing two decoded messages' `msgType` and `body` is exactly as
 strong as comparing their wire bytes (`decodeOne_injective`) — the framing-layer
 analogue of `parseClientHello_canonical` and `parseClientHello_body_injective`.
 
-The missing ingredient was the converse of `uint24_recompose`: the three
+Frame canonicity also uses the converse of `uint24_recompose`: the three
 big-endian length bytes are recovered from the length they encode. -/
 
 private theorem uint24_value (b0 b1 b2 : UInt8) :

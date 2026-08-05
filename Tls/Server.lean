@@ -28,7 +28,7 @@ client's offered set and chooses X25519 (or P-256 when configured) from
 supported_groups. When the preferred mutual group has no first-flight share,
 the server performs one HelloRetryRequest with the RFC 8446 synthetic
 message_hash transcript. Authentication is Ed25519; PSK and client
-authentication are not yet supported. ALPN is negotiated and the selected
+authentication are unsupported. ALPN is negotiated and the selected
 protocol is surfaced in `State.alpnSelected` so the caller can route h2 (gRPC)
 versus http/1.1 (REST).
 -/
