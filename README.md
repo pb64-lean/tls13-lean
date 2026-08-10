@@ -594,7 +594,12 @@ bazel test //...
 ```
 
 `lakefile.lean` is an IDE/LSP project model only; Bazel is the authoritative
-build because it compiles and links the HACL\* C shim.
+build because it compiles and links the HACL\* C shim. The checked-in
+`lean-toolchain` selects `nightly-2026-04-25`, whose upstream commit
+(`24bef91f9a20a45f074729e869461d374687de1c`) matches the Nix Lean toolchain
+registered by Bazel. Install that Elan toolchain before opening the project in
+an editor. The `lean4-nightly` selector spelling is intentional because
+Lean4IJ maps it directly to Elan's on-disk nightly directory.
 
 ## Coverage summary
 

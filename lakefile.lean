@@ -29,3 +29,14 @@ lean_lib «TLS13» where
     `TLS13.KeySchedule.Spec,
     `TLS13.X509,
   ]
+
+lean_lib «Tls» where
+  roots := #[
+    `Tls.Record,
+    `Tls.Record.Laws,
+    `Tls.Handshake,
+    `Tls.Client,
+    `Tls.Client.Laws,
+    `Tls.Server,
+    `Tls.Server.Laws,
+  ]
