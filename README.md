@@ -581,12 +581,13 @@ OpenSSL 3.6.1, curl 8.18.0, and Go 1.25.6.
 ## Building
 
 Part of the [pb64-lean](https://github.com/pb64-lean) ecosystem: Bazel 8.5
-(`.bazelversion`), sibling checkouts for `../rules_lean` and (for the shared
-Nix-pinned Lean toolchain files only) `../grpc-lean`, and **Nix** to build
-the pinned Lean 4.31.0-pre toolchain:
+(`.bazelversion`), a sibling checkout of `../grpc-lean` for the shared
+Nix-pinned Lean toolchain files, and **Nix** to build the pinned Lean
+4.31.0-pre toolchain. `rules_lean` is fetched from the checksummed GitHub
+archive pinned in `MODULE.bazel`:
 
 ```sh
-for r in rules_lean grpc-lean tls13-lean; do
+for r in grpc-lean tls13-lean; do
   git clone "https://github.com/pb64-lean/$r"
 done
 cd tls13-lean

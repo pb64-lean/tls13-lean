@@ -4,13 +4,17 @@ module(
     compatibility_level = 1,
 )
 
-# Base Lean build rules. local_path_override is honored only when
-# tls13-lean is the root module; downstream consumers supply their own
-# overrides (or the registry resolves these).
+# Base Lean build rules. Overrides are honored only in the root module, so pin
+# standalone tls13-lean builds to the current public rules_lean main revision.
+# Downstream consumers select their own override or registry version.
 bazel_dep(name = "rules_lean", version = "0.1.0")
-local_path_override(
+archive_override(
     module_name = "rules_lean",
-    path = "../rules_lean",
+    integrity = "sha256-R04+5hNuca2KRdLDQDnQ68hZYjpKcw6p6kz/aU/fmAc=",
+    strip_prefix = "rules_lean-fbc2dd0626da1dee86348ff4841798ea8c8cbb34",
+    urls = [
+        "https://github.com/pb64-lean/rules_lean/archive/fbc2dd0626da1dee86348ff4841798ea8c8cbb34.tar.gz",
+    ],
 )
 
 # The lean4_upstream_std nix overlay (pinned lean + upstream Std) lives in the
