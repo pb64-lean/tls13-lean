@@ -9,6 +9,7 @@ their selected Lean version.
 """
 
 load("@rules_cc//cc/common:cc_info.bzl", "CcInfo")
+load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
 
 def _toolchain_root(toolchain):
     lean_path = toolchain.lean.path
