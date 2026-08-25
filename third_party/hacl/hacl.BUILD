@@ -30,6 +30,8 @@
 
 package(default_visibility = ["//visibility:public"])
 
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
 _INCLUDE_ROOTS = [
     "gcc-compatible",
     "karamel/include",
