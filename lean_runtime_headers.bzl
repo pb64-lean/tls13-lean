@@ -8,6 +8,8 @@ the registered toolchain instead, so downstream builds remain hermetic and use
 their selected Lean version.
 """
 
+load("@rules_cc//cc/common:cc_info.bzl", "CcInfo")
+
 def _toolchain_root(toolchain):
     lean_path = toolchain.lean.path
     if "/bin/lean" in lean_path:

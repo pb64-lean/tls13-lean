@@ -8,6 +8,7 @@ module(
 # standalone tls13-lean builds to the current public rules_lean main revision.
 # Downstream consumers select their own override or registry version.
 bazel_dep(name = "rules_lean", version = "0.1.0")
+bazel_dep(name = "rules_cc", version = "0.2.17")
 archive_override(
     module_name = "rules_lean",
     integrity = "sha256-R04+5hNuca2KRdLDQDnQ68hZYjpKcw6p6kz/aU/fmAc=",

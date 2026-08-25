@@ -1,5 +1,6 @@
 package(default_visibility = ["//visibility:public"])
 
+load("@rules_cc//cc:defs.bzl", "cc_library")
 load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_library")
 load("//:assurance.bzl", "TLS13_LEAN_ALLOWED_AXIOMS")
 load("//:lean_runtime_headers.bzl", "lean_runtime_headers")
