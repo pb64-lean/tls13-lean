@@ -21,6 +21,25 @@ namespace TLS13
 namespace X509
 namespace Chain
 
+/-- TLS endpoint role, independent of certificate subject/hostname policy. -/
+inductive Purpose where
+  | serverAuth
+  | clientAuth
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+def Purpose.oid : Purpose → OID
+  | .serverAuth => OID.serverAuth
+  | .clientAuth => OID.clientAuth
+
+/-- Absent EKU is unrestricted unless the caller requires an explicit role.
+When present, the intended purpose (or anyExtendedKeyUsage) must occur. -/
+def permitsPurpose (certificate : Certificate) (purpose : Purpose)
+    (requireExplicit : Bool := false) : Bool :=
+  match certificate.tbsCertificate.extensions.extendedKeyUsage with
+  | none => !requireExplicit
+  | some usage => usage.value.contains purpose.oid ||
+      (!requireExplicit && usage.value.contains OID.anyExtendedKeyUsage)
+
 /-- Parsed certificate trust anchors. -/
 structure TrustStore where
   anchors : Array Certificate
@@ -42,6 +61,7 @@ inductive Failure where
   | expired (serial : Nat) (notAfter now : Int)
   | badSignature (childSerial issuerSerial : Nat)
   | leafDigitalSignatureMissing (leafSerial : Nat)
+  | purposeNotPermitted (serial : Nat) (purpose : Purpose)
   | notCA (issuerSerial : Nat)
   | keyCertSignMissing (issuerSerial : Nat)
   | pathLenExceeded (issuerSerial limit actual : Nat)
@@ -64,6 +84,8 @@ def render : Failure → String
       s!"certificate {childSerial} has an invalid signature from issuer {issuerSerial}"
   | .leafDigitalSignatureMissing leafSerial =>
       s!"leaf certificate {leafSerial} KeyUsage does not permit TLS digital signatures"
+  | .purposeNotPermitted serial purpose =>
+      s!"certificate {serial} ExtendedKeyUsage does not permit {repr purpose}"
   | .notCA issuerSerial =>
       s!"issuer certificate {issuerSerial} is not a CA"
   | .keyCertSignMissing issuerSerial =>
@@ -334,11 +356,21 @@ def validate
     (now : Int) (leaf : Certificate) (presented : Array Certificate)
     (trustStore : TrustStore)
     (maximumDepth : Nat := defaultMaximumDepth)
-    (maximumIssuerAttempts : Nat := defaultMaximumIssuerAttempts) :
+    (maximumIssuerAttempts : Nat := defaultMaximumIssuerAttempts)
+    (purpose : Purpose := .serverAuth)
+    (requireExplicitLeafPurpose : Bool := false) :
     Except Failure VerifiedChain := do
   checkLeafKeyUsage leaf
-  (buildPath now maximumDepth maximumIssuerAttempts
+  let verified ← (buildPath now maximumDepth maximumIssuerAttempts
     leaf leaf presented trustStore #[] maximumIssuerAttempts).result
+  unless permitsPurpose leaf purpose requireExplicitLeafPurpose do
+    throw (.purposeNotPermitted leaf.tbsCertificate.serialNumber purpose)
+  -- Honor any purpose restriction on an issuing certificate as well. Checks
+  -- apply only to the selected path, never unrelated presented candidates.
+  for certificate in verified.path do
+    unless permitsPurpose certificate purpose do
+      throw (.purposeNotPermitted certificate.tbsCertificate.serialNumber purpose)
+  pure verified
 
 /-!
 ## The signed-bytes corollary

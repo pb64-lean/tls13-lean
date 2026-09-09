@@ -2,6 +2,13 @@ package(default_visibility = ["//visibility:public"])
 
 load("@rules_lean//lean:defs.bzl", "lean_binary", "lean_test")
 
+lean_test(
+    name = "workload_identity_test",
+    srcs = ["WorkloadIdentityTest.lean"],
+    data = glob(["Fixtures/Identity/*.pem", "Fixtures/Identity/*.der"]),
+    deps = ["//Tls:tls"],
+)
+
 # End-to-end validation of the FFI pipeline: exercises every HACL* binding with
 # published RFC vectors where available, plus sign/verify roundtrips, tamper
 # checks, and boundary rejection; it checks the TLS 1.3 key schedule against
@@ -69,6 +76,9 @@ sh_test(
     data = [
         "Fixtures/Tls/server_cert.pem",
         "interop/goclient/main.go",
+        "Fixtures/Identity/root.pem",
+        "Fixtures/Identity/client.pem",
+        "Fixtures/Identity/client-key.pem",
         ":tls_external_server",
     ],
     tags = [

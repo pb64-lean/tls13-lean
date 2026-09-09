@@ -241,6 +241,21 @@ else
   note "SKIP go crypto/tls cases: no go binary on PATH"
 fi
 
+# Independent client authentication: OpenSSL constructs CertificateVerify and
+# Finished; the Lean server checks purpose, chain and proof of possession.
+export TLS13_TEST_CLIENT_CA="${SERVER_CWD}/Test/Fixtures/Identity/root.pem"
+if run_openssl openssl-mtls \
+    -cert "${SERVER_CWD}/Test/Fixtures/Identity/client.pem" \
+    -key "${SERVER_CWD}/Test/Fixtures/Identity/client-key.pem" \
+    -cert_chain "${TLS13_TEST_CLIENT_CA}"; then
+  if grep -q '^CLIENT_CERTIFICATES 2$' "${SERVER_LOG}"; then
+    note "PASS openssl mutual TLS with explicit clientAuth EKU"
+  else
+    fail "openssl-mtls: authenticated chain not retained"
+  fi
+fi
+unset TLS13_TEST_CLIENT_CA
+
 if [[ ${FAILURES} -ne 0 ]]; then
   echo "[interop] ${FAILURES} case(s) failed" >&2
   exit 1

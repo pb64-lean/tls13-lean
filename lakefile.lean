@@ -35,6 +35,7 @@ lean_lib «Tls» where
     `Tls.Record,
     `Tls.Record.Laws,
     `Tls.Handshake,
+    `Tls.Identity,
     `Tls.Client,
     `Tls.Client.Laws,
     `Tls.Server,

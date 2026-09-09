@@ -887,6 +887,52 @@ structure CertificateVerify where
   encoded : ByteArray
   deriving Inhabited, BEq
 
+/-- Initial-handshake CertificateRequest (post-handshake authentication is not
+negotiated). Unknown extensions are ignored, but duplicate extension IDs and
+missing/empty signature_algorithms are rejected by the shared strict codec. -/
+structure CertificateRequest where
+  signatureAlgorithms : Array UInt16
+  deriving Inhabited, BEq
+
+def certificateRequestType : UInt8 := 13
+
+def parseCertificateRequest (msg : Message) : Except String CertificateRequest := do
+  unless msg.msgType == certificateRequestType do
+    throw "expected CertificateRequest"
+  let (context, r) ← ({ bytes := msg.body } : Reader).readVector8
+  unless context.isEmpty do
+    throw "initial CertificateRequest context must be empty"
+  let (bytes, r) ← r.readVector16
+  r.requireEnd "CertificateRequest"
+  let extensions ← parseExtensions bytes
+  let some algorithms := findExtension? extensions signatureAlgorithmsExtension
+    | throw "CertificateRequest requires signature_algorithms"
+  let (bytes, r) ← ({ bytes := algorithms.data } : Reader).readVector16
+  r.requireEnd "CertificateRequest signature_algorithms"
+  unless !bytes.isEmpty && bytes.size % 2 == 0 do
+    throw "invalid CertificateRequest signature_algorithms vector"
+  let mut result := #[]
+  for i in [:bytes.size / 2] do
+    result := result.push ((UInt16.ofNat (bytes.get! (2*i)).toNat <<< 8) |||
+      UInt16.ofNat (bytes.get! (2*i+1)).toNat)
+  pure { signatureAlgorithms := result }
+
+/-- Client Certificate has the same grammar but permits an empty chain.
+Request contexts must be empty in the initial handshake. -/
+def parseClientCertificate (msg : Message) : Except String (Array CertificateEntry) := do
+  unless msg.msgType == certificateType do
+    throw "expected client Certificate"
+  let (context, r) ← ({ bytes := msg.body } : Reader).readVector8
+  unless context.isEmpty do
+    throw "initial client Certificate context must be empty"
+  let (bytes, r) ← r.readVector24
+  r.requireEnd "client Certificate"
+  let entries ← parseCertificateEntries { bytes } #[]
+  for entry in entries do
+    unless entry.extensions.isEmpty do
+      throw "unsolicited client Certificate entry extension"
+  pure entries
+
 /-- Parse CertificateVerify structurally. Scheme policy belongs to the TLS
 client: it rejects forbidden or unoffered schemes, checks the leaf SPKI, and
 verifies the signature over the raw transcript before advancing to Finished.
@@ -1687,6 +1733,16 @@ def encodeCertificateVerify (algorithm : UInt16) (signature : ByteArray) :
     throw "CertificateVerify signature must not be empty"
   frame certificateVerifyType
     (appendUInt16 ByteArray.empty algorithm ++ (← encodeVector16 signature))
+
+def encodeCertificateRequest : Except String Message := do
+  let algorithms := appendUInt16 ByteArray.empty ed25519
+  let extension ← encodeExtension signatureAlgorithmsExtension (← encodeVector16 algorithms)
+  frame certificateRequestType ((← encodeVector8 ByteArray.empty) ++
+    (← encodeVector16 extension))
+
+def encodeClientCertificate (chain : Array ByteArray) : Except String Message := do
+  let list ← encodeCertificateList chain.toList
+  frame certificateType ((← encodeVector8 ByteArray.empty) ++ (← encodeVector24 list))
 
 /-!
 ## Wire-codec roundtrip laws

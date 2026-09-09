@@ -25,6 +25,10 @@ def keyUsage : OID := { arcs := #[2, 5, 29, 15] }
 def subjectAltName : OID := { arcs := #[2, 5, 29, 17] }
 def basicConstraints : OID := { arcs := #[2, 5, 29, 19] }
 def authorityKeyIdentifier : OID := { arcs := #[2, 5, 29, 35] }
+def extendedKeyUsage : OID := { arcs := #[2, 5, 29, 37] }
+def anyExtendedKeyUsage : OID := { arcs := #[2, 5, 29, 37, 0] }
+def serverAuth : OID := { arcs := #[1, 3, 6, 1, 5, 5, 7, 3, 1] }
+def clientAuth : OID := { arcs := #[1, 3, 6, 1, 5, 5, 7, 3, 2] }
 
 def rsaEncryption : OID := { arcs := #[1, 2, 840, 113549, 1, 1, 1] }
 def mgf1 : OID := { arcs := #[1, 2, 840, 113549, 1, 1, 8] }
@@ -143,6 +147,7 @@ structure Extensions where
   subjectAltName : Option (ParsedExtension SubjectAltName) := none
   basicConstraints : Option (ParsedExtension BasicConstraints) := none
   keyUsage : Option (ParsedExtension KeyUsage) := none
+  extendedKeyUsage : Option (ParsedExtension (Array OID)) := none
   unhandled : Array RawExtension := #[]
   deriving BEq, Inhabited
 
@@ -603,6 +608,24 @@ private def parseRawExtension (value : DER.TLV) : Except String RawExtension := 
 private def containsOID (extensions : Array OID) (oid : OID) : Bool :=
   extensions.any (· == oid)
 
+/-- Strict, bounded RFC 5280 ExtendedKeyUsage decoding. Unknown purposes are
+retained; an application must explicitly permit its own purpose. -/
+private def parseExtendedKeyUsage (extension : RawExtension) :
+    Except String (ParsedExtension (Array OID)) := do
+  let value ← DER.decode extension.valueDER
+  value.requireTag DER.Tag.sequence "ExtendedKeyUsage"
+  let values ← DER.decodeAll value.contents
+  if values.isEmpty || values.size > 128 then
+    throw "ExtendedKeyUsage must contain between 1 and 128 purposes"
+  let mut purposes := #[]
+  for value in values do
+    value.requireTag DER.Tag.objectIdentifier "ExtendedKeyUsage purpose"
+    let purpose ← OID.decodeContents value.contents
+    if purposes.contains purpose then
+      throw "duplicate ExtendedKeyUsage purpose"
+    purposes := purposes.push purpose
+  pure { critical := extension.critical, value := purposes, encoded := extension.encoded }
+
 private def parseExtensions (value : DER.TLV) : Except String Extensions := do
   value.requireTag DER.Tag.sequence "Extensions"
   let mut reader := value.reader
@@ -624,6 +647,8 @@ private def parseExtensions (value : DER.TLV) : Except String Extensions := do
       result := { result with basicConstraints := some (← parseBasicConstraints extension) }
     else if extension.oid == OID.keyUsage then
       result := { result with keyUsage := some (← parseKeyUsage extension) }
+    else if extension.oid == OID.extendedKeyUsage then
+      result := { result with extendedKeyUsage := some (← parseExtendedKeyUsage extension) }
     else
       result := { result with unhandled := result.unhandled.push extension }
     reader := next

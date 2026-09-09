@@ -283,6 +283,56 @@ private theorem acceptServerHello_write {state next : State}
       · cases h
     · cases h
 
+/-- Every record in the client certificate/Finished flight advances one shared
+handshake epoch, including chains spanning multiple protected records. -/
+private theorem sealClientFlight_write {keys keys' : Record.TrafficKeys}
+    {flight : ByteArray} {offset : Nat} {wire wireOut : ByteArray}
+    (h : sealClientFlight keys flight offset wire = .ok (keys', wireOut)) :
+    Record.Extends (some keys) (some keys') := by
+  unfold sealClientFlight at h
+  split at h
+  · cases h; exact Record.Extends.refl _
+  · simp only [] at h
+    split at h
+    · cases h
+    · rename_i nextKeys record hseal
+      exact Record.Extends.trans (Record.Extends.of_seal (liftRecord_ok hseal))
+        (sealClientFlight_write h)
+  termination_by flight.size - offset
+  decreasing_by omega
+
+private theorem sealClientFlight_secret {keys keys' : Record.TrafficKeys}
+    {flight : ByteArray} {offset : Nat} {wire wireOut : ByteArray}
+    (h : sealClientFlight keys flight offset wire = .ok (keys', wireOut)) :
+    keys'.secret = keys.secret := by
+  unfold sealClientFlight at h
+  split at h
+  · cases h; rfl
+  · simp only [] at h
+    split at h
+    · cases h
+    · rename_i nextKeys record hseal
+      exact (sealClientFlight_secret h).trans (Record.seal_secret_eq (liftRecord_ok hseal))
+  termination_by flight.size - offset
+  decreasing_by omega
+
+private theorem sealClientFlight_epochs {H : TLS13.KeySchedule.Spec.Hkdf}
+    {keys keys' : Record.TrafficKeys} {flight : ByteArray} {offset : Nat}
+    {wire wireOut : ByteArray}
+    (h : sealClientFlight keys flight offset wire = .ok (keys', wireOut)) :
+    Record.WithinEpoch H (some keys) (some keys') := by
+  unfold sealClientFlight at h
+  split at h
+  · cases h; exact Record.WithinEpoch.refl _
+  · simp only [] at h
+    split at h
+    · cases h
+    · rename_i nextKeys record hseal
+      exact Record.WithinEpoch.trans (Record.WithinEpoch.of_seal (liftRecord_ok hseal))
+        (sealClientFlight_epochs h)
+  termination_by flight.size - offset
+  decreasing_by omega
+
 /-- Completing the handshake seals the client Finished under the handshake write
 epoch and then installs the application epoch — both accounted for. -/
 private theorem completeServerHandshake_write {state next : State}
@@ -299,13 +349,15 @@ private theorem completeServerHandshake_write {state next : State}
   obtain ⟨clientApplicationKeys, _, h⟩ := except_bind_ok_inv h
   obtain ⟨serverApplicationKeys, _, h⟩ := except_bind_ok_inv h
   obtain ⟨clientHandshakeSecret, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨authentication, _, h⟩ := except_bind_ok_inv h
   obtain ⟨clientFinished, _, h⟩ := except_bind_ok_inv h
   obtain ⟨handshakeWriteKeys, hk, h⟩ := except_bind_ok_inv h
   obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
   obtain ⟨advancedKeys, finishedWire⟩ := sealed
   have hgoal : Record.Extends state.writeKeys? (some clientApplicationKeys) := by
     rw [requireWriteKeys_ok hk]
-    exact Record.Extends.trans (Record.Extends.of_seal (liftRecord_ok hs))
+    exact Record.Extends.trans (sealClientFlight_write hs)
       (Record.Extends.rekey advancedKeys clientApplicationKeys)
   split at h
   · cases h; exact hgoal
@@ -335,11 +387,16 @@ private theorem processHandshakeBuffer_write {state next : State} {wire : ByteAr
         exact hw
       · have hw := processHandshakeBuffer_write h
         exact hw
-    · obtain ⟨_, h⟩ := unless_ok h
-      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-      have hw := processHandshakeBuffer_write h
-      exact hw
+    · split at h
+      · obtain ⟨_, h⟩ := if_throw_ok h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        have hw := processHandshakeBuffer_write h
+        exact hw
+      · obtain ⟨_, h⟩ := unless_ok h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        have hw := processHandshakeBuffer_write h
+        exact hw
     · obtain ⟨_, h⟩ := unless_ok h
       obtain ⟨_, _, h⟩ := except_bind_ok_inv h
       split at h
@@ -708,6 +765,7 @@ private theorem start_phase_readKeys {config : Config} {out : Output}
       out.state.writeKeys? = none := by
   unfold start at h
   simp only [pure_bind] at h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
   obtain ⟨_, h⟩ := unless_ok h
   obtain ⟨_, h⟩ := unless_ok h
   split at h <;>
@@ -925,6 +983,8 @@ private theorem completeServerHandshake_wellFormed {state next : State}
   obtain ⟨clientApplicationKeys, _, h⟩ := except_bind_ok_inv h
   obtain ⟨serverApplicationKeys, _, h⟩ := except_bind_ok_inv h
   obtain ⟨clientHandshakeSecret, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨authentication, _, h⟩ := except_bind_ok_inv h
   obtain ⟨clientFinished, _, h⟩ := except_bind_ok_inv h
   obtain ⟨handshakeWriteKeys, hk, h⟩ := except_bind_ok_inv h
   obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
@@ -979,10 +1039,14 @@ private theorem processHandshakeBuffer_wellFormed {state next : State}
       · obtain ⟨_, h⟩ := unless_ok h
         exact processHandshakeBuffer_wellFormed h ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
       · exact processHandshakeBuffer_wellFormed h ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
-    · obtain ⟨_, h⟩ := unless_ok h
-      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-      exact processHandshakeBuffer_wellFormed h ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
+    · split at h
+      · obtain ⟨_, h⟩ := if_throw_ok h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        exact processHandshakeBuffer_wellFormed h ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
+      · obtain ⟨_, h⟩ := unless_ok h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        exact processHandshakeBuffer_wellFormed h ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
     · obtain ⟨_, h⟩ := unless_ok h
       obtain ⟨_, _, h⟩ := except_bind_ok_inv h
       split at h
@@ -2106,6 +2170,8 @@ theorem completeServerHandshake_keySchedule {H : Spec.Hkdf} (hi : Implements H)
   obtain ⟨clientApplicationKeys, hcak, h⟩ := except_bind_ok_inv h
   obtain ⟨serverApplicationKeys, hsak, h⟩ := except_bind_ok_inv h
   obtain ⟨clientHandshakeSecret, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨authentication, _, h⟩ := except_bind_ok_inv h
   obtain ⟨clientFinished, _, h⟩ := except_bind_ok_inv h
   obtain ⟨handshakeWriteKeys, hk, h⟩ := except_bind_ok_inv h
   obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
@@ -2207,11 +2273,16 @@ theorem processHandshakeBuffer_keySchedule {H : Spec.Hkdf} (hi : Implements H)
         exact hw
       · have hw := processHandshakeBuffer_keySchedule hi h
         exact hw
-    · obtain ⟨_, h⟩ := unless_ok h
-      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-      have hw := processHandshakeBuffer_keySchedule hi h
-      exact hw
+    · split at h
+      · obtain ⟨_, h⟩ := if_throw_ok h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        have hw := processHandshakeBuffer_keySchedule hi h
+        exact hw
+      · obtain ⟨_, h⟩ := unless_ok h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        have hw := processHandshakeBuffer_keySchedule hi h
+        exact hw
     · obtain ⟨_, h⟩ := unless_ok h
       obtain ⟨_, _, h⟩ := except_bind_ok_inv h
       split at h
@@ -2590,6 +2661,8 @@ private theorem completeServerHandshake_epochs {H : Spec.Hkdf} (hi : Implements 
   obtain ⟨clientApplicationKeys, hcak, h⟩ := except_bind_ok_inv h
   obtain ⟨serverApplicationKeys, hsak, h⟩ := except_bind_ok_inv h
   obtain ⟨clientHandshakeSecret, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨authentication, _, h⟩ := except_bind_ok_inv h
   obtain ⟨clientFinished, _, h⟩ := except_bind_ok_inv h
   obtain ⟨handshakeWriteKeys, hk, h⟩ := except_bind_ok_inv h
   obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
@@ -2609,7 +2682,7 @@ private theorem completeServerHandshake_epochs {H : Spec.Hkdf} (hi : Implements 
     have hE : Record.EpochOf H o (some handshakeWriteKeys) := by rw [← hw]; exact ho.1
     obtain ⟨e, rfl, hsec⟩ := Record.EpochOf.some_inv hE
     have hadv : advancedKeys.secret = e.secret H := by
-      rw [Record.seal_secret_eq (liftRecord_ok hs)]; exact hsec
+      rw [sealClientFlight_secret hs]; exact hsec
     have hlt : e.Lt ⟨parent, Spec.Label.cApTraffic, ctx, 0⟩ := by
       refine Or.inl ?_
       rw [show e.label = Spec.Label.cHsTraffic from
@@ -2623,7 +2696,7 @@ private theorem completeServerHandshake_epochs {H : Spec.Hkdf} (hi : Implements 
     · cases he'
       exact hlab.symm
     · rw [hw, hwk]
-      exact (Record.SpecExtends.of_seal (liftRecord_ok hs)).trans
+      exact ((sealClientFlight_epochs hs).apply (Record.EpochOf.intro hsec)).2.trans
         (Record.SpecExtends.rekey hadv (ho.valid e rfl) hlt)
   split at h
   · cases h; exact hgoal _ _ _ _ (liftRecord_ok hcak) rfl rfl
@@ -2661,12 +2734,18 @@ private theorem processHandshakeBuffer_epochs {H : Spec.Hkdf} (hi : Implements H
     · rename_i hph
       have hph' : writeEpochLabel state.phase = Spec.Label.cHsTraffic := by
         rw [show state.phase = Phase.waitingCertificate from hph]; rfl
-      obtain ⟨_, h⟩ := unless_ok h
-      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-      have hw := processHandshakeBuffer_epochs hi h
-        ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
-      exact SpecEffect.of_eq hw rfl hph'.symm
+      split at h
+      · obtain ⟨_, h⟩ := if_throw_ok h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        have hw := processHandshakeBuffer_epochs hi h
+          ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
+        exact SpecEffect.of_eq hw rfl hph'.symm
+      · obtain ⟨_, h⟩ := unless_ok h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        have hw := processHandshakeBuffer_epochs hi h
+          ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
+        exact SpecEffect.of_eq hw rfl hph'.symm
     · rename_i hph
       have hph' : writeEpochLabel state.phase = Spec.Label.cHsTraffic := by
         rw [show state.phase = Phase.waitingCertificateVerify from hph]; rfl
@@ -3193,6 +3272,8 @@ private theorem completeServerHandshake_phase {state next : State}
   obtain ⟨clientApplicationKeys, _, h⟩ := except_bind_ok_inv h
   obtain ⟨serverApplicationKeys, _, h⟩ := except_bind_ok_inv h
   obtain ⟨clientHandshakeSecret, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨authentication, _, h⟩ := except_bind_ok_inv h
   obtain ⟨clientFinished, _, h⟩ := except_bind_ok_inv h
   obtain ⟨handshakeWriteKeys, _, h⟩ := except_bind_ok_inv h
   obtain ⟨sealed, _, h⟩ := except_bind_ok_inv h
@@ -3255,10 +3336,14 @@ private theorem processHandshakeBuffer_phase_ne {state next : State}
       · obtain ⟨_, h⟩ := unless_ok h
         exact processHandshakeBuffer_phase_ne h (by intro hc; cases hc)
       · exact processHandshakeBuffer_phase_ne h (by intro hc; cases hc)
-    · obtain ⟨_, h⟩ := unless_ok h
-      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-      exact processHandshakeBuffer_phase_ne h (by intro hc; cases hc)
+    · split at h
+      · obtain ⟨_, h⟩ := if_throw_ok h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        exact processHandshakeBuffer_phase_ne h (by intro hc; cases hc)
+      · obtain ⟨_, h⟩ := unless_ok h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        exact processHandshakeBuffer_phase_ne h (by intro hc; cases hc)
     · obtain ⟨_, h⟩ := unless_ok h
       obtain ⟨_, _, h⟩ := except_bind_ok_inv h
       split at h
@@ -3428,11 +3513,16 @@ private theorem processHandshakeBuffer_established {H : Spec.Hkdf} (hi : Impleme
         exact hw
       · have hw := processHandshakeBuffer_established hi h
         exact hw
-    · obtain ⟨_, h⟩ := unless_ok h
-      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-      obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-      have hw := processHandshakeBuffer_established hi h
-      exact hw
+    · split at h
+      · obtain ⟨_, h⟩ := if_throw_ok h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        have hw := processHandshakeBuffer_established hi h
+        exact hw
+      · obtain ⟨_, h⟩ := unless_ok h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+        have hw := processHandshakeBuffer_established hi h
+        exact hw
     · obtain ⟨_, h⟩ := unless_ok h
       obtain ⟨_, _, h⟩ := except_bind_ok_inv h
       split at h

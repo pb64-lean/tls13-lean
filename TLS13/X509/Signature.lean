@@ -271,6 +271,23 @@ def serverCertificateVerifyContent (transcriptHash : ByteArray) :
   let context := "TLS 1.3, server CertificateVerify".toUTF8
   pure (((spaces ++ context).push 0x00) ++ transcriptHash)
 
+/-- Role-separated RFC 8446 client CertificateVerify input. -/
+def clientCertificateVerifyContent (transcriptHash : ByteArray) :
+    Except String ByteArray := do
+  unless transcriptHash.size == HaclStar.sha256DigestLen do
+    throw "CertificateVerify transcript hash must contain exactly 32 bytes"
+  let spaces := ByteArray.mk (Array.replicate 64 0x20)
+  pure (((spaces ++ "TLS 1.3, client CertificateVerify".toUTF8).push 0) ++ transcriptHash)
+
+/-- The initial workload-identity profile signs client authentication with
+Ed25519. Certificate chain issuer signatures retain the normal X.509 profile. -/
+def verifyClientCertificateVerify (spki : SubjectPublicKeyInfo)
+    (transcriptHash signature : ByteArray) : Bool :=
+  certificateVerifySchemeCompatible .ed25519 spki &&
+    match clientCertificateVerifyContent transcriptHash with
+    | .error _ => false
+    | .ok content => verify .ed25519 spki.key content signature
+
 /-- Verify a TLS 1.3 server CertificateVerify against the leaf SPKI and the
 SHA-256 transcript hash through Certificate, inclusive. ECDSA and RSA hash
 the constructed content with SHA-256; Ed25519 receives the whole content and

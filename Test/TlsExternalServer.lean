@@ -1,4 +1,5 @@
 import Std.Async.TCP
+import Std.Time
 import Tls.Server
 
 /-!
@@ -124,6 +125,15 @@ def main (args : List String) : IO Unit := do
       hex "471761974da12938977eca1b40cc0ea3d6e9c52897648a1661681e88fd31f4be"
     alpnProtocols := ["http/1.1"]
   }
+  let config ← match ← IO.getEnv "TLS13_TEST_CLIENT_CA" with
+    | none => pure config
+    | some path => do
+      let pem ← IO.FS.readFile path
+      let trustStore ← match TLS13.X509.Chain.TrustStore.decodePEM pem with
+        | .ok store => pure store
+        | .error error => throw (IO.userError error)
+      let now := (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.toInt
+      pure { config with clientAuth := some { trustStore, now } }
 
   let listener ← TCP.Socket.Server.mk
   listener.bind (.v4 {
@@ -137,6 +147,7 @@ def main (args : List String) : IO Unit := do
   try
     let connected ← completeHandshake client readSize (Server.start config)
     logLine s!"NEGOTIATED suite={connected.cipherSuiteSelected} group={repr connected.groupSelected}"
+    logLine s!"CLIENT_CERTIFICATES {connected.peerCertificates.size}"
     if connected.peerClosed then
       logLine "peer closed immediately after the handshake"
     else

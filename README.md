@@ -349,6 +349,12 @@ Implemented and negotiated:
   `ecdsa_secp256r1_sha256`, `ed25519`, `rsa_pss_rsae_sha256`, and
   `rsa_pss_pss_sha256`; PKCS#1 v1.5 is advertised for certificate-*chain*
   selection only, as RFC 9846 requires.
+- **Workload identity / mTLS**: optional Ed25519 client certificates in the
+  initial handshake, required or optional server-side authentication, bounded
+  trust-path validation, explicit `clientAuth` / `serverAuth` extended-key-usage
+  checks, and immutable certificate/key rotation snapshots. Client credentials
+  require server trust and hostname verification **before** their disclosure.
+  See [workload identity](docs/workload-identity.md) for policy and lifecycle.
 - **Extensions**: server_name, supported_groups, signature_algorithms, ALPN,
   supported_versions, key_share; the server performs HelloRetryRequest with
   the synthetic `message_hash` transcript and strict second-ClientHello
@@ -373,7 +379,7 @@ Implemented and negotiated:
 Unsupported: PSK and session resumption
 (NewSessionTicket is silently ignored without semantically parsing its body;
 the server never issues tickets),
-0-RTT, the exporter and resumption secrets, client certificates,
+0-RTT, the exporter and resumption secrets, post-handshake client authentication,
 AES-GCM suites, client-side HelloRetryRequest processing, and post-quantum
 hybrid groups (a hybrid key share in a
 ClientHello is tolerated and skipped, not negotiated). The server's

@@ -13,6 +13,7 @@ lean_library(
         "Record.lean",
         "Record/Laws.lean",
         "Handshake.lean",
+        "Identity.lean",
         "Client.lean",
         "Client/Laws.lean",
         "Server.lean",

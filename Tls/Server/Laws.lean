@@ -351,6 +351,7 @@ private theorem completeClientHello_write {state next : State}
   obtain ⟨serverWriteKeys, _, h⟩ := except_bind_ok_inv h
   obtain ⟨clientReadKeys, _, h⟩ := except_bind_ok_inv h
   obtain ⟨encryptedExtensions, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨requestBytes, _, h⟩ := except_bind_ok_inv h
   obtain ⟨certificate, _, h⟩ := except_bind_ok_inv h
   split at h
   case h_2 => cases h
@@ -420,13 +421,8 @@ private theorem acceptClientFinished_write {state next : State}
   unfold acceptClientFinished at h
   simp only [pure_bind] at h
   obtain ⟨finished, _, h⟩ := except_bind_ok_inv h
-  split at h <;>
-    first
-      | (cases h <;> exact Record.Extends.refl _)
-      | (split at h <;>
-          first
-            | (cases h <;> exact Record.Extends.refl _)
-            | (split at h <;> (cases h <;> exact Record.Extends.refl _)))
+  repeat' first | (split at h) | (cases h)
+  all_goals exact Record.Extends.refl _
 
 
 private theorem processHandshakeBuffer_write {state next : State} {wire : ByteArray}
@@ -459,6 +455,20 @@ private theorem processHandshakeBuffer_write {state next : State} {wire : ByteAr
           (state := { state with handshakeBuffered := rest }) h
       · cases h
 
+private theorem prepareClientFlight_frame {state next : State}
+    (h : prepareClientFlight state = .ok next) :
+    next.phase = state.phase ∧ next.readKeys? = state.readKeys? ∧
+      next.writeKeys? = state.writeKeys? ∧
+      next.clientApplicationKeys? = state.clientApplicationKeys? := by
+  unfold prepareClientFlight at h
+  split at h
+  · obtain ⟨pair, _, h⟩ := except_bind_ok_inv h
+    obtain ⟨auth, buffer⟩ := pair
+    cases h
+    exact ⟨rfl, rfl, rfl, rfl⟩
+  · cases h
+    exact ⟨rfl, rfl, rfl, rfl⟩
+
 private theorem processProtectedRecord_write {state next : State}
     {record : Record.RawRecord} {plain wire : ByteArray}
     (h : processProtectedRecord state record = .ok (next, plain, wire)) :
@@ -478,10 +488,14 @@ private theorem processProtectedRecord_write {state next : State}
            cases h
            exact Record.Extends.refl _)
         | (obtain ⟨_, h⟩ := if_throw_ok h
+           obtain ⟨prepared, hprepared, h⟩ := except_bind_ok_inv h
            obtain ⟨pair, hpb, h⟩ := except_bind_ok_inv h
            obtain ⟨stateH, wireH⟩ := pair
            cases h
            have hw := processHandshakeBuffer_write hpb
+           have hf := (prepareClientFlight_frame hprepared).2.2.1
+           unfold WriteEffect at hw ⊢
+           rw [hf] at hw
            exact hw)
         | (obtain ⟨_, h⟩ := unless_ok h
            obtain ⟨pair, hpa, h⟩ := except_bind_ok_inv h
@@ -871,6 +885,7 @@ private theorem completeClientHello_wellFormed {state next : State}
   obtain ⟨serverWriteKeys, _, h⟩ := except_bind_ok_inv h
   obtain ⟨clientReadKeys, _, h⟩ := except_bind_ok_inv h
   obtain ⟨encryptedExtensions, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨requestBytes, _, h⟩ := except_bind_ok_inv h
   obtain ⟨certificate, _, h⟩ := except_bind_ok_inv h
   split at h
   case h_2 => cases h
@@ -968,15 +983,9 @@ private theorem acceptClientFinished_wellFormed {state next : State}
   unfold acceptClientFinished at h
   simp only [pure_bind] at h
   obtain ⟨finished, _, h⟩ := except_bind_ok_inv h
-  split at h
-  · split at h
-    · split at h
-      · cases h
-        exact ⟨fun _ => ⟨rfl, rfl, rfl⟩, fun _ => hwrite,
-          fun hp => (by rcases hp with hp | hp <;> cases hp)⟩
-      · cases h
-    · cases h
-  · cases h
+  repeat' first | (split at h) | (cases h)
+  all_goals exact ⟨fun _ => ⟨rfl, rfl, rfl⟩, fun _ => hwrite,
+    fun hp => (by rcases hp with hp | hp <;> cases hp)⟩
 
 private theorem processHandshakeBuffer_wellFormed {state next : State}
     {wire : ByteArray} (h : processHandshakeBuffer state = .ok (next, wire))
@@ -1008,6 +1017,31 @@ private theorem processHandshakeBuffer_wellFormed {state next : State}
           (wellFormed_transfer hinv rfl (.inl rfl) rfl rfl (.inl rfl))
       · cases h
 
+private theorem phase_eq_of_beq {p q : Phase} (h : (p == q) = true) : p = q := by
+  cases p <;> cases q <;> first | rfl | exact absurd h (by decide)
+
+private theorem prepareClientFlight_wellFormed {state next : State}
+    (h : prepareClientFlight state = .ok next)
+    (hinv : state.WellFormed) : next.WellFormed := by
+  unfold prepareClientFlight at h
+  split at h
+  · rename_i hp
+    have hphase : state.phase = .waitingClientFinished := by
+      simp only [Bool.and_eq_true] at hp
+      exact phase_eq_of_beq hp.1
+    obtain ⟨pair, _, h⟩ := except_bind_ok_inv h
+    obtain ⟨auth, buffer⟩ := pair
+    cases h
+    refine ⟨?_, ?_, ?_⟩
+    · intro hc
+      simp_all
+    · intro _
+      exact hinv.2.1 (.inl hphase)
+    · intro hc
+      simp_all
+  · cases h
+    exact hinv
+
 private theorem processProtectedRecord_wellFormed {state next : State}
     {record : Record.RawRecord} {plain wire : ByteArray}
     (h : processProtectedRecord state record = .ok (next, plain, wire))
@@ -1030,10 +1064,12 @@ private theorem processProtectedRecord_wellFormed {state next : State}
            cases h
            exact hinv')
         | (obtain ⟨_, h⟩ := if_throw_ok h
+           obtain ⟨prepared, hprepared, h⟩ := except_bind_ok_inv h
            obtain ⟨pair, hpb, h⟩ := except_bind_ok_inv h
            obtain ⟨stateH, wireH⟩ := pair
            cases h
-           exact processHandshakeBuffer_wellFormed hpb hinv')
+           exact processHandshakeBuffer_wellFormed hpb
+             (prepareClientFlight_wellFormed hprepared hinv'))
         | (obtain ⟨_, h⟩ := unless_ok h
            obtain ⟨pair, hpa, h⟩ := except_bind_ok_inv h
            obtain ⟨stateA, wireA⟩ := pair
@@ -1151,9 +1187,6 @@ theorem run_wellFormed {ops : List Op} : ∀ {state : State} {out : Output},
           exact h2
 
 /-! ## Transition laws -/
-
-private theorem phase_eq_of_beq {p q : Phase} (h : (p == q) = true) : p = q := by
-  cases p <;> cases q <;> first | rfl | exact absurd h (by decide)
 
 /-- **Application data is protected only by an established connection whose
 local write direction is open.** A peer `close_notify` does not close this
@@ -1312,11 +1345,13 @@ private theorem processProtectedRecord_plaintext {state next : State}
       cases h
       exact phase_eq_of_beq hph
     · obtain ⟨_, h⟩ := if_throw_ok h
+      obtain ⟨prepared, hprepared, h⟩ := except_bind_ok_inv h
       obtain ⟨pair, hpb, h⟩ := except_bind_ok_inv h
       obtain ⟨stateH, wireH⟩ := pair
       cases h
       rcases hp with hc | hne
-      · exact processHandshakeBuffer_connected hpb hc
+      · exact processHandshakeBuffer_connected hpb
+          ((prepareClientFlight_frame hprepared).1.trans hc)
       · exact absurd hne (by decide)
     · obtain ⟨_, h⟩ := unless_ok h
       obtain ⟨pair, hpa, h⟩ := except_bind_ok_inv h
@@ -1943,7 +1978,7 @@ theorem completeClientHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
     {state next : State} {hello : Handshake.ClientHello}
     {group : Handshake.NamedGroup} {transcriptPrefix wire : ByteArray}
     (h : completeClientHello state hello group transcriptPrefix = .ok (next, wire)) :
-    ∃ (ecdhe : ByteArray) (serverHello encryptedExtensions certificate certVerify
+    ∃ (ecdhe requestBytes : ByteArray) (serverHello encryptedExtensions certificate certVerify
         serverFinished : Handshake.Message),
       ecdhe.size = hashLen ∧
       ∀ inp : Spec.Inputs,
@@ -1954,7 +1989,7 @@ theorem completeClientHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
           HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded) →
         inp.hash .serverFinished =
           HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded ++
-            encryptedExtensions.encoded ++ certificate.encoded ++ certVerify.encoded ++
+            encryptedExtensions.encoded ++ requestBytes ++ certificate.encoded ++ certVerify.encoded ++
             serverFinished.encoded) →
         (∃ rk, next.readKeys? = some rk ∧
           Record.TrafficKeys.DerivedFrom H rk (Spec.derived H inp .cHsTraffic)) ∧
@@ -1975,6 +2010,7 @@ theorem completeClientHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
   obtain ⟨serverWriteKeys, _, h⟩ := except_bind_ok_inv h
   obtain ⟨clientReadKeys, hcrk, h⟩ := except_bind_ok_inv h
   obtain ⟨encryptedExtensions, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨requestBytes, _, h⟩ := except_bind_ok_inv h
   obtain ⟨certificate, _, h⟩ := except_bind_ok_inv h
   split at h
   case h_2 => cases h
@@ -1992,7 +2028,7 @@ theorem completeClientHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
       inp.hash .serverHello = HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded) →
       inp.hash .serverFinished =
         HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded ++
-          encryptedExtensions.encoded ++ certificate.encoded ++ certVerify.encoded ++
+          encryptedExtensions.encoded ++ requestBytes ++ certificate.encoded ++ certVerify.encoded ++
           serverFinished.encoded) →
       Record.TrafficKeys.DerivedFrom H clientReadKeys (Spec.derived H inp .cHsTraffic) ∧
       Record.TrafficKeys.DerivedFrom H serverApplicationKeys
@@ -2004,7 +2040,7 @@ theorem completeClientHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
             (HaclStar.sha256 ByteArray.empty)) "c hs traffic"
             (HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded)))
           (HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded ++
-            encryptedExtensions.encoded ++ certificate.encoded ++ certVerify.encoded ++
+            encryptedExtensions.encoded ++ requestBytes ++ certificate.encoded ++ certVerify.encoded ++
             serverFinished.encoded)) =
         HaclStar.hmacSha256 (Spec.finishedKey H (Spec.derived H inp .cHsTraffic))
           (inp.hash .serverFinished) := by
@@ -2023,7 +2059,7 @@ theorem completeClientHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
       exact congrArg
         (fun s => HaclStar.hmacSha256 (Spec.finishedKey H s) (inp.hash .serverFinished))
         hchs
-  refine ⟨sharedSecret, serverHello, encryptedExtensions, certificate, certVerify,
+  refine ⟨sharedSecret, requestBytes, serverHello, encryptedExtensions, certificate, certVerify,
     serverFinished, eq_of_beq hsize, fun inp h1 h2 h3 h4 h5 => ?_⟩
   obtain ⟨a, b, c, d⟩ := hderiv inp h1 h2 h3 h4 h5
   split at h
@@ -2326,6 +2362,7 @@ private theorem completeClientHello_epochs {H : Spec.Hkdf} (hi : Implements H)
   obtain ⟨serverWriteKeys, hswk, h⟩ := except_bind_ok_inv h
   obtain ⟨clientReadKeys, _, h⟩ := except_bind_ok_inv h
   obtain ⟨encryptedExtensions, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨requestBytes, _, h⟩ := except_bind_ok_inv h
   obtain ⟨certificate, _, h⟩ := except_bind_ok_inv h
   split at h
   case h_2 => cases h
@@ -2421,14 +2458,8 @@ private theorem acceptClientFinished_epochs {H : Spec.Hkdf} {state next : State}
   unfold acceptClientFinished at h
   simp only [pure_bind] at h
   obtain ⟨finished, _, h⟩ := except_bind_ok_inv h
-  split at h <;>
-    first
-      | (cases h <;> exact SpecEffect.within (Record.WithinEpoch.refl _))
-      | (split at h <;>
-          first
-            | (cases h <;> exact SpecEffect.within (Record.WithinEpoch.refl _))
-            | (split at h <;>
-                (cases h <;> exact SpecEffect.within (Record.WithinEpoch.refl _))))
+  repeat' first | (split at h) | (cases h)
+  all_goals exact SpecEffect.within (Record.WithinEpoch.refl _)
 
 private theorem processHandshakeBuffer_epochs {H : Spec.Hkdf} (hi : Implements H)
     {state next : State} {wire : ByteArray}
@@ -2485,11 +2516,13 @@ private theorem processProtectedRecord_epochs {H : Spec.Hkdf} (hi : Implements H
            cases h
            exact SpecEffect.within (Record.WithinEpoch.refl _))
         | (obtain ⟨_, h⟩ := if_throw_ok h
+           obtain ⟨prepared, hprepared, h⟩ := except_bind_ok_inv h
            obtain ⟨pair, hpb, h⟩ := except_bind_ok_inv h
            obtain ⟨stateH, wireH⟩ := pair
            cases h
-           have hw := processHandshakeBuffer_epochs hi hpb hinv'
-           exact SpecEffect.of_eq hw rfl)
+           have hw := processHandshakeBuffer_epochs hi hpb
+             (prepareClientFlight_wellFormed hprepared hinv')
+           exact SpecEffect.of_eq hw (prepareClientFlight_frame hprepared).2.2.1)
         | (obtain ⟨_, h⟩ := unless_ok h
            obtain ⟨pair, hpa, h⟩ := except_bind_ok_inv h
            obtain ⟨stateA, wireA⟩ := pair

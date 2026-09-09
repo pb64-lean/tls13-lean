@@ -5,6 +5,7 @@ public import HaclStar.Hmac
 public import HaclStar.P256
 public import HaclStar.Sha256
 public import Tls.Handshake
+public import Tls.Identity
 public import Tls.Record
 public import TLS13.KeySchedule
 public import TLS13.X509
@@ -30,6 +31,13 @@ steps for verification modes.
 and optional P-256 scalars must be independently generated for this connection
 and must never be reused across connections; the pure API cannot enforce that
 RFC 9846 §4.3.8 caller obligation. -/
+structure PeerAuthPolicy where
+  trustStore : TLS13.X509.Chain.TrustStore
+  now : Int
+  hostname : String
+  requireExplicitPurpose : Bool := false
+  deriving Inhabited
+
 structure Config where
   clientRandom : ByteArray
   x25519Private : ByteArray
@@ -41,9 +49,16 @@ structure Config where
   serverName : Option String := none
   /-- ALPN protocols to offer, in preference order (empty omits ALPN). -/
   alpnProtocols : Array String := #[]
+  /-- Optional immutable client credentials; sent only after CertificateRequest.
+  Capture an IdentityStore snapshot once before `start` to support rotation. -/
+  identity : Option Identity := none
+  /-- Required with client credentials: verify the server before disclosing a
+  client certificate. Also usable without mTLS for in-engine verification. -/
+  peerAuth : Option PeerAuthPolicy := none
   deriving Inhabited
 
-/-- Strict server-handshake ordering for the no-PSK, no-client-auth flow. -/
+/-- Strict server-handshake ordering; CertificateRequest is consumed at the
+start of waitingCertificate without introducing an additional record epoch. -/
 inductive Phase where
   | waitingServerHello
   | waitingEncryptedExtensions
@@ -186,6 +201,10 @@ structure State where
   offeredKeyShareGroups : Array Handshake.NamedGroup := #[]
   /-- ALPN protocol IDs advertised by this connection's ClientHello. -/
   offeredAlpnProtocols : Array String := #[]
+  identity : Option Identity := none
+  peerAuth : Option PeerAuthPolicy := none
+  certificateRequested : Bool := false
+  clientSignaturePermitted : Bool := false
   handshakeSecret? : Option ByteArray := none
   clientHandshakeTrafficSecret? : Option ByteArray := none
   serverHandshakeTrafficSecret? : Option ByteArray := none
@@ -344,12 +363,17 @@ def finishedVerifyData (trafficSecret transcriptHash : ByteArray) : ByteArray :=
 private def emptyTranscriptHash : ByteArray :=
   HaclStar.sha256 ByteArray.empty
 
-/--
-Create a ClientHello and initial state.  No entropy is generated here:
-`clientRandom` and each supplied private key must be exactly 32 bytes, while
-the legacy session id follows TLS's zero-to-32-byte vector constraint.
--/
+private def checkIdentity (config : Config) : Except Error Unit := do
+  if let some identity := config.identity then
+    unless identity.purpose == .clientAuth do
+      throw (.badCertificate "client identity has the wrong certificate purpose")
+    unless config.peerAuth.isSome do
+      throw (.badCertificate "client identity requires pre-disclosure server verification")
+
+/-- Create ClientHello and initial state from fresh caller-provided entropy.
+Credentials require an explicit server-verification policy. -/
 def start (config : Config) : Except Error Output := do
+  checkIdentity config
   unless config.clientRandom.size == 32 do
     throw (.invalidEntropy "ClientHello random" 32 config.clientRandom.size)
   unless config.x25519Private.size == 32 do
@@ -393,6 +417,8 @@ def start (config : Config) : Except Error Output := do
       else
         #[.x25519]
     offeredAlpnProtocols := config.alpnProtocols
+    identity := config.identity
+    peerAuth := config.peerAuth
   }
   pure { state, wireBytes }
 
@@ -477,6 +503,50 @@ private def feedPlaintextHandshake (state : State) (fragment : ByteArray) :
 private def appendTranscript (state : State) (message : Handshake.Message) : State :=
   { state with transcript := state.transcript ++ message.encoded }
 
+/-- Client authentication is signed only after the server Finished verifies.
+The returned bytes are part of the client Finished transcript, never the
+application-secret transcript (which ends at the server Finished). -/
+private def clientAuthentication (state : State) (transcript : ByteArray) :
+    Except Error ByteArray := do
+  if !state.certificateRequested then
+    return ByteArray.empty
+  let identity := if state.clientSignaturePermitted then state.identity else none
+  let certificate ← liftHandshake (Handshake.encodeClientCertificate
+    (identity.map (·.certificateChain) |>.getD #[]))
+  match identity with
+  | none => pure certificate.encoded
+  | some identity =>
+    let content ← liftHandshake (TLS13.X509.Signature.clientCertificateVerifyContent
+      (HaclStar.sha256 (transcript ++ certificate.encoded)))
+    let signature := HaclStar.Signature.ed25519Sign identity.signingKey content
+    let verify ← liftHandshake (Handshake.encodeCertificateVerify Handshake.ed25519 signature)
+    pure (certificate.encoded ++ verify.encoded)
+
+private def verifyServerIdentity (state : State) : Except Error Unit := do
+  if let some policy := state.peerAuth then
+    let some leaf := state.peerCertificates[0]?
+      | throw (.badCertificate "missing peer certificate")
+    let verified ← match TLS13.X509.Chain.validate policy.now leaf
+        (state.peerCertificates.extract 1 state.peerCertificates.size) policy.trustStore
+        10 128 .serverAuth policy.requireExplicitPurpose with
+      | .ok verified => pure verified
+      | .error _ => throw (.badCertificate "server trust or purpose verification failed")
+    match TLS13.X509.Hostname.verifyHostname policy.hostname verified.leaf with
+    | .ok () => pure ()
+    | .error _ => throw (.badCertificate "server hostname verification failed")
+
+private def sealClientFlight (keys : Record.TrafficKeys) (flight : ByteArray)
+    (offset : Nat := 0) (wire : ByteArray := ByteArray.empty) :
+    Except Error (Record.TrafficKeys × ByteArray) :=
+  if flight.size ≤ offset then .ok (keys, wire)
+  else
+    let stop := min flight.size (offset + 16384)
+    match liftRecord (Record.«seal» keys .handshake (flight.extract offset stop)) with
+    | .error e => .error e
+    | .ok (keys, bytes) => sealClientFlight keys flight stop (wire ++ bytes)
+  termination_by flight.size - offset
+  decreasing_by omega
+
 def completeServerHandshake (state : State) (message : Handshake.Message) :
     Except Error (State × ByteArray) := do
   let finished ← liftHandshake (Handshake.parseFinished message)
@@ -497,11 +567,14 @@ def completeServerHandshake (state : State) (message : Handshake.Message) :
   let serverApplicationKeys ← liftRecord (Record.deriveTrafficKeys serverApplicationSecret)
 
   let clientHandshakeSecret ← requireClientHandshakeTrafficSecret state
-  let clientVerifyData := finishedVerifyData clientHandshakeSecret transcriptHash
+  verifyServerIdentity state
+  let authentication ← clientAuthentication state transcriptThroughServerFinished
+  let clientVerifyData := finishedVerifyData clientHandshakeSecret
+    (HaclStar.sha256 (transcriptThroughServerFinished ++ authentication))
   let clientFinished ← liftHandshake (Handshake.encodeFinished clientVerifyData)
   let handshakeWriteKeys ← requireWriteKeys state
-  let (_, finishedWireBytes) ←
-    liftRecord (Record.«seal» handshakeWriteKeys .handshake clientFinished.encoded)
+  let (_, finishedWireBytes) ← sealClientFlight handshakeWriteKeys
+    (authentication ++ clientFinished.encoded)
   -- A nonempty legacy session id opts into RFC 8446 appendix D.4's
   -- middlebox-compatibility mode.  The dummy CCS is deliberately plaintext
   -- and immediately precedes the client's encrypted second flight.
@@ -529,6 +602,10 @@ def completeServerHandshake (state : State) (message : Handshake.Message) :
     handshakeSecret? := none
     clientHandshakeTrafficSecret? := none
     serverHandshakeTrafficSecret? := none
+    identity := none
+    peerAuth := none
+    certificateRequested := false
+    clientSignaturePermitted := false
     readKeys? := some serverApplicationKeys
     writeKeys? := some clientApplicationKeys
     sendingKeyUpdates := 0
@@ -699,19 +776,29 @@ def processHandshakeBuffer (state : State) :
         processHandshakeBuffer (appendTranscript
           { state' with phase := .waitingCertificate, alpnSelected } message)
     | .waitingCertificate => do
-        unless message.msgType == Handshake.certificateType do
-          throw (.unexpectedHandshake state'.phase message.msgType)
-        let certificate ← liftHandshake (Handshake.parseCertificate message)
-        let parsedCertificates ← certificate.entries.mapM fun entry =>
-          decodeCertificate entry.der
-        let parsedLeaf := parsedCertificates[0]!
-        processHandshakeBuffer (appendTranscript {
-          state' with
-          phase := .waitingCertificateVerify
-          leafCertificate? := some certificate.leafDer
-          peerCertificates := parsedCertificates
-          leafPublicKey? := some parsedLeaf.tbsCertificate.subjectPublicKeyInfo
-        } message)
+        if message.msgType == Handshake.certificateRequestType then
+          if state'.certificateRequested then
+            throw (.unexpectedHandshake state'.phase message.msgType)
+          let request ← liftHandshake (Handshake.parseCertificateRequest message)
+          processHandshakeBuffer (appendTranscript { state' with
+            phase := .waitingCertificate
+            certificateRequested := true
+            clientSignaturePermitted := request.signatureAlgorithms.contains Handshake.ed25519
+          } message)
+        else
+          unless message.msgType == Handshake.certificateType do
+            throw (.unexpectedHandshake state'.phase message.msgType)
+          let certificate ← liftHandshake (Handshake.parseCertificate message)
+          let parsedCertificates ← certificate.entries.mapM fun entry =>
+            decodeCertificate entry.der
+          let parsedLeaf := parsedCertificates[0]!
+          processHandshakeBuffer (appendTranscript {
+            state' with
+            phase := .waitingCertificateVerify
+            leafCertificate? := some certificate.leafDer
+            peerCertificates := parsedCertificates
+            leafPublicKey? := some parsedLeaf.tbsCertificate.subjectPublicKeyInfo
+          } message)
     | .waitingCertificateVerify => do
         unless message.msgType == Handshake.certificateVerifyType do
           throw (.unexpectedHandshake state'.phase message.msgType)
