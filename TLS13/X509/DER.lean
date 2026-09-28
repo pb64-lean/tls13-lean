@@ -1267,6 +1267,568 @@ theorem decode_append_ne_ok {bytes extra : ByteArray} {tlv : TLV}
   have h0 : (Reader.ofBytes bytes).offset = 0 := rfl
   omega
 
+
+/-! ### Canonical encoding
+
+`decode_inj` above holds because a `TLV` keeps its own bytes. The laws below
+say more: the bytes `decode` accepts are a function of the tag and the contents
+alone. Every accepted header is exactly `encodeHeader tag length`
+(`readTLV_canonical`), so two byte strings that decode to the same tag and
+contents are the same byte string (`decode_canonical`). -/
+
+/-- Digits of `m` in base `base`, most significant first, each written as
+`add + digit`, none for `0`; `fuel` bounds the recursion (`m` steps suffice). -/
+private def digitsF (base add : Nat) : Nat → Nat → List Nat
+  | 0, _ => []
+  | fuel + 1, m => if m = 0 then [] else digitsF base add fuel (m / base) ++ [add + m % base]
+
+/-- The value of digits written by `digitsF`. -/
+private def digitsVal (base add : Nat) (l : List Nat) : Nat :=
+  l.foldl (fun acc x => acc * base + (x - add)) 0
+
+private theorem digitsF_zero (base add fuel : Nat) : digitsF base add fuel 0 = [] := by
+  cases fuel <;> simp [digitsF]
+
+private theorem digitsF_fuel {base add : Nat} (hb : 2 ≤ base) :
+    ∀ (f g m : Nat), m ≤ f → m ≤ g → digitsF base add f m = digitsF base add g m := by
+  intro f
+  induction f with
+  | zero =>
+    intro g m hf _
+    have : m = 0 := by omega
+    subst this; simp [digitsF_zero]
+  | succ f ih =>
+    intro g m hf hg
+    by_cases h : m = 0
+    · subst h; simp [digitsF_zero]
+    · cases g with
+      | zero => omega
+      | succ g =>
+        have hlt : m / base < m := Nat.div_lt_self (by omega) (by omega)
+        simp only [digitsF, h, if_false]
+        rw [ih g (m / base) (by omega) (by omega)]
+
+private theorem digitsF_pos {base add : Nat} (hb : 2 ≤ base) {m : Nat} (hm : m ≠ 0) (f : Nat)
+    (hf : m ≤ f) :
+    digitsF base add f m = digitsF base add (m / base) (m / base) ++ [add + m % base] := by
+  obtain ⟨f', rfl⟩ : ∃ f', f = f' + 1 := ⟨f - 1, by omega⟩
+  have hlt : m / base < m := Nat.div_lt_self (by omega) (by omega)
+  simp only [digitsF, hm, if_false]
+  rw [digitsF_fuel hb f' (m / base) (m / base) (by omega) (Nat.le_refl _)]
+
+private theorem digitsVal_append (base add : Nat) (l : List Nat) (x : Nat) :
+    digitsVal base add (l ++ [x]) = digitsVal base add l * base + (x - add) := by
+  simp [digitsVal, List.foldl_append]
+
+private theorem snoc_induction {motive : List Nat → Prop} (nil : motive [])
+    (snoc : ∀ l x, motive l → motive (l ++ [x])) (l : List Nat) : motive l := by
+  rw [← List.reverse_reverse l]
+  induction l.reverse with
+  | nil => exact nil
+  | cons x r ih => rw [List.reverse_cons]; exact snoc _ _ ih
+
+private theorem digitsVal_pos {base add : Nat} (hb : 2 ≤ base) :
+    ∀ (l : List Nat) (x : Nat), x - add ≠ 0 → digitsVal base add (x :: l) ≠ 0 := by
+  intro l
+  induction l using snoc_induction with
+  | nil => intro x hx; simpa [digitsVal] using hx
+  | snoc l y ih =>
+    intro x hx
+    rw [← List.cons_append, digitsVal_append]
+    have := ih x hx
+    have : 0 < digitsVal base add (x :: l) * base := Nat.mul_pos (by omega) (by omega)
+    omega
+
+/-- Digits in range, with a non-zero leading digit, are exactly what `digitsF`
+writes for their value: each value has one such encoding. -/
+private theorem digitsF_digitsVal {base add : Nat} (hb : 2 ≤ base) :
+    ∀ (l : List Nat), (∀ x ∈ l, add ≤ x ∧ x < add + base) →
+      (∀ x, l.head? = some x → x - add ≠ 0) →
+      digitsF base add (digitsVal base add l) (digitsVal base add l) = l := by
+  intro l
+  induction l using snoc_induction with
+  | nil => intro _ _; simp [digitsVal, digitsF_zero]
+  | snoc l y ih =>
+    intro hall hhead
+    have hy : add ≤ y ∧ y < add + base := hall y (by simp)
+    have hl : ∀ x ∈ l, add ≤ x ∧ x < add + base := fun x hx => hall x (by simp [hx])
+    rw [digitsVal_append]
+    have hdiv : (digitsVal base add l * base + (y - add)) / base = digitsVal base add l := by
+      rw [Nat.add_comm, Nat.add_mul_div_right _ _ (by omega), Nat.div_eq_of_lt (by omega)]; omega
+    have hmod : (digitsVal base add l * base + (y - add)) % base = y - add := by
+      rw [Nat.add_comm, Nat.add_mul_mod_self_right, Nat.mod_eq_of_lt (by omega)]
+    cases l with
+    | nil =>
+      have hy0 : y - add ≠ 0 := hhead y (by simp)
+      simp only [digitsVal, List.foldl_nil, Nat.zero_mul, Nat.zero_add, List.nil_append]
+        at hdiv hmod ⊢
+      rw [digitsF_pos hb hy0 _ (Nat.le_refl _), Nat.div_eq_of_lt (by omega), digitsF_zero,
+        Nat.mod_eq_of_lt (by omega)]
+      simp; omega
+    | cons x xs =>
+      have hx0 : x - add ≠ 0 := hhead x (by simp)
+      have hpos := digitsVal_pos hb xs x hx0
+      have hne : digitsVal base add (x :: xs) * base + (y - add) ≠ 0 := by
+        have : 0 < digitsVal base add (x :: xs) * base := Nat.mul_pos (by omega) (by omega)
+        omega
+      rw [digitsF_pos hb hne _ (Nat.le_refl _), hdiv, hmod, ih hl (by simpa using hhead)]
+      congr 2; omega
+
+/-- The two class bits of an identifier octet. -/
+def TagClass.bits : TagClass → Nat
+  | .universal => 0
+  | .application => 1
+  | .contextSpecific => 2
+  | .private_ => 3
+
+/-- The length octets DER writes for `n`: the short form below 128, otherwise
+`0x80 + k` followed by the `k` big-endian octets of `n` with no leading zero. -/
+def lengthOctets (n : Nat) : List Nat :=
+  if n < 128 then [n] else (0x80 + (digitsF 256 0 n n).length) :: digitsF 256 0 n n
+
+/-- The base-128 groups of a high tag number: every group but the last has its
+top bit set, and the first is never `0x80`. -/
+def tagNumberOctets (n : Nat) : List Nat :=
+  digitsF 128 0x80 (n / 128) (n / 128) ++ [n % 128]
+
+/-- The identifier octets DER writes for `tag`: one octet for numbers below 31,
+otherwise `0x1f` in the low bits followed by the number's base-128 groups. -/
+def identifierOctets (tag : Tag) : List Nat :=
+  let lead := tag.tagClass.bits * 64 + (if tag.constructed then 0x20 else 0)
+  if tag.number < 31 then [lead + tag.number] else (lead + 0x1f) :: tagNumberOctets tag.number
+
+/-- The DER header (identifier and length octets) of a value with this tag and
+this many content bytes. -/
+def encodeHeader (tag : Tag) (length : Nat) : ByteArray :=
+  ⟨((identifierOctets tag ++ lengthOctets length).map UInt8.ofNat).toArray⟩
+
+/-- The octets of `b` from offset `i` up to offset `j`, as numbers. -/
+private def octets (b : ByteArray) (i j : Nat) : List Nat :=
+  ((b.data.toList.drop i).take (j - i)).map UInt8.toNat
+
+private theorem extract_toList (b : ByteArray) (i j : Nat) :
+    (b.extract i j).data.toList = (b.data.toList.drop i).take (j - i) := by
+  rw [ByteArray.data_extract, Array.toList_extract, List.extract_eq_take_drop]
+
+private theorem octets_append {b : ByteArray} {i j k : Nat} (hij : i ≤ j) (hjk : j ≤ k) :
+    octets b i k = octets b i j ++ octets b j k := by
+  unfold octets
+  rw [← List.map_append, show k - i = (j - i) + (k - j) by omega, List.take_add,
+    List.drop_drop, show i + (j - i) = j by omega]
+
+private theorem octets_single {b : ByteArray} {i : Nat} (h : i < b.size) :
+    octets b i (i + 1) = [(b.get! i).toNat] := by
+  unfold octets
+  have hl : i < b.data.toList.length := by simpa using h
+  rw [show i + 1 - i = 1 by omega, List.drop_eq_getElem_cons hl]
+  simp only [List.take_succ_cons, List.take_zero, List.map_cons, List.map_nil,
+    List.cons.injEq, and_true]
+  rw [get!_eq_getElem h]
+  simp only [Array.getElem_toList]
+  rfl
+
+private theorem octets_extract {b : ByteArray} {i j : Nat} :
+    octets b i j = (b.extract i j).data.toList.map UInt8.toNat := by
+  rw [extract_toList]; rfl
+
+/-- `ByteArray.foldl` is the list fold over the bytes. -/
+private theorem foldlM_loop_run {β : Type} (f : β → UInt8 → β) (e : ByteArray) :
+    ∀ (i j : Nat) (b : β), j + i = e.size →
+      (ByteArray.foldlM.loop (m := Id) (fun x y => pure (f x y)) e e.size (Nat.le_refl _) i j b).run
+        = (e.data.toList.drop j).foldl f b := by
+  intro i
+  induction i with
+  | zero =>
+    intro j b hj
+    unfold ByteArray.foldlM.loop
+    have : ¬ j < e.size := by omega
+    simp only [this, dite_false]
+    rw [List.drop_eq_nil_of_le (by simp; omega)]
+    rfl
+  | succ i ih =>
+    intro j b hj
+    unfold ByteArray.foldlM.loop
+    have hlt : j < e.size := by omega
+    simp only [hlt, dite_true]
+    have hl : j < e.data.toList.length := by simpa using hlt
+    have hx : e.data.toList[j] = e[j] := by rw [Array.getElem_toList]; rfl
+    rw [List.drop_eq_getElem_cons hl, List.foldl_cons, hx]
+    simp only [pure_bind]
+    exact ih (j + 1) (f b e[j]) (by omega)
+
+private theorem lengthValue_eq (e : ByteArray) :
+    Reader.lengthValue e = digitsVal 256 0 (e.data.toList.map UInt8.toNat) := by
+  unfold Reader.lengthValue ByteArray.foldl ByteArray.foldlM
+  simp only [Nat.le_refl, dite_true, Nat.sub_zero]
+  rw [foldlM_loop_run _ e e.size 0 0 (by omega)]
+  simp only [List.drop_zero, digitsVal, List.foldl_map, Nat.sub_zero]
+  congr
+  funext v o
+  have : o.toNat < 2 ^ 8 := UInt8.toNat_lt o
+  rw [← Nat.shiftLeft_add_eq_or_of_lt this, Nat.shiftLeft_eq]
+
+namespace Reader
+
+/-- A successful `readLength` consumed exactly `lengthOctets len`. -/
+private theorem readLength_octets {r : Reader} {len : Nat} {r' : Reader}
+    (h : readLength r = .ok (len, r')) :
+    r'.bytes = r.bytes ∧ octets r.bytes r.offset r'.offset = lengthOctets len := by
+  obtain ⟨hb, -, hlt, hle⟩ := readLength_ok_state h
+  refine ⟨hb, ?_⟩
+  unfold readLength at h
+  split at h
+  · cases h
+  rename_i first afterFirst heq
+  obtain ⟨hfl, hfirst, hAF⟩ := readByte_eq_ok heq
+  obtain ⟨hab, hao, -⟩ := reader_with_offset hAF
+  have hf256 : first.toNat < 256 := UInt8.toNat_lt first
+  split at h
+  · cases h
+  rename_i h80
+  split at h
+  · cases h
+  rename_i hff
+  have h80' : first.toNat ≠ 128 := by
+    intro habs
+    exact h80 (by simp only [beq_iff_eq]; exact UInt8.toNat_inj.mp (by simpa using habs))
+  have hff' : first.toNat ≠ 255 := by
+    intro habs
+    exact hff (by simp only [beq_iff_eq]; exact UInt8.toNat_inj.mp (by simpa using habs))
+  split at h
+  · rename_i hge
+    have hge' : 128 ≤ first.toNat := by have := UInt8.le_iff_toNat_le.mp hge; simpa using this
+    split at h
+    · cases h
+    rename_i encodedLength afterLength htake
+    obtain ⟨hle2, hbs, hAL⟩ := take_eq_ok htake
+    obtain ⟨hlb, hlo, -⟩ := reader_with_offset hAL
+    split at h
+    · cases h
+    rename_i hz
+    split at h
+    · cases h
+    rename_i hmin
+    simp only [Except.ok.injEq, Prod.mk.injEq] at h
+    obtain ⟨hlen, hr'⟩ := h
+    subst hr'
+    have hc : first.toNat &&& 0x7f = first.toNat - 128 := by
+      rw [show (0x7f : Nat) = 2 ^ 7 - 1 from rfl, Nat.and_two_pow_sub_one_eq_mod]; omega
+    rw [hc, hab, hao] at hle2 hbs
+    rw [hlo, hc, hao]
+    -- the consumed octets: the first byte, then the length octets
+    rw [octets_append (j := r.offset + 1) (by omega) (by omega), octets_single hfl, ← hfirst]
+    have hEoct : octets r.bytes (r.offset + 1) (r.offset + 1 + (first.toNat - 128)) =
+        encodedLength.data.toList.map UInt8.toNat := by rw [octets_extract, hbs]
+    rw [hEoct, ← hlen, lengthValue_eq]
+    have hElen : (encodedLength.data.toList.map UInt8.toNat).length = first.toNat - 128 := by
+      rw [hbs]; simp; omega
+    have hEall : ∀ x ∈ encodedLength.data.toList.map UInt8.toNat, 0 ≤ x ∧ x < 0 + 256 := by
+      intro x hx; simp only [List.mem_map] at hx; obtain ⟨o, -, rfl⟩ := hx
+      exact ⟨Nat.zero_le _, by simpa using UInt8.toNat_lt o⟩
+    have hEhead :
+        ∀ x, (encodedLength.data.toList.map UInt8.toNat).head? = some x → x - 0 ≠ 0 := by
+      intro x hx
+      have hne : encodedLength.data.toList ≠ [] := by
+        intro he; rw [he] at hx; simp at hx
+      obtain ⟨o, os, hos⟩ := List.exists_cons_of_ne_nil hne
+      rw [hos] at hx; simp at hx; subst hx
+      have h0 : encodedLength.get! 0 = o := by
+        have hsz : 0 < encodedLength.size := by
+          have : encodedLength.data.toList.length = encodedLength.size := by simp
+          rw [← this, hos]; simp
+        rw [get!_eq_getElem hsz]
+        have : encodedLength.data.toList[0]'(by rw [hos]; simp) = o := by simp [hos]
+        rw [← this, Array.getElem_toList]; rfl
+      intro h0'
+      apply hz
+      simp only [beq_iff_eq]
+      rw [h0]
+      exact UInt8.toNat_inj.mp (by simpa using h0')
+    have hcanon := digitsF_digitsVal (base := 256) (add := 0) (by omega) _ hEall hEhead
+    have hbig : ¬ digitsVal 256 0 (encodedLength.data.toList.map UInt8.toNat) < 128 := by
+      rw [← lengthValue_eq]; simpa using hmin
+    unfold lengthOctets
+    rw [if_neg hbig, hcanon, hElen]
+    simp; omega
+  · rename_i hlt128
+    simp only [Except.ok.injEq, Prod.mk.injEq] at h
+    obtain ⟨hlen, hr'⟩ := h
+    subst hr'
+    have hlt' : first.toNat < 128 := by
+      have := UInt8.lt_iff_toNat_lt.mp (UInt8.not_le.mp hlt128); simpa using this
+    rw [hao, octets_single hfl, ← hfirst, ← hlen]
+    unfold lengthOctets
+    rw [if_pos hlt']
+
+private theorem shift7_or {a x : Nat} (hx : x < 128) : (a <<< 7) ||| x = a * 128 + x := by
+  rw [← Nat.shiftLeft_add_eq_or_of_lt (by simpa using hx), Nat.shiftLeft_eq]
+
+/-- A successful `readTagNumber` consumed base-128 groups: every one but the
+last has its top bit set, the first carries a non-zero value when
+`firstGroup` is set, and the number is their value appended to `acc`. -/
+private theorem readTagNumber_octets {fuel : Nat} :
+    ∀ {r : Reader} {hs acc : Nat} {fg : Bool} {m : Nat} {r' : Reader},
+      readTagNumber r hs acc fg fuel = .ok (m, r') →
+      ∃ hi last, octets r.bytes r.offset r'.offset = hi ++ [last] ∧
+        (∀ x ∈ hi, 128 ≤ x ∧ x < 256) ∧ last < 128 ∧
+        (fg = true → ((hi ++ [last]).headD 0) % 128 ≠ 0) ∧
+        m = (hi ++ [last]).foldl (fun a x => a * 128 + x % 128) acc := by
+  induction fuel with
+  | zero =>
+    intro r hs acc fg m r' h
+    exact absurd h (by simp [readTagNumber])
+  | succ fuel ih =>
+    intro r hs acc fg m r' h
+    unfold readTagNumber at h
+    split at h
+    · cases h
+    rename_i octet next heq
+    obtain ⟨hlt, hoct, hnext⟩ := readByte_eq_ok heq
+    obtain ⟨hnb, hno, -⟩ := reader_with_offset hnext
+    have ho256 : octet.toNat < 256 := UInt8.toNat_lt octet
+    have hmask : octet.toNat &&& 0x7f = octet.toNat % 128 := by
+      rw [show (0x7f : Nat) = 2 ^ 7 - 1 from rfl, Nat.and_two_pow_sub_one_eq_mod]
+    split at h
+    · cases h
+    rename_i hfirst
+    have hfg : fg = true → octet.toNat % 128 ≠ 0 := by
+      intro hf h0; apply hfirst; simp [hf, hmask, h0]
+    split at h
+    · rename_i hsmall
+      simp only [Except.ok.injEq, Prod.mk.injEq] at h
+      obtain ⟨hm, hr'⟩ := h
+      subst hr'
+      have hs' : octet.toNat < 128 := by
+        have := UInt8.lt_iff_toNat_lt.mp hsmall; simpa using this
+      refine ⟨[], octet.toNat, ?_, by simp, hs', ?_, ?_⟩
+      · rw [hno, octets_single hlt, ← hoct]; rfl
+      · intro hf; simpa using hfg hf
+      · rw [← hm, hmask, shift7_or (by omega)]; simp
+    · rename_i hbig
+      have hb' : 128 ≤ octet.toNat := by
+        have := UInt8.not_lt.mp hbig; have := UInt8.le_iff_toNat_le.mp this; simpa using this
+      obtain ⟨hi, last, hoc, hhi, hlast, -, hm⟩ := ih h
+      obtain ⟨hb2, -, hlt2, hle2⟩ := readTagNumber_ok_state h
+      rw [hnb] at hoc hle2
+      rw [hno] at hoc hlt2
+      refine ⟨octet.toNat :: hi, last, ?_, ?_, hlast, ?_, ?_⟩
+      · rw [octets_append (j := r.offset + 1) (by omega) (by omega), octets_single hlt, hoc,
+          ← hoct]
+        rfl
+      · intro x hx
+        simp only [List.mem_cons] at hx
+        rcases hx with rfl | hx
+        · exact ⟨hb', ho256⟩
+        · exact hhi x hx
+      · intro hf; simpa using hfg hf
+      · rw [hm, List.cons_append, List.foldl_cons, hmask, shift7_or (by omega)]
+
+private theorem foldl_groups (c : Nat) :
+    ∀ (hi : List Nat), (∀ x ∈ hi, 128 ≤ x ∧ x < 256) →
+      hi.foldl (fun a x => a * 128 + x % 128) c = hi.foldl (fun a x => a * 128 + (x - 128)) c := by
+  intro hi
+  induction hi generalizing c with
+  | nil => intro _; simp
+  | cons x xs ih =>
+    intro h
+    have hx := h x (by simp)
+    simp only [List.foldl_cons]
+    rw [show x % 128 = x - 128 by omega]
+    exact ih _ (fun y hy => h y (by simp [hy]))
+
+/-- Base-128 groups as `readTagNumber` accepts them are exactly
+`tagNumberOctets` of their value. -/
+private theorem groups_canonical {hi : List Nat} {last : Nat}
+    (hhi : ∀ x ∈ hi, 128 ≤ x ∧ x < 256) (hlast : last < 128)
+    (hhead : ((hi ++ [last]).headD 0) % 128 ≠ 0) :
+    hi ++ [last] = tagNumberOctets ((hi ++ [last]).foldl (fun a x => a * 128 + x % 128) 0) := by
+  rw [List.foldl_append, List.foldl_cons, List.foldl_nil, foldl_groups 0 hi hhi]
+  have hv : hi.foldl (fun a x => a * 128 + (x - 128)) 0 = digitsVal 128 128 hi := rfl
+  rw [hv]
+  unfold tagNumberOctets
+  have hdiv : (digitsVal 128 128 hi * 128 + last % 128) / 128 = digitsVal 128 128 hi := by omega
+  have hmod : (digitsVal 128 128 hi * 128 + last % 128) % 128 = last := by omega
+  rw [hdiv, hmod]
+  congr 1
+  refine (digitsF_digitsVal (by omega) hi (fun x hx => ?_) ?_).symm
+  · have := hhi x hx; omega
+  · intro x hx
+    cases hi with
+    | nil => simp at hx
+    | cons y ys =>
+      simp at hx; subst hx
+      have := hhi y (by simp)
+      simp at hhead; omega
+
+/-- The identifier octet splits into class, form and low tag bits, and those
+bits are all there is to it. -/
+private theorem lead_bits : ∀ n, n < 256 →
+    (tagClassOfBits (n >>> 6)).bits * 64 + (if ((n &&& 0x20) != 0) = true then 0x20 else 0) +
+      (if n &&& 0x1f = 0x1f then 0x1f else n &&& 0x1f) = n := by
+  decide +kernel
+
+/-- A successful `readNumber` consumed the tag number's canonical octets: none
+in the low-tag-number form, `tagNumberOctets number` in the high one. -/
+private theorem readNumber_octets {first : UInt8} {r : Reader} {i m : Nat} {r' : Reader}
+    (h : readNumber first r i = .ok (m, r')) :
+    r'.bytes = r.bytes ∧ r.offset ≤ r'.offset ∧
+      (if first.toNat &&& 0x1f = 0x1f then
+        31 ≤ m ∧ octets r.bytes r.offset r'.offset = tagNumberOctets m
+      else m = first.toNat &&& 0x1f ∧ r'.offset = r.offset) := by
+  unfold readNumber at h
+  split at h
+  · rename_i hhigh
+    have hhigh' : first.toNat &&& 0x1f = 0x1f := by simpa using hhigh
+    split at h
+    · cases h
+    rename_i number next heq
+    split at h
+    · cases h
+    rename_i h31
+    simp only [Except.ok.injEq, Prod.mk.injEq] at h
+    obtain ⟨hm, hr'⟩ := h
+    subst hm hr'
+    obtain ⟨hb, -, hlt, -⟩ := readTagNumber_ok_state heq
+    obtain ⟨hi, last, hoc, hhi, hlast, hhead, hnum⟩ := readTagNumber_octets heq
+    refine ⟨hb, by omega, ?_⟩
+    rw [if_pos hhigh']
+    refine ⟨by omega, ?_⟩
+    rw [hoc, hnum]
+    exact groups_canonical hhi hlast (hhead rfl)
+  · rename_i hlow
+    have hlow' : ¬ first.toNat &&& 0x1f = 0x1f := by simpa using hlow
+    simp only [Except.ok.injEq, Prod.mk.injEq] at h
+    obtain ⟨hm, hr'⟩ := h
+    subst hm hr'
+    exact ⟨rfl, Nat.le_refl _, by rw [if_neg hlow']; exact ⟨rfl, rfl⟩⟩
+
+private theorem octets_self (b : ByteArray) (i : Nat) : octets b i i = [] := by
+  simp [octets]
+
+/-- The identifier octets `readTLV` consumed are `identifierOctets` of the tag
+it returns. -/
+private theorem identifier_octets {first : UInt8} {r : Reader} {i m : Nat} {r' : Reader}
+    (hfl : r.offset < r.bytes.size) (hfirst : first = r.bytes.get! r.offset)
+    (h : readNumber first { r with offset := r.offset + 1 } i = .ok (m, r')) :
+    r'.bytes = r.bytes ∧ r.offset + 1 ≤ r'.offset ∧
+      octets r.bytes r.offset r'.offset =
+        identifierOctets { tagClass := tagClassOfBits (first.toNat >>> 6)
+                           constructed := (first.toNat &&& 0x20) != 0
+                           number := m } := by
+  obtain ⟨hb, hle, hform⟩ := readNumber_octets h
+  refine ⟨hb, hle, ?_⟩
+  have hlead := lead_bits first.toNat (UInt8.toNat_lt first)
+  rw [octets_append (j := r.offset + 1) (by omega) hle, octets_single hfl, ← hfirst]
+  unfold identifierOctets
+  split at hform
+  · rename_i hhigh
+    obtain ⟨h31, hoc⟩ := hform
+    rw [if_pos hhigh] at hlead
+    simp only [Nat.not_lt.mpr h31, if_false]
+    rw [hoc]
+    simp only [List.singleton_append, List.cons.injEq, and_true]
+    omega
+  · rename_i hlow
+    obtain ⟨hm, hoff⟩ := hform
+    rw [if_neg hlow] at hlead
+    have hm31 : m < 31 := by
+      have : first.toNat &&& 0x1f ≤ 0x1f := Nat.and_le_right
+      omega
+    simp only [hm31, if_true]
+    rw [hoff, octets_self]
+    simp only [List.append_nil, List.cons.injEq, and_true]
+    omega
+
+private theorem extract_eq_header {b : ByteArray} {i j k : Nat} {H : List Nat}
+    (hij : i ≤ j) (hjk : j ≤ k) (hoct : octets b i j = H) :
+    b.extract i k = ⟨(H.map UInt8.ofNat).toArray⟩ ++ b.extract j k := by
+  apply ByteArray.ext
+  rw [ByteArray.data_append]
+  apply Array.ext'
+  rw [Array.toList_append, extract_toList, extract_toList,
+    show k - i = (j - i) + (k - j) by omega, List.take_add, List.drop_drop,
+    show i + (j - i) = j by omega]
+  congr 1
+  rw [← hoct]
+  unfold octets
+  rw [List.map_map, show (UInt8.ofNat ∘ UInt8.toNat) = id from funext fun _ => UInt8.ofNat_toNat,
+    List.map_id]
+
+/-- **Canonical header**: the bytes a successful `readTLV` consumed are exactly
+`encodeHeader` of the returned tag and content length, followed by the
+contents. Nothing about the encoding is left to the input. -/
+theorem readTLV_canonical {r : Reader} {tlv : TLV} {r' : Reader}
+    (h : r.readTLV = .ok (tlv, r')) :
+    tlv.encoded = encodeHeader tlv.tag tlv.contents.size ++ tlv.contents := by
+  unfold readTLV at h
+  split at h
+  · cases h
+  rename_i hoff
+  split at h
+  · cases h
+  rename_i first afterFirst h1
+  split at h
+  · cases h
+  rename_i number afterTag h2
+  split at h
+  · cases h
+  rename_i h3
+  split at h
+  · cases h
+  rename_i contentLength afterLength h4
+  split at h
+  · cases h
+  rename_i hrem
+  split at h
+  · cases h
+  rename_i contents afterContents h5
+  simp only [Except.ok.injEq, Prod.mk.injEq] at h
+  obtain ⟨htlv, hr'⟩ := h
+  subst hr' htlv
+  obtain ⟨hfl, hfirst, hAF⟩ := readByte_eq_ok h1
+  subst hAF
+  obtain ⟨hbT, hleT, hidT⟩ := identifier_octets hfl hfirst h2
+  obtain ⟨hbL, hocL⟩ := readLength_octets h4
+  obtain ⟨-, -, hltL, hleL⟩ := readLength_ok_state h4
+  obtain ⟨hle5, hc5, hAC⟩ := take_eq_ok h5
+  obtain ⟨hacb, haco, -⟩ := reader_with_offset hAC
+  rw [hbL, hbT] at hle5 hc5
+  rw [hbT] at hleL hocL
+  have hsize : contents.size = contentLength := by
+    rw [hc5, ByteArray.size_extract]; omega
+  show r.bytes.extract r.offset afterContents.offset =
+    encodeHeader _ contents.size ++ contents
+  rw [hsize, hc5, haco]
+  apply extract_eq_header (j := afterLength.offset) (by omega) (by omega)
+  rw [octets_append (j := afterTag.offset) (by omega) (by omega), hidT, hocL]
+
+
+end Reader
+
+/-- A byte string `decode` accepts is exactly `encodeHeader` of its tag and
+content length, followed by its contents. -/
+theorem decode_canonical_encoding {bytes : ByteArray} {tlv : TLV}
+    (h : decode bytes = .ok tlv) :
+    bytes = encodeHeader tlv.tag tlv.contents.size ++ tlv.contents := by
+  rw [← decode_encoded h]
+  unfold decode at h
+  split at h
+  · cases h
+  rename_i tlv₀ rest heq
+  split at h
+  · cases h
+  simp only [Except.ok.injEq] at h
+  subst h
+  exact Reader.readTLV_canonical heq
+
+/-- **DER canonicity**: two byte strings that `decode` to values with the same
+tag and the same contents are the same byte string. Unlike `decode_inj`, this
+does not rest on the retained `encoded` field. -/
+theorem decode_canonical {b₁ b₂ : ByteArray} {t₁ t₂ : TLV}
+    (h₁ : decode b₁ = .ok t₁) (h₂ : decode b₂ = .ok t₂)
+    (htag : t₁.tag = t₂.tag) (hcontents : t₁.contents = t₂.contents) : b₁ = b₂ := by
+  rw [decode_canonical_encoding h₁, decode_canonical_encoding h₂, htag, hcontents]
+
 end DER
 end X509
 end TLS13

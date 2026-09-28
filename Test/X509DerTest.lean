@@ -272,8 +272,34 @@ private def testPEM : IO Unit := do
   for (label, text) in malformed do
     expectError label (PEM.decodeBlocks text)
 
+/-- `decode_canonical_encoding` at runtime: every accepted value re-encodes, with
+`encodeHeader`, to exactly the bytes it came from. -/
+private def testCanonical : IO Unit := do
+  let cases : Array (String × String) := #[
+    ("short length", "020105"),
+    ("empty contents", "0500"),
+    ("long length", "0481c8" ++ String.join (List.replicate 200 "ab")),
+    ("two-octet long length", "0482012c" ++ String.join (List.replicate 300 "cd")),
+    ("high tag number", "9f810003010203"),
+    ("constructed context tag", "a1030201ff")
+  ]
+  for (label, hex) in cases do
+    let bytes := h hex
+    let tlv ← expectOk label (DER.decode bytes)
+    checkBytes (label ++ " re-encodes")
+      (DER.encodeHeader tlv.tag tlv.contents.size ++ tlv.contents) bytes
+  for path in #["Test/Fixtures/X509/rsa2048.pem", "Test/Fixtures/X509/p256.pem",
+      "Test/Fixtures/X509/ed25519.pem"] do
+    let text ← IO.FS.readFile path
+    let ders ← expectOk path (PEM.decodeCertificates text)
+    for der in ders do
+      let tlv ← expectOk path (DER.decode der)
+      checkBytes (path ++ " re-encodes")
+        (DER.encodeHeader tlv.tag tlv.contents.size ++ tlv.contents) der
+
 def main : IO Unit := do
   testDER
+  testCanonical
   testOID
   testPEM
   IO.println "all strict DER/OID/PEM assertions passed"
