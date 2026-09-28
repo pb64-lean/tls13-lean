@@ -243,10 +243,6 @@ private def testTimes : IO Unit := do
     ("UTC leap day", 0x17, "000229123456Z", 951827696, 2000),
     ("UTC leap second", 0x17, "161231235960Z", 1483228800, 2016),
     ("UTC 2049 pivot", 0x17, "491231235959Z", 2524607999, 2049),
-    ("Generalized year zero", 0x18, "00000101000000Z", -62167219200, 0),
-    ("Generalized pre-2050", 0x18, "19500101000000Z", -631152000, 1950),
-    ("Generalized epoch", 0x18, "19700101000000Z", 0, 1970),
-    ("Generalized leap day", 0x18, "20000229123456Z", 951827696, 2000),
     ("Generalized 2050", 0x18, "20500101000000Z", 2524608000, 2050),
     ("Generalized 2400 leap day", 0x18, "24000229000000Z", 13574563200, 2400),
     ("Generalized maximum", 0x18, "99991231235959Z", 253402300799, 9999)
@@ -255,6 +251,18 @@ private def testTimes : IO Unit := do
     let parsed ← expectOk label (parseTime tag text)
     check (label ++ " epoch") (parsed.unixSeconds == epoch)
     check (label ++ " year") (parsed.year == year)
+
+  -- The calendar arithmetic still covers the whole four-digit range, including
+  -- years that may no longer arrive as GeneralizedTime.
+  let calendar : Array (String × Nat × Nat × Nat × Nat × Int) := #[
+    ("calendar year zero", 0, 1, 1, 0, -62167219200),
+    ("calendar epoch", 1970, 1, 1, 0, 0),
+    ("calendar leap day", 2000, 2, 29, 45296, 951827696)
+  ]
+  for (label, year, month, day, seconds, epoch) in calendar do
+    let parsed ← expectOk label
+      (Time.ofComponents year month day (seconds / 3600) (seconds / 60 % 60) (seconds % 60))
+    check (label ++ " epoch") (parsed.unixSeconds == epoch)
 
   let malformed : Array (String × UInt8 × String) := #[
     ("UTC missing Z", 0x17, "240101000000"),
@@ -271,6 +279,10 @@ private def testTimes : IO Unit := do
     ("UTC hour 24", 0x17, "240101240000Z"),
     ("UTC minute 60", 0x17, "240101006000Z"),
     ("UTC second 61", 0x17, "240101000061Z"),
+    ("Generalized year zero", 0x18, "00000101000000Z"),
+    ("Generalized pre-2050", 0x18, "19500101000000Z"),
+    ("Generalized epoch", 0x18, "19700101000000Z"),
+    ("Generalized 2049", 0x18, "20491231235959Z"),
     ("Generalized 1900 non-leap", 0x18, "19000229000000Z"),
     ("Generalized 2100 non-leap", 0x18, "21000229000000Z")
   ]

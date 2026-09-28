@@ -105,12 +105,17 @@ private def parseFields (bytes : ByteArray) (yearDigits : Nat) :
 
 /-- Parse an RFC 5280 `Time` choice. UTCTime uses the mandated 1950/2050
 pivot; both forms require seconds and uppercase `Z`, and reject offsets and
-fractional seconds. -/
+fractional seconds. GeneralizedTime is accepted only for years from 2050 on:
+RFC 5280 §4.1.2.5 requires dates through 2049 to be encoded as UTCTime, so
+each validity date has exactly one accepted encoding. -/
 def parse (value : DER.TLV) : Except String Timestamp := do
   if value.tag == DER.Tag.utcTime then
     parseFields value.contents 2
   else if value.tag == DER.Tag.generalizedTime then
-    parseFields value.contents 4
+    let timestamp ← parseFields value.contents 4
+    if timestamp.year < 2050 then
+      throw s!"X.509 time before 2050 must be UTCTime, not GeneralizedTime (RFC 5280 §4.1.2.5)"
+    pure timestamp
   else
     throw s!"validity value has an unexpected tag at offset {value.offset}"
 
